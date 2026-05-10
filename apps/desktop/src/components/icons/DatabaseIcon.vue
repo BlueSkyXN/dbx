@@ -84,7 +84,10 @@ const assetIcons: Record<string, string> = {
   influxdb: "influxdb",
 };
 
-const letterIcons: Record<string, { letter: string; color: string }> = {};
+const letterIcons: Record<string, { letter: string; color: string }> = {
+  csvfile: { letter: "C", color: "#217346" },
+  xlsxfile: { letter: "X", color: "#217346" },
+};
 
 const normalizedType = computed(() => props.dbType.toLowerCase().replace(/[\s-]+/g, "_"));
 const assetName = computed(() => assetIcons[normalizedType.value]);

@@ -9,7 +9,7 @@ import { h2FilePathFromJdbcUrl } from "@/lib/h2Connection";
  * available.
  */
 export function isLocalFileTypeDb(dbType: DatabaseType | string): boolean {
-  return dbType === "sqlite" || dbType === "duckdb" || dbType === "access" || dbType === "h2";
+  return dbType === "sqlite" || dbType === "duckdb" || dbType === "csvfile" || dbType === "xlsxfile" || dbType === "access" || dbType === "h2";
 }
 
 /**
@@ -27,7 +27,7 @@ export function isLocalFileTypeDb(dbType: DatabaseType | string): boolean {
  */
 export function connectionFilePath(config: Pick<ConnectionConfig, "db_type" | "host" | "connection_string">): string | null {
   const dbType = config.db_type;
-  if (dbType === "sqlite" || dbType === "duckdb" || dbType === "access") {
+  if (dbType === "sqlite" || dbType === "duckdb" || dbType === "csvfile" || dbType === "xlsxfile" || dbType === "access") {
     const host = (config.host ?? "").trim();
     if (!host || host === ":memory:") return null;
     return host;

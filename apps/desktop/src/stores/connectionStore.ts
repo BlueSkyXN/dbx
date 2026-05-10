@@ -291,6 +291,8 @@ export const useConnectionStore = defineStore("connection", () => {
       redis: "Redis",
       etcd: "etcd",
       duckdb: "DuckDB",
+      csvfile: "CSV",
+      xlsxfile: "XLSX",
       clickhouse: "ClickHouse",
       sqlserver: "SQL Server",
       mongodb: "MongoDB",

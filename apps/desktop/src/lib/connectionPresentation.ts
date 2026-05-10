@@ -3,7 +3,7 @@ import type { ConnectionConfig, DatabaseType } from "@/types/database";
 type ConnectionPresentationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "host" | "port" | "database">;
 type ConnectionNamePresentationConfig = ConnectionPresentationConfig & Pick<ConnectionConfig, "name">;
 
-const LOCAL_DATABASE_TYPES = new Set(["sqlite", "duckdb", "access"]);
+const LOCAL_DATABASE_TYPES = new Set(["sqlite", "duckdb", "csvfile", "xlsxfile", "access"]);
 const REDACTED_HOST_SEGMENT = "***";
 const REDACTED_PORT = "****";
 
@@ -110,6 +110,12 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
 
     case "duckdb":
       return "duckdb:///absolute/path/to/database.duckdb";
+
+    case "csvfile":
+      return "csv:///absolute/path/to/data.csv";
+
+    case "xlsxfile":
+      return "xlsx:///absolute/path/to/workbook.xlsx";
 
     case "access":
       return "jdbc:ucanaccess:///absolute/path/to/database.accdb";

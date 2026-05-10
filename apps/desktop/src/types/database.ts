@@ -6,6 +6,8 @@ export type DatabaseType =
   | "turso"
   | "redis"
   | "duckdb"
+  | "csvfile"
+  | "xlsxfile"
   | "clickhouse"
   | "sqlserver"
   | "mongodb"

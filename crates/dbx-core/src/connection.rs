@@ -20,6 +20,7 @@ use crate::db;
 use crate::db::agent_driver::AgentMethod;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
+use crate::external;
 use crate::models::connection::{
     parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host, ConnectionConfig, DatabaseType,
 };
@@ -518,6 +519,31 @@ impl AppState {
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => {
                 return Err("DuckDB support is not compiled in this build. Rebuild with default features.".to_string());
+            }
+            #[cfg(feature = "duckdb-bundled")]
+            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+                let file_path = expand_tilde(&db_config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
+                let source: Arc<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Arc::new(external::CsvSource::new(PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Arc::new(external::XlsxSource::new(PathBuf::from(&file_path), xlsx_config))
+                    }
+                };
+                let duckdb_con =
+                    duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
+                let pool = external::ExternalPool::new(source, Arc::new(std::sync::Mutex::new(duckdb_con)));
+                pool.refresh_cache().await?;
+                PoolKind::ExternalTabular(Arc::new(pool))
+            }
+            #[cfg(not(feature = "duckdb-bundled"))]
+            DatabaseType::CsvFile | DatabaseType::XlsxFile => {
+                return Err(
+                    "External file source support is not compiled in this build. Rebuild with default features."
+                        .to_string(),
+                );
             }
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&db_config) {

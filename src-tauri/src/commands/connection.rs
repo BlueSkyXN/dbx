@@ -570,6 +570,20 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             }
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+                use dbx_core::external;
+                let file_path = expand_tilde(&config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, config.external_config.as_ref())?;
+                let source: Box<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Box::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Box::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                };
+                source.test_connection().await
+            }
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&config) {
                     let am = &state.agent_manager;
@@ -823,6 +837,29 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         }
         #[cfg(not(feature = "duckdb-bundled"))]
         DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+        #[cfg(feature = "duckdb-bundled")]
+        db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            use dbx_core::external;
+            let file_path = expand_tilde(&db_config.host);
+            let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
+            let source: std::sync::Arc<dyn external::ExternalTabularSource> = match ext_config {
+                external::ExternalConfig::Csv(csv_config) => {
+                    std::sync::Arc::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                }
+                external::ExternalConfig::Xlsx(xlsx_config) => {
+                    std::sync::Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                }
+            };
+            let duckdb_con =
+                duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
+            let ext_pool = external::ExternalPool::new(source, std::sync::Arc::new(std::sync::Mutex::new(duckdb_con)));
+            ext_pool.refresh_cache().await?;
+            PoolKind::ExternalTabular(std::sync::Arc::new(ext_pool))
+        }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        DatabaseType::CsvFile | DatabaseType::XlsxFile => {
+            return Err("External file source support not compiled (enable duckdb-bundled feature)".to_string());
+        }
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client = state.agent_manager.spawn(&db_config.db_type, Some("mongodb-legacy")).await?;

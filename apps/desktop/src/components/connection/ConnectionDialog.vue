@@ -389,6 +389,8 @@ const driverProfiles: Record<
   rqlite: { type: "rqlite", port: 4001, user: "", label: "RQLite", icon: "rqlite" },
   turso: { type: "turso", port: 443, user: "", label: "Turso", icon: "turso" },
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
+  csvfile: { type: "csvfile", port: 0, user: "", label: "CSV", icon: "csvfile" },
+  xlsxfile: { type: "xlsxfile", port: 0, user: "", label: "XLSX", icon: "xlsxfile" },
   access: { type: "access", port: 0, user: "", label: "Microsoft Access", icon: "access" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
   clickhouse: {
@@ -658,8 +660,14 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     if (profile.host) {
       form.value.host = profile.host;
     }
-    if (profile.type === "sqlite" || profile.type === "duckdb" || profile.type === "access") {
+    if (profile.type === "sqlite" || profile.type === "duckdb" || profile.type === "csvfile" || profile.type === "xlsxfile" || profile.type === "access") {
       form.value.host = "";
+      form.value.port = 0;
+      form.value.username = "";
+      form.value.password = "";
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+      form.value.transport_layers = [];
     }
     if (profile.type === "h2") {
       h2ConnectionMode.value = "file";
@@ -865,6 +873,8 @@ const iconTypeMap: Record<string, string> = {
   rqlite: "rqlite",
   turso: "turso",
   access: "access",
+  csvfile: "csvfile",
+  xlsxfile: "xlsxfile",
   redis: "redis",
   mongodb: "mongodb",
   duckdb: "duckdb",
@@ -943,6 +953,8 @@ const dbOptions: DbOption[] = [
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
   { value: "duckdb", label: "DuckDB" },
+  { value: "csvfile", label: "CSV" },
+  { value: "xlsxfile", label: "XLSX" },
   { value: "rqlite", label: "RQLite" },
   { value: "access", label: "Microsoft Access" },
   { value: "mariadb", label: "MariaDB" },
@@ -1029,6 +1041,8 @@ const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_ty
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
+  if (form.value.db_type === "csvfile") return "/path/to/data.csv";
+  if (form.value.db_type === "xlsxfile") return "/path/to/workbook.xlsx";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
   if (form.value.db_type === "h2") return "/path/to/database.mv.db";
   return "/path/to/database.db or :memory:";
@@ -1110,7 +1124,7 @@ const etcdEndpointsLines = computed({
     form.value.etcd_endpoints = normalizeEndpointLines(value);
   },
 });
-const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isH2FileMode.value);
+const canUseTransportLayers = computed(() => !usesLocalFilePathInput.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
@@ -1378,6 +1392,15 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       .split(/\r?\n/)
       .map((path) => path.trim())
       .filter(Boolean);
+  }
+  if (config.db_type === "csvfile" || config.db_type === "xlsxfile") {
+    config.host = config.host?.trim() || "";
+    config.port = 0;
+    config.username = "";
+    config.password = "";
+    config.database = undefined;
+    config.connection_string = undefined;
+    config.transport_layers = [];
   }
   if (config.db_type === "h2") {
     if (h2ConnectionMode.value === "file") {
@@ -2139,11 +2162,15 @@ async function browseDbFilePath() {
     const filters =
       form.value.db_type === "duckdb"
         ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
-        : form.value.db_type === "access"
-          ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
-          : form.value.db_type === "h2"
-            ? [{ name: "H2", extensions: ["db"] }]
-            : [{ name: "SQLite", extensions: ["db", "db3", "sqlite", "sqlite3"] }];
+        : form.value.db_type === "csvfile"
+          ? [{ name: "CSV", extensions: ["csv", "tsv"] }]
+          : form.value.db_type === "xlsxfile"
+            ? [{ name: "Excel Workbook", extensions: ["xlsx", "xlsm", "xls"] }]
+            : form.value.db_type === "access"
+              ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
+              : form.value.db_type === "h2"
+                ? [{ name: "H2", extensions: ["db"] }]
+                : [{ name: "SQLite", extensions: ["db", "db3", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,

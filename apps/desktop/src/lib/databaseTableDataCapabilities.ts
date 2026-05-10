@@ -141,6 +141,26 @@ const DATABASE_CAPABILITY_OVERRIDES: Partial<Record<DatabaseType, Partial<Databa
       readonly: true,
     },
   },
+  csvfile: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+      readonly: true,
+    },
+  },
+  xlsxfile: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+      readonly: true,
+    },
+  },
   tdengine: {
     tableData: {
       insert: true,
