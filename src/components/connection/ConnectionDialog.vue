@@ -66,6 +66,7 @@ const defaultForm = (): Omit<ConnectionConfig, "id"> => ({
   ssh_connect_timeout_secs: 5,
   ssl: false,
   connection_string: undefined,
+  external_config: undefined,
 });
 
 const form = ref(defaultForm());
@@ -110,6 +111,8 @@ const driverProfiles: Record<
   redis: { type: "redis", port: 6379, user: "", label: "Redis", icon: "redis" },
   sqlite: { type: "sqlite", port: 0, user: "", label: "SQLite", icon: "sqlite" },
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
+  csvfile: { type: "csvfile", port: 0, user: "", label: "CSV", icon: "csvfile" },
+  xlsxfile: { type: "xlsxfile", port: 0, user: "", label: "XLSX", icon: "xlsxfile" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
   clickhouse: {
     type: "clickhouse",
@@ -214,8 +217,11 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     form.value.port = profile.port;
     form.value.username = profile.user;
     form.value.url_params = profile.urlParams || "";
-    if (profile.type === "sqlite" || profile.type === "duckdb") {
+    if (["sqlite", "duckdb", "csvfile", "xlsxfile"].includes(profile.type)) {
       form.value.host = "";
+      form.value.username = "";
+      form.value.password = "";
+      form.value.database = undefined;
     }
   }
 }
@@ -249,6 +255,7 @@ watch(
         ssh_connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
         ssl: config.ssl || false,
         connection_string: config.connection_string,
+        external_config: config.external_config,
       };
       selectedType.value = profile;
       mongoUseUrl.value = !!config.connection_string;
@@ -305,6 +312,8 @@ const iconTypeMap: Record<string, string> = {
   mysql: "mysql",
   postgres: "postgres",
   sqlite: "sqlite",
+  csvfile: "csvfile",
+  xlsxfile: "xlsxfile",
   redis: "redis",
   mongodb: "mongodb",
   duckdb: "duckdb",
@@ -335,6 +344,8 @@ const dbOptions = [
   { value: "mysql", label: "MySQL" },
   { value: "postgres", label: "PostgreSQL" },
   { value: "sqlite", label: "SQLite" },
+  { value: "csvfile", label: "CSV" },
+  { value: "xlsxfile", label: "XLSX" },
   { value: "redis", label: "Redis" },
   { value: "mongodb", label: "MongoDB" },
   { value: "duckdb", label: "DuckDB" },
@@ -384,7 +395,14 @@ const filteredDbCategories = computed<DbCategory[]>(() => {
 
 const hasDbPickerResults = computed(() => filteredDbCategories.value.some((category) => category.options.length > 0));
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
-const canUseSsh = computed(() => form.value.db_type !== "sqlite");
+const isFileConnection = computed(() => ["sqlite", "duckdb", "csvfile", "xlsxfile"].includes(form.value.db_type));
+const filePathPlaceholder = computed(() => {
+  if (form.value.db_type === "csvfile") return "/path/to/data.csv";
+  if (form.value.db_type === "xlsxfile") return "/path/to/workbook.xlsx";
+  if (form.value.db_type === "duckdb") return "/path/to/database.duckdb";
+  return "/path/to/database.db";
+});
+const canUseSsh = computed(() => !isFileConnection.value);
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
@@ -435,6 +453,12 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   config.ssh_connect_timeout_secs = Number.isFinite(sshTimeout) && sshTimeout > 0 ? sshTimeout : 5;
   if (config.db_type === "mongodb" && !mongoUseUrl.value) {
     config.connection_string = undefined;
+  }
+  if (config.db_type === "csvfile" || config.db_type === "xlsxfile") {
+    config.port = 0;
+    config.username = "";
+    config.password = "";
+    config.database = undefined;
   }
   return config;
 }
@@ -537,7 +561,11 @@ async function browseDbFilePath() {
     const filters =
       form.value.db_type === "duckdb"
         ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
-        : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
+        : form.value.db_type === "csvfile"
+          ? [{ name: "CSV", extensions: ["csv", "tsv"] }]
+          : form.value.db_type === "xlsxfile"
+            ? [{ name: "Excel", extensions: ["xlsx", "xlsm", "xls"] }]
+            : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -717,12 +745,12 @@ async function browseDbFilePath() {
                   </div>
                 </div>
 
-                <!-- SQLite / DuckDB: file path only -->
-                <template v-if="form.db_type === 'sqlite' || form.db_type === 'duckdb'">
+                <!-- Local file sources: file path only -->
+                <template v-if="isFileConnection">
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.filePath") }}</Label>
                     <div class="col-span-3 flex items-center gap-1">
-                      <Input v-model="form.host" class="flex-1" placeholder="/path/to/database.db" />
+                      <Input v-model="form.host" class="flex-1" :placeholder="filePathPlaceholder" />
                       <Tooltip>
                         <TooltipTrigger as-child>
                           <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseDbFilePath">

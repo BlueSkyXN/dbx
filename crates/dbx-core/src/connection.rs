@@ -212,6 +212,23 @@ impl AppState {
                 .await?;
                 PoolKind::Gaussdb(Arc::new(tokio::sync::Mutex::new(client)))
             }
+            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+                let file_path = expand_tilde(&db_config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
+                let source: Arc<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Arc::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                };
+                let duckdb_con =
+                    duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
+                let pool = external::ExternalPool::new(source, Arc::new(std::sync::Mutex::new(duckdb_con)));
+                pool.refresh_cache().await?;
+                PoolKind::ExternalTabular(Arc::new(pool))
+            }
         };
 
         self.connections.lock().await.insert(pool_key.clone(), pool);
@@ -223,7 +240,7 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        if !config.ssh_enabled || config.ssh_host.is_empty() {
+        if !config.ssh_enabled || config.ssh_host.is_empty() || config.db_type.is_file_based() {
             return Ok((config.host.clone(), config.port));
         }
 
@@ -305,7 +322,7 @@ pub fn redacted_connection_url_for_endpoint(config: &ConnectionConfig, host: &st
 
 pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> Result<(), String> {
     match config.db_type {
-        DatabaseType::Sqlite | DatabaseType::DuckDb => Ok(()),
+        DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => Ok(()),
         DatabaseType::MongoDb if config.connection_string.as_deref().is_some_and(|value| !value.is_empty()) => Ok(()),
         _ => db::probe_tcp_endpoint(&format!("{:?}", config.db_type), host, port).await,
     }

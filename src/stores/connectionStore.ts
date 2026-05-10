@@ -148,6 +148,8 @@ export const useConnectionStore = defineStore("connection", () => {
       redshift: "Redshift",
       dameng: "DM (Dameng)",
       gaussdb: "GaussDB",
+      csvfile: "CSV",
+      xlsxfile: "XLSX",
     };
 
     const profile = config.driver_profile || config.db_type;

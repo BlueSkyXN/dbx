@@ -81,6 +81,20 @@ pub enum DatabaseType {
     Redshift,
     Dameng,
     Gaussdb,
+    #[serde(rename = "csvfile")]
+    CsvFile,
+    #[serde(rename = "xlsxfile")]
+    XlsxFile,
+}
+
+impl DatabaseType {
+    pub fn is_external_tabular(&self) -> bool {
+        matches!(self, DatabaseType::CsvFile | DatabaseType::XlsxFile)
+    }
+
+    pub fn is_file_based(&self) -> bool {
+        matches!(self, DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile)
+    }
 }
 
 impl ConnectionConfig {
@@ -135,7 +149,7 @@ impl ConnectionConfig {
         let params = self.normalized_url_params();
 
         match self.db_type {
-            DatabaseType::Sqlite | DatabaseType::DuckDb => {
+            DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Redis => {
@@ -186,7 +200,7 @@ impl ConnectionConfig {
         let params = self.normalized_url_params();
 
         match self.db_type {
-            DatabaseType::Sqlite | DatabaseType::DuckDb => {
+            DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Redis => {
