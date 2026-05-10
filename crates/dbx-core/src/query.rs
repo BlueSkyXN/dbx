@@ -5,23 +5,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::connection::{AppState, PoolKind};
 use crate::db;
-use crate::sql::split_sql_statements;
+use crate::sql::{split_sql_statements, starts_with_executable_sql_keyword};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
 
+fn starts_with_external_read_keyword(sql: &str) -> bool {
+    starts_with_executable_sql_keyword(sql, &["SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN"])
+}
+
 pub fn duckdb_execute(con: &duckdb::Connection, sql: &str) -> Result<db::QueryResult, String> {
     let start = std::time::Instant::now();
-    let trimmed = sql.trim().to_uppercase();
 
-    if trimmed.starts_with("SELECT")
-        || trimmed.starts_with("SHOW")
-        || trimmed.starts_with("DESCRIBE")
-        || trimmed.starts_with("EXPLAIN")
-        || trimmed.starts_with("WITH")
-        || trimmed.starts_with("PRAGMA")
-    {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "PRAGMA"]) {
         let mut stmt = con.prepare(sql).map_err(|e| e.to_string())?;
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         let stmt_ref = rows.as_ref().ok_or("DuckDB statement unavailable")?;
@@ -244,6 +241,22 @@ pub async fn do_execute(
             .await
             .map(truncate_result)
         }
+        PoolKind::ExternalTabular(ext_pool) => {
+            if !starts_with_external_read_keyword(sql) {
+                return Err("External data sources are read-only. Only SELECT queries are supported.".to_string());
+            }
+            let con = ext_pool.cache.clone();
+            let sql = sql.to_string();
+            drop(connections);
+            wait_for_query(cancel_token, async move {
+                let task = tokio::task::spawn_blocking(move || {
+                    let con = con.lock().map_err(|e| e.to_string())?;
+                    duckdb_execute(&con, &sql)
+                });
+                task.await.map_err(|e| e.to_string())?
+            })
+            .await
+        }
     }
 }
 
@@ -403,7 +416,8 @@ pub async fn execute_statements_in_transaction(
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
             | PoolKind::Oracle(_)
-            | PoolKind::Elasticsearch(_) => TxPath::None,
+            | PoolKind::Elasticsearch(_)
+            | PoolKind::ExternalTabular(_) => TxPath::None,
         })
     };
 
@@ -610,6 +624,14 @@ async fn exec_tx_none_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_read_keyword_allows_only_result_set_queries() {
+        assert!(starts_with_external_read_keyword("SELECT * FROM users"));
+        assert!(starts_with_external_read_keyword("-- leading comment\nWITH rows AS (SELECT 1) SELECT * FROM rows"));
+        assert!(!starts_with_external_read_keyword("PRAGMA enable_profiling"));
+        assert!(!starts_with_external_read_keyword("UPDATE users SET name = 'Ada'"));
+    }
 
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {

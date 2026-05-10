@@ -4,6 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::db;
 use crate::db::ssh_tunnel::TunnelManager;
+use crate::external;
 use crate::models::connection::{parse_mongo_first_host, ConnectionConfig, DatabaseType};
 use crate::query_cancel::RunningQueries;
 use crate::storage::Storage;
@@ -37,6 +38,7 @@ pub enum PoolKind {
     Elasticsearch(db::elasticsearch_driver::EsClient),
     Dameng(Arc<std::sync::Mutex<db::dm_driver::DmClient>>),
     Gaussdb(Arc<tokio::sync::Mutex<db::gaussdb_driver::GaussdbClient>>),
+    ExternalTabular(Arc<external::ExternalPool>),
 }
 
 pub struct AppState {
@@ -354,6 +356,7 @@ mod tests {
             ssl: false,
             sysdba: false,
             connection_string: None,
+            external_config: None,
         }
     }
 

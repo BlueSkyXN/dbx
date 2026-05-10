@@ -258,6 +258,7 @@ pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: Strin
                 PoolKind::Elasticsearch(_) => {}
                 PoolKind::Dameng(_) => {}
                 PoolKind::Gaussdb(_) => {}
+                PoolKind::ExternalTabular(_) => {}
             }
         }
     }
