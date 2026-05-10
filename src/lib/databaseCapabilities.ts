@@ -1,5 +1,7 @@
 import type { DatabaseType } from "@/types/database";
 
+export const FILE_BASED_EXTERNAL_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile"]);
+
 export const SCHEMA_AWARE_TYPES = new Set<DatabaseType>([
   "postgres",
   "sqlserver",
@@ -10,7 +12,13 @@ export const SCHEMA_AWARE_TYPES = new Set<DatabaseType>([
   "jdbc",
 ]);
 
-export const SQL_FILE_UNSUPPORTED_TYPES = new Set<DatabaseType>(["redis", "mongodb", "elasticsearch"]);
+export const SQL_FILE_UNSUPPORTED_TYPES = new Set<DatabaseType>([
+  "redis",
+  "mongodb",
+  "elasticsearch",
+  "csvfile",
+  "xlsxfile",
+]);
 
 export const DIAGRAM_SUPPORTED_TYPES = new Set<DatabaseType>([
   "mysql",
@@ -21,6 +29,8 @@ export const DIAGRAM_SUPPORTED_TYPES = new Set<DatabaseType>([
   "redshift",
   "dameng",
   "gaussdb",
+  "csvfile",
+  "xlsxfile",
 ]);
 
 export const DATABASE_SEARCH_SUPPORTED_TYPES = new Set<DatabaseType>([
@@ -112,4 +122,8 @@ export function isSchemaAware(dbType?: DatabaseType): boolean {
 
 export function usesFetchFirst(dbType?: DatabaseType): boolean {
   return !!dbType && FETCH_FIRST_TYPES.has(dbType);
+}
+
+export function isFileBasedExternal(dbType?: DatabaseType): boolean {
+  return !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
 }

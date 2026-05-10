@@ -117,7 +117,8 @@ impl AppState {
             configs.get(connection_id).map(|c| c.db_type.clone())
         };
 
-        let is_embedded = matches!(db_type, Some(DatabaseType::Sqlite) | Some(DatabaseType::DuckDb));
+        let is_embedded = matches!(db_type, Some(DatabaseType::Sqlite) | Some(DatabaseType::DuckDb))
+            || db_type.as_ref().is_some_and(DatabaseType::is_external_tabular);
         if is_embedded {
             return Ok(connection_id.to_string());
         }
@@ -246,6 +247,23 @@ impl AppState {
                 .await?;
                 PoolKind::Gaussdb(Arc::new(tokio::sync::Mutex::new(client)))
             }
+            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+                let file_path = expand_tilde(&db_config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
+                let source: Arc<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Arc::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                };
+                let duckdb_con =
+                    duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
+                let pool = external::ExternalPool::new(source, Arc::new(std::sync::Mutex::new(duckdb_con)));
+                pool.refresh_cache().await?;
+                PoolKind::ExternalTabular(Arc::new(pool))
+            }
             DatabaseType::Jdbc => self.external_driver_pool("jdbc", &db_config).await?,
         };
 
@@ -258,7 +276,7 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        if !config.ssh_enabled || config.ssh_host.is_empty() {
+        if !config.ssh_enabled || config.ssh_host.is_empty() || config.db_type.is_file_based() {
             return Ok((config.host.clone(), config.port));
         }
 
@@ -306,6 +324,7 @@ impl AppState {
                     c.db_type == DatabaseType::Oracle
                         || c.db_type == DatabaseType::Elasticsearch
                         || c.db_type == DatabaseType::Dameng
+                        || c.db_type.is_external_tabular()
                 })
                 .unwrap_or(false)
         };
@@ -346,6 +365,7 @@ pub fn redacted_connection_url_for_endpoint(config: &ConnectionConfig, host: &st
 pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> Result<(), String> {
     match config.db_type {
         DatabaseType::Sqlite | DatabaseType::DuckDb => Ok(()),
+        _ if config.db_type.is_external_tabular() => Ok(()),
         DatabaseType::MongoDb if config.connection_string.as_deref().is_some_and(|value| !value.is_empty()) => Ok(()),
         DatabaseType::Jdbc => Ok(()),
         _ => db::probe_tcp_endpoint(&format!("{:?}", config.db_type), host, port).await,

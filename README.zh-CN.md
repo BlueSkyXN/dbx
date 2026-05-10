@@ -28,6 +28,8 @@
     <img src="https://img.shields.io/badge/openGauss-2B7BD9?logoColor=white" />
     <img src="https://img.shields.io/badge/GaussDB-E60012?logoColor=white" />
     <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
+    <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
+    <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>

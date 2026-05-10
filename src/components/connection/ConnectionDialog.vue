@@ -69,6 +69,7 @@ const defaultForm = (): Omit<ConnectionConfig, "id"> => ({
   ssh_connect_timeout_secs: 5,
   ssl: false,
   connection_string: undefined,
+  external_config: undefined,
   jdbc_driver_class: undefined,
   jdbc_driver_paths: [],
 });
@@ -119,6 +120,8 @@ const driverProfiles: Record<
   redis: { type: "redis", port: 6379, user: "", label: "Redis", icon: "redis" },
   sqlite: { type: "sqlite", port: 0, user: "", label: "SQLite", icon: "sqlite" },
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
+  csvfile: { type: "csvfile", port: 0, user: "", label: "CSV", icon: "csvfile" },
+  xlsxfile: { type: "xlsxfile", port: 0, user: "", label: "XLSX", icon: "xlsxfile" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
   clickhouse: {
     type: "clickhouse",
@@ -224,8 +227,11 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     form.value.port = profile.port;
     form.value.username = profile.user;
     form.value.url_params = profile.urlParams || "";
-    if (profile.type === "sqlite" || profile.type === "duckdb") {
+    if (["sqlite", "duckdb", "csvfile", "xlsxfile"].includes(profile.type)) {
       form.value.host = "";
+      form.value.username = "";
+      form.value.password = "";
+      form.value.database = undefined;
     }
     if (profile.type === "jdbc") {
       form.value.host = "";
@@ -266,6 +272,7 @@ watch(
         ssh_connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
         ssl: config.ssl || false,
         connection_string: config.connection_string,
+        external_config: config.external_config,
         jdbc_driver_class: config.jdbc_driver_class,
         jdbc_driver_paths: config.jdbc_driver_paths || [],
       };
@@ -325,6 +332,8 @@ const iconTypeMap: Record<string, string> = {
   mysql: "mysql",
   postgres: "postgres",
   sqlite: "sqlite",
+  csvfile: "csvfile",
+  xlsxfile: "xlsxfile",
   redis: "redis",
   mongodb: "mongodb",
   duckdb: "duckdb",
@@ -356,6 +365,8 @@ const dbOptions = [
   { value: "mysql", label: "MySQL" },
   { value: "postgres", label: "PostgreSQL" },
   { value: "sqlite", label: "SQLite" },
+  { value: "csvfile", label: "CSV" },
+  { value: "xlsxfile", label: "XLSX" },
   { value: "redis", label: "Redis" },
   { value: "mongodb", label: "MongoDB" },
   { value: "duckdb", label: "DuckDB" },
@@ -407,7 +418,14 @@ const filteredDbCategories = computed<DbCategory[]>(() => {
 const hasDbPickerResults = computed(() => filteredDbCategories.value.some((category) => category.options.length > 0));
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
-const canUseSsh = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "jdbc");
+const isFileConnection = computed(() => ["sqlite", "duckdb", "csvfile", "xlsxfile"].includes(form.value.db_type));
+const filePathPlaceholder = computed(() => {
+  if (form.value.db_type === "csvfile") return "/path/to/data.csv";
+  if (form.value.db_type === "xlsxfile") return "/path/to/workbook.xlsx";
+  if (form.value.db_type === "duckdb") return "/path/to/database.duckdb";
+  return "/path/to/database.db";
+});
+const canUseSsh = computed(() => !isFileConnection.value && !isJdbcConnection.value);
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
@@ -468,6 +486,12 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       .split(/\r?\n/)
       .map((path) => path.trim())
       .filter(Boolean);
+  }
+  if (config.db_type === "csvfile" || config.db_type === "xlsxfile") {
+    config.port = 0;
+    config.username = "";
+    config.password = "";
+    config.database = undefined;
   }
   return config;
 }
@@ -595,7 +619,11 @@ async function browseDbFilePath() {
     const filters =
       form.value.db_type === "duckdb"
         ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
-        : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
+        : form.value.db_type === "csvfile"
+          ? [{ name: "CSV", extensions: ["csv", "tsv"] }]
+          : form.value.db_type === "xlsxfile"
+            ? [{ name: "Excel", extensions: ["xlsx", "xlsm", "xls"] }]
+            : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -787,7 +815,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent value="connection" class="m-0">
               <div class="grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
-                <div v-if="!isJdbcConnection" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!isJdbcConnection && !isFileConnection" class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input
@@ -936,12 +964,12 @@ function openExternalUrl(url: string) {
                   </div>
                 </template>
 
-                <!-- SQLite / DuckDB: file path only -->
-                <template v-else-if="form.db_type === 'sqlite' || form.db_type === 'duckdb'">
+                <!-- Local file sources: file path only -->
+                <template v-else-if="isFileConnection">
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.filePath") }}</Label>
                     <div class="col-span-3 flex items-center gap-1">
-                      <Input v-model="form.host" class="flex-1" placeholder="/path/to/database.db" />
+                      <Input v-model="form.host" class="flex-1" :placeholder="filePathPlaceholder" />
                       <Tooltip v-if="isDesktop">
                         <TooltipTrigger as-child>
                           <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseDbFilePath">

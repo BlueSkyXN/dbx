@@ -41,6 +41,20 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
     let result = match probe_result {
         Err(e) => Err(e),
         Ok(()) => match config.db_type {
+            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+                use dbx_core::external;
+                let file_path = expand_tilde(&config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, config.external_config.as_ref())?;
+                let source: Box<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Box::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Box::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                };
+                source.test_connection().await
+            }
             DatabaseType::Mysql if config.needs_bare_mysql() => match db::mysql::connect_bare(&url).await {
                 Ok(pool) => {
                     pool.close().await;
@@ -134,7 +148,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
         },
     };
 
-    if config.ssh_enabled && !config.ssh_host.is_empty() {
+    if config.ssh_enabled && !config.ssh_host.is_empty() && !config.db_type.is_file_based() {
         state.tunnels.stop_tunnel(&tunnel_id).await;
     }
 
@@ -230,6 +244,24 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             )
             .await?;
             PoolKind::Gaussdb(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+        }
+        db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            use dbx_core::external;
+            let file_path = expand_tilde(&db_config.host);
+            let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
+            let source: std::sync::Arc<dyn external::ExternalTabularSource> = match ext_config {
+                external::ExternalConfig::Csv(csv_config) => {
+                    std::sync::Arc::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                }
+                external::ExternalConfig::Xlsx(xlsx_config) => {
+                    std::sync::Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                }
+            };
+            let duckdb_con =
+                duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
+            let ext_pool = external::ExternalPool::new(source, std::sync::Arc::new(std::sync::Mutex::new(duckdb_con)));
+            ext_pool.refresh_cache().await?;
+            PoolKind::ExternalTabular(std::sync::Arc::new(ext_pool))
         }
         DatabaseType::Jdbc => state.external_driver_pool("jdbc", &db_config).await?,
     };

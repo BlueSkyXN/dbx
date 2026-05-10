@@ -14,6 +14,8 @@ export type DatabaseType =
   | "redshift"
   | "dameng"
   | "gaussdb"
+  | "csvfile"
+  | "xlsxfile"
   | "jdbc";
 
 export interface ConnectionConfig {
@@ -41,6 +43,7 @@ export interface ConnectionConfig {
   ssl?: boolean;
   sysdba?: boolean;
   connection_string?: string;
+  external_config?: Record<string, unknown>;
   jdbc_driver_class?: string;
   jdbc_driver_paths?: string[];
 }
