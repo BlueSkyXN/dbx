@@ -52,14 +52,14 @@ impl FeishuClient {
             base_url,
             app_id: app_id.trim().to_string(),
             app_secret: app_secret.trim().to_string(),
-            access_token: clean_optional(access_token),
+            access_token: clean_access_token(access_token),
             cached_tenant_token: Arc::new(Mutex::new(None)),
         }
     }
 
     async fn bearer_token(&self) -> Result<String, String> {
         if let Some(token) = self.access_token.as_deref().filter(|token| !token.trim().is_empty()) {
-            return Ok(token.trim().to_string());
+            return Ok(normalize_access_token_value(token));
         }
 
         {
@@ -277,7 +277,7 @@ impl FeishuSheetsSource {
         range: &str,
         rows: Vec<Vec<Value>>,
     ) -> Result<ExternalWriteResult, String> {
-        let write_range = if range.contains('!') { range.to_string() } else { format!("{sheet_id}!{range}") };
+        let write_range = normalize_sheet_write_range(sheet_id, range, &rows);
         let path =
             format!("/open-apis/sheets/v2/spreadsheets/{}/values", encode_path_segment(&self.config.spreadsheet_token));
         let body = serde_json::json!({
@@ -367,14 +367,7 @@ impl ExternalTabularSource for FeishuSheetsSource {
             .as_deref()
             .filter(|range| !range.trim().is_empty())
             .map(|range| if range.contains('!') { range.to_string() } else { format!("{}!{range}", table.source_id) })
-            .unwrap_or_else(|| {
-                format!(
-                    "{}!A1:{}{}",
-                    table.source_id,
-                    column_label(rows.iter().map(Vec::len).max().unwrap_or(1)),
-                    rows.len().max(1)
-                )
-            });
+            .unwrap_or_else(|| table.source_id.clone());
         let path = format!(
             "/open-apis/sheets/v2/spreadsheets/{}/values_append",
             encode_path_segment(&self.config.spreadsheet_token)
@@ -985,6 +978,22 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
 }
 
+fn clean_access_token(value: Option<String>) -> Option<String> {
+    clean_optional(value).map(|value| normalize_access_token_value(&value)).filter(|value| !value.is_empty())
+}
+
+fn normalize_access_token_value(value: &str) -> String {
+    let value = value.trim();
+    let rest = value.get(6..).unwrap_or_default();
+    if value.get(..6).is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
+        && rest.chars().next().is_some_and(char::is_whitespace)
+    {
+        rest.trim().to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn clean_title(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1009,6 +1018,76 @@ fn column_label(mut one_based_index: usize) -> String {
     chars.iter().rev().collect()
 }
 
+fn normalize_sheet_write_range(sheet_id: &str, range: &str, rows: &[Vec<Value>]) -> String {
+    let range = range.trim();
+    let (target_sheet_id, cell_range) = match range.split_once('!') {
+        Some((range_sheet_id, cell_range)) => (range_sheet_id.trim(), cell_range.trim()),
+        None => (sheet_id.trim(), range),
+    };
+
+    let target_sheet_id = if target_sheet_id.is_empty() { sheet_id.trim() } else { target_sheet_id };
+    if target_sheet_id.is_empty() {
+        return range.to_string();
+    }
+    let cell_range = if !range.contains('!') && cell_range == target_sheet_id { "" } else { cell_range };
+
+    if let Some((column, row)) = parse_cell_ref(cell_range) {
+        let (row_count, column_count) = matrix_dimensions(rows);
+        let start_column = column_label(column_index(column));
+        let end_column = column_label(column_index(column) + column_count.saturating_sub(1));
+        let end_row = row + row_count.saturating_sub(1);
+        return format!("{target_sheet_id}!{start_column}{row}:{end_column}{end_row}");
+    }
+
+    if cell_range.is_empty() {
+        let (row_count, column_count) = matrix_dimensions(rows);
+        return format!("{target_sheet_id}!A1:{}{}", column_label(column_count), row_count);
+    }
+
+    if range.contains('!') {
+        format!("{target_sheet_id}!{cell_range}")
+    } else {
+        format!("{target_sheet_id}!{range}")
+    }
+}
+
+fn matrix_dimensions(rows: &[Vec<Value>]) -> (usize, usize) {
+    let row_count = rows.len().max(1);
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    (row_count, column_count)
+}
+
+fn parse_cell_ref(value: &str) -> Option<(&str, usize)> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(':') {
+        return None;
+    }
+
+    let split_at = value.find(|c: char| c.is_ascii_digit())?;
+    let (column, row) = value.split_at(split_at);
+    if column.is_empty()
+        || row.is_empty()
+        || !column.chars().all(|c| c.is_ascii_alphabetic())
+        || !row.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let row = row.parse::<usize>().ok()?;
+    if row == 0 {
+        return None;
+    }
+    Some((column, row))
+}
+
+fn column_index(label: &str) -> usize {
+    label
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .fold(0usize, |acc, c| acc * 26 + (c.to_ascii_uppercase() as u8 - b'A' + 1) as usize)
+        .max(1)
+}
+
 fn collapse_raw_responses(mut responses: Vec<Value>) -> Value {
     if responses.len() == 1 {
         responses.remove(0)
@@ -1027,6 +1106,28 @@ mod tests {
         assert_eq!(column_label(26), "Z");
         assert_eq!(column_label(27), "AA");
         assert_eq!(column_label(702), "ZZ");
+    }
+
+    #[test]
+    fn normalizes_pasted_bearer_tokens() {
+        assert_eq!(normalize_access_token_value("Bearer t-abc"), "t-abc");
+        assert_eq!(normalize_access_token_value("bearer   u-abc  "), "u-abc");
+        assert_eq!(normalize_access_token_value("bearer-token-without-space"), "bearer-token-without-space");
+        assert_eq!(normalize_access_token_value("t-raw"), "t-raw");
+    }
+
+    #[test]
+    fn expands_sheet_write_anchor_ranges_to_payload_dimensions() {
+        let rows = vec![
+            vec![Value::String("A".to_string()), Value::String("B".to_string())],
+            vec![Value::String("C".to_string()), Value::String("D".to_string())],
+        ];
+
+        assert_eq!(normalize_sheet_write_range("s1", "A1", &rows), "s1!A1:B2");
+        assert_eq!(normalize_sheet_write_range("s1", "C3", &rows), "s1!C3:D4");
+        assert_eq!(normalize_sheet_write_range("s1", "s2!Z9", &rows), "s2!Z9:AA10");
+        assert_eq!(normalize_sheet_write_range("s1", "A1:C3", &rows), "s1!A1:C3");
+        assert_eq!(normalize_sheet_write_range("s1", "s1", &rows), "s1!A1:B2");
     }
 
     #[test]
