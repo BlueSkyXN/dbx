@@ -462,7 +462,7 @@ function updateExternalConfig(patch: Record<string, unknown>) {
 }
 
 function normalizeCsvDelimiter(value: string) {
-  if (value === "\\t") return "\t";
+  if (value === "\\t" || value === "\\\\t") return "\t";
   return value.charAt(0) || ",";
 }
 
@@ -852,7 +852,7 @@ async function browseDbFilePath() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value=",">{{ t("connection.delimiterComma") }}</SelectItem>
-                        <SelectItem value="\\t">{{ t("connection.delimiterTab") }}</SelectItem>
+                        <SelectItem :value="'\\t'">{{ t("connection.delimiterTab") }}</SelectItem>
                         <SelectItem value=";">{{ t("connection.delimiterSemicolon") }}</SelectItem>
                         <SelectItem value="|">{{ t("connection.delimiterPipe") }}</SelectItem>
                       </SelectContent>
