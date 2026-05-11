@@ -21,7 +21,7 @@ import {
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject, SqlCompletionTable } from "@/lib/sqlCompletion";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
+import { FILE_BASED_EXTERNAL_TYPES, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/databaseTree";
 import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
@@ -1950,6 +1950,23 @@ export const useConnectionStore = defineStore("connection", () => {
     await restoreExpandedChildren(node, expandedIds, { force: true });
   }
 
+  async function refreshExternalConnection(connectionId: string) {
+    const config = getConfig(connectionId);
+    if (!config || !FILE_BASED_EXTERNAL_TYPES.has(config.db_type)) return;
+
+    await ensureConnected(connectionId);
+    await api.refreshExternalConnection(connectionId);
+    clearConnectionError(connectionId);
+    invalidateCompletionCache(connectionId);
+    clearLoadedChildrenCache(connectionId);
+
+    const node = findNode(treeNodes.value, connectionId);
+    if (node) {
+      node.children = [];
+      await loadTreeNodeChildren(node, { force: true });
+    }
+  }
+
   async function refreshDatabaseTreeNode(connectionId: string, database: string) {
     const node = findDatabaseTreeNode(treeNodes.value, connectionId, database);
     if (node) {
@@ -3003,6 +3020,7 @@ export const useConnectionStore = defineStore("connection", () => {
     removeTreeNode,
     refreshAllTree,
     refreshTreeNode,
+    refreshExternalConnection,
     refreshDatabaseTreeNode,
     refreshObjectListTreeNode,
     connectedIds,

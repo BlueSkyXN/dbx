@@ -357,6 +357,7 @@ pub fn run() {
             commands::connection::disconnect_db,
             commands::connection::close_database_connection,
             commands::connection::refresh_connections,
+            commands::connection::refresh_external_connection,
             commands::connection::save_connections,
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,

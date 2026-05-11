@@ -573,6 +573,10 @@ export async function refreshConnections(): Promise<void> {
   return invoke("refresh_connections");
 }
 
+export async function refreshExternalConnection(connectionId: string): Promise<void> {
+  return invoke("refresh_external_connection", { connectionId });
+}
+
 export async function cancelQuery(executionId: string): Promise<boolean> {
   return invoke("cancel_query", { executionId });
 }

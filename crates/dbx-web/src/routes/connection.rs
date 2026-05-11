@@ -30,6 +30,12 @@ pub struct CloseDatabaseConnectionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RefreshExternalRequest {
+    pub connection_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
@@ -117,6 +123,13 @@ pub async fn close_database_connection(
     let database = body.database.trim();
     let database = if database.is_empty() { None } else { Some(database) };
     state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError)
+}
+
+pub async fn refresh_external_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<RefreshExternalRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.refresh_external_pool(&body.connection_id).await.map(Json).map_err(AppError)
 }
 
 pub async fn save_connections(

@@ -126,3 +126,45 @@ impl ExternalConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::connection::DatabaseType;
+
+    #[test]
+    fn parses_csv_ui_config() {
+        let value = serde_json::json!({
+            "delimiter": "\t",
+            "has_header": false
+        });
+
+        let config = ExternalConfig::parse(&DatabaseType::CsvFile, Some(&value)).unwrap();
+
+        match config {
+            ExternalConfig::Csv(config) => {
+                assert_eq!(config.delimiter, '\t');
+                assert!(!config.has_header);
+            }
+            ExternalConfig::Xlsx(_) => panic!("expected CSV external config"),
+        }
+    }
+
+    #[test]
+    fn parses_xlsx_ui_config() {
+        let value = serde_json::json!({
+            "sheet_name": "Sheet2",
+            "has_header": false
+        });
+
+        let config = ExternalConfig::parse(&DatabaseType::XlsxFile, Some(&value)).unwrap();
+
+        match config {
+            ExternalConfig::Xlsx(config) => {
+                assert_eq!(config.sheet_name.as_deref(), Some("Sheet2"));
+                assert!(!config.has_header);
+            }
+            ExternalConfig::Csv(_) => panic!("expected XLSX external config"),
+        }
+    }
+}

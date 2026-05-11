@@ -1601,4 +1601,8 @@ export async function refreshConnections(): Promise<void> {
   // Web mode doesn't maintain persistent connection pools - no-op
 }
 
+export async function refreshExternalConnection(connectionId: string): Promise<void> {
+  return post("/api/connection/refresh-external", { connectionId });
+}
+
 export * from "./mq-http";

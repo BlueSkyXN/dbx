@@ -1095,3 +1095,8 @@ pub async fn ensure_connection_writable(
     }
     Ok(())
 }
+
+#[tauri::command]
+pub async fn refresh_external_connection(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
+    state.refresh_external_pool(&connection_id).await
+}

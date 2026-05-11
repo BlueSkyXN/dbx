@@ -55,6 +55,7 @@ export const connectionFinalProxyPort = forward("connectionFinalProxyPort");
 export const disconnectDb = forward("disconnectDb");
 export const closeDatabaseConnection = forward("closeDatabaseConnection");
 export const refreshConnections = forward("refreshConnections");
+export const refreshExternalConnection = forward("refreshExternalConnection");
 export const saveConnections = forward("saveConnections");
 export const loadConnections = forward("loadConnections");
 export const readKeychainPassword = forward("readKeychainPassword");

@@ -72,7 +72,19 @@ import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sq
 import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
 import { editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/tableEditing";
-import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
+import {
+  FILE_BASED_EXTERNAL_TYPES,
+  supportsDatabaseCreation,
+  supportsDatabaseSearch,
+  supportsFieldLineage,
+  supportsObjectBrowserTreeNode,
+  supportsSchemaDiagram,
+  supportsSqlFileExecution,
+  supportsTableImport,
+  supportsTableTruncate,
+  supportsTableStructureEditing,
+  usesTreeSchemaMode,
+} from "@/lib/databaseCapabilities";
 import { copyNameForTreeNode, objectSourceKindForTreeNode, sidebarSelectionCopyAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/treeNodeClick";
 import { formatSqlInsert } from "@/lib/exportFormats";
 import { fetchTableDataForExport } from "@/lib/tableDataExport";
@@ -1130,6 +1142,16 @@ async function refresh() {
     if (e?.message?.includes("driver is not installed") || (e?.message?.includes("JRE") && e?.message?.includes("not installed"))) {
       window.dispatchEvent(new Event("dbx-open-driver-store"));
     }
+  }
+}
+
+async function refreshExternalSnapshot() {
+  if (!props.node.connectionId) return;
+  try {
+    await connectionStore.refreshExternalConnection(props.node.connectionId);
+    toast(t("contextMenu.refreshExternalSnapshotSuccess"), 3000);
+  } catch (e: any) {
+    toast(t("contextMenu.refreshExternalSnapshotFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -2667,6 +2689,10 @@ const tableComment = computed(() =>
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(() => props.node.type === "connection" && !!props.node.connectionId && connectionStore.connectedIds.has(props.node.connectionId));
 const isConnectionReadonly = computed(() => props.node.type === "connection" && !!props.node.connectionId && (connectionStore.getConfig(props.node.connectionId)?.read_only ?? false));
+const canRefreshExternalSnapshot = computed(() => {
+  const dbType = currentDatabaseType();
+  return props.node.type === "connection" && !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+});
 const canCloseDatabaseConnection = computed(() => props.node.type === "database" && !!props.node.connectionId && props.node.database != null && connectionStore.connectedIds.has(props.node.connectionId));
 const nodeIconClass = computed(() => {
   const infoClass = getIconInfo(props.node)?.colorClass;
@@ -3112,6 +3138,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
       icon: RefreshCw,
       shortcut: shortcutRefresh,
     });
+    if (canRefreshExternalSnapshot.value) {
+      items.push({
+        label: t("contextMenu.refreshExternalSnapshot"),
+        action: refreshExternalSnapshot,
+        icon: RefreshCw,
+      });
+    }
     if (canConfigureVisibleDatabases.value) {
       items.push({
         label: t("contextMenu.selectVisibleDatabases"),

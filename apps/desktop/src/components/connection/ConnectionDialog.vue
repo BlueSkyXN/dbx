@@ -688,6 +688,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.connection_string = undefined;
     }
   }
+  ensureExternalConfigDefaults(profile.type);
 }
 
 function switchOceanbaseMode(mode: "mysql" | "oracle") {
@@ -751,6 +752,7 @@ watch(
         redis_key_separator: config.redis_key_separator ?? ":",
         etcd_endpoints: config.etcd_endpoints || "",
         informix_server: config.informix_server || "",
+        external_config: config.external_config,
         read_only: config.read_only || false,
         visible_databases: config.visible_databases,
       };
@@ -769,6 +771,7 @@ watch(
       if (profile === "gbase8a" || profile === "gbase8s") {
         selectedType.value = "gbase";
       }
+      ensureExternalConfigDefaults(config.db_type);
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
@@ -1037,6 +1040,7 @@ const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selecte
 const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
+const isExternalFileConnection = computed(() => form.value.db_type === "csvfile" || form.value.db_type === "xlsxfile");
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const filePathPlaceholder = computed(() => {
@@ -1048,6 +1052,74 @@ const filePathPlaceholder = computed(() => {
   return "/path/to/database.db or :memory:";
 });
 const supportsMemoryDatabasePath = computed(() => form.value.db_type === "sqlite" || form.value.db_type === "duckdb");
+
+function externalConfigRecord(value = form.value.external_config): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function updateExternalConfig(patch: Record<string, unknown>) {
+  form.value.external_config = {
+    ...externalConfigRecord(),
+    ...patch,
+  };
+}
+
+function normalizeCsvDelimiter(value: string) {
+  if (value === "\\t") return "\t";
+  return value.charAt(0) || ",";
+}
+
+function ensureExternalConfigDefaults(dbType = form.value.db_type) {
+  if (dbType === "csvfile") {
+    const existing = externalConfigRecord();
+    form.value.external_config = {
+      delimiter: normalizeCsvDelimiter(typeof existing.delimiter === "string" ? existing.delimiter : ","),
+      has_header: existing.has_header !== false,
+    };
+    return;
+  }
+
+  if (dbType === "xlsxfile") {
+    const existing = externalConfigRecord();
+    const sheetName = typeof existing.sheet_name === "string" ? existing.sheet_name.trim() : "";
+    form.value.external_config = {
+      ...(sheetName ? { sheet_name: sheetName } : {}),
+      has_header: existing.has_header !== false,
+    };
+    return;
+  }
+
+  form.value.external_config = undefined;
+}
+
+const csvDelimiter = computed({
+  get: () => {
+    const value = externalConfigRecord().delimiter;
+    if (value === "\t") return "\\t";
+    return typeof value === "string" && value.length > 0 ? value : ",";
+  },
+  set: (value: string) => {
+    updateExternalConfig({ delimiter: normalizeCsvDelimiter(value) });
+  },
+});
+
+const externalHasHeader = computed({
+  get: () => externalConfigRecord().has_header !== false,
+  set: (value: boolean) => {
+    updateExternalConfig({ has_header: value });
+  },
+});
+
+const xlsxSheetName = computed({
+  get: () => {
+    const value = externalConfigRecord().sheet_name;
+    return typeof value === "string" ? value : "";
+  },
+  set: (value: string) => {
+    updateExternalConfig({ sheet_name: value });
+  },
+});
+
 const sqliteExtensionPaths = computed({
   get: () => sqliteExtensionPathsFromParams(form.value.url_params),
   set: (value: string) => {
@@ -1298,6 +1370,19 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.database = undefined;
     config.connection_string = undefined;
     config.url_params = "";
+  } else if (config.db_type === "csvfile") {
+    const existing = externalConfigRecord(config.external_config);
+    config.external_config = {
+      delimiter: normalizeCsvDelimiter(typeof existing.delimiter === "string" ? existing.delimiter : ","),
+      has_header: existing.has_header !== false,
+    };
+  } else if (config.db_type === "xlsxfile") {
+    const existing = externalConfigRecord(config.external_config);
+    const sheetName = typeof existing.sheet_name === "string" ? existing.sheet_name.trim() : "";
+    config.external_config = {
+      ...(sheetName ? { sheet_name: sheetName } : {}),
+      has_header: existing.has_header !== false,
+    };
   } else {
     config.external_config = undefined;
   }
@@ -2632,6 +2717,37 @@ function openExternalUrl(url: string) {
                         {{ t("connection.memoryDatabasePathHint") }}
                       </p>
                     </div>
+                  </div>
+                  <div v-if="form.db_type === 'csvfile'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.csvDelimiter") }}</Label>
+                    <Select v-model="csvDelimiter">
+                      <SelectTrigger class="col-span-3 w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value=",">{{ t("connection.delimiterComma") }}</SelectItem>
+                        <SelectItem value="\\t">{{ t("connection.delimiterTab") }}</SelectItem>
+                        <SelectItem value=";">{{ t("connection.delimiterSemicolon") }}</SelectItem>
+                        <SelectItem value="|">{{ t("connection.delimiterPipe") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div v-if="form.db_type === 'xlsxfile'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.xlsxSheetName") }}</Label>
+                    <Input v-model="xlsxSheetName" class="col-span-3" :placeholder="t('connection.xlsxSheetNamePlaceholder')" />
+                  </div>
+                  <div v-if="isExternalFileConnection" class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex cursor-pointer items-center gap-2">
+                      <Switch v-model="externalHasHeader" />
+                      <span class="text-xs text-muted-foreground">{{ t("connection.firstRowHeader") }}</span>
+                    </label>
+                  </div>
+                  <div v-if="isExternalFileConnection" class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 text-xs text-muted-foreground">
+                      {{ t("connection.fileSnapshotHint") }}
+                    </p>
                   </div>
                   <div v-if="form.db_type === 'sqlite'" class="grid grid-cols-4 items-start gap-4">
                     <Label class="text-right mt-2">{{ t("connection.sqliteExtensions") }}</Label>

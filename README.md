@@ -121,6 +121,7 @@ Virtual-scrolled table that handles large result sets. Inline editing, SQL previ
 - **Database export** — full database dump
 - **Data compare** — compare table data and review synchronization output
 - **SQL file execution** — run `.sql` files directly
+- **Local file connections** — query CSV/XLSX files as read-only snapshots, with manual refresh after file changes
 - **File preview** — drag & drop Parquet, CSV, JSON to preview instantly (powered by DuckDB)
 - **Connection import** — bring connection profiles from DBeaver or Navicat
 
