@@ -206,6 +206,58 @@ pub fn statement_summary(statement: &str) -> String {
     collapsed.chars().take(MAX_LEN).collect()
 }
 
+pub fn starts_with_executable_sql_keyword(sql: &str, keywords: &[&str]) -> bool {
+    let Some(token) = first_executable_sql_token(sql) else {
+        return false;
+    };
+    keywords.iter().any(|keyword| token.eq_ignore_ascii_case(keyword))
+}
+
+fn first_executable_sql_token(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || (i + 3 < bytes.len() && &bytes[i + 2..i + 4] == b"M!")) {
+                i += if bytes[i + 2] == b'!' { 3 } else { 4 };
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i].is_ascii_whitespace()) {
+                    i += 1;
+                }
+                break;
+            }
+
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+
+        break;
+    }
+
+    let start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        i += 1;
+    }
+
+    (i > start).then_some(&sql[start..i])
+}
+
 fn starts_with_chars(chars: &[char], start: usize, needle: &[char]) -> bool {
     start + needle.len() <= chars.len() && chars[start..start + needle.len()] == *needle
 }
@@ -306,7 +358,7 @@ fn split_sql_script(sql: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_sql_script, SqlStatementSplitter};
+    use super::{split_sql_script, starts_with_executable_sql_keyword, SqlStatementSplitter};
 
     #[test]
     fn splits_semicolon_delimited_statements() {
@@ -393,5 +445,22 @@ mod tests {
             split_sql_script("/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\nSELECT 1;",).unwrap(),
             vec!["/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */", "SELECT 1",]
         );
+    }
+
+    #[test]
+    fn detects_result_set_keyword_after_comments() {
+        assert!(starts_with_executable_sql_keyword("-- comment\nselect * from users;", &["SELECT"]));
+        assert!(starts_with_executable_sql_keyword(
+            "/* comment */\nWITH rows AS (SELECT 1) SELECT * FROM rows;",
+            &["WITH"]
+        ));
+        assert!(!starts_with_executable_sql_keyword("-- comment only\n", &["SELECT"]));
+        assert!(!starts_with_executable_sql_keyword("selected * from users", &["SELECT"]));
+    }
+
+    #[test]
+    fn detects_mysql_executable_comment_keyword() {
+        assert!(starts_with_executable_sql_keyword("/*!40101 SELECT 1 */", &["SELECT"]));
+        assert!(starts_with_executable_sql_keyword("/*M! SELECT 1 */", &["SELECT"]));
     }
 }
