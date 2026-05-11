@@ -1,0 +1,66 @@
+---
+title: 云表格数据源
+description: 将飞书电子表格和多维表格作为可查询的外部表格数据源连接到 DBX。
+---
+
+DBX 可以通过 Feishu OpenAPI 连接飞书电子表格和飞书多维表格，将数据加载到内存 DuckDB 缓存中，并以表的形式执行 `SELECT` 查询。
+
+## 鉴权
+
+先创建具备云文档权限的飞书应用，然后配置以下任一凭证路径：
+
+| 字段 | 用途 |
+|---|---|
+| OpenAPI | 基础地址，通常是 `https://open.feishu.cn` |
+| App ID / App Secret | 通过 `/open-apis/auth/v3/tenant_access_token/internal` 获取 `tenant_access_token` |
+| Access Token | 可选的预签发 `tenant_access_token` 或 `user_access_token`；填写后 DBX 会直接使用 |
+
+Token 对应的应用或用户仍然需要目标电子表格或多维表格的文档访问权限。
+
+## 飞书电子表格
+
+电子表格连接使用这些 OpenAPI：
+
+| 操作 | Endpoint |
+|---|---|
+| 列出工作表 | `GET /open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/query` |
+| 读取范围 | `GET /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values/:range` |
+| 追加行 | `POST /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values_append` |
+| 覆盖范围 | `PUT /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values` |
+
+需要配置 `Spreadsheet Token`，可选配置 `Sheet ID`、`Range`、渲染选项、首行表头、行列上限和同步模式。如果不填写 `Range`，DBX 会从 `A1` 读取到配置的行列上限。
+
+## 飞书多维表格
+
+多维表格连接使用这些 OpenAPI：
+
+| 操作 | Endpoint |
+|---|---|
+| 列出数据表 | `GET /open-apis/bitable/v1/apps/:app_token/tables` |
+| 列出字段 | `GET /open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields` |
+| 查询记录 | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/search` |
+| 新增记录 | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_create` |
+| 更新记录 | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_update` |
+| 删除记录 | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_delete` |
+
+需要配置 `App Token`，可选配置 `Table ID`、`View ID`、字段白名单、`user_id_type`、分页大小、最大记录数和同步模式。DBX 会把 `_record_id` 暴露为主键，表数据视图中的行内编辑可通过 batch update/delete 写回飞书多维表格。
+
+## 同步模式
+
+| 模式 | 行为 |
+|---|---|
+| Snapshot | 连接时加载，之后依赖手动刷新，成本最低。 |
+| Refresh before SELECT | 每次外部 `SELECT` 前刷新缓存。这是轮询式新鲜度，不是飞书事件订阅。 |
+
+外部写入成功后会刷新缓存。本实现尚未启用后台异步同步或飞书 webhook 订阅。
+
+## 写入 API
+
+桌面端和 Web 模式都暴露这些写入操作：
+
+| API | 数据源 |
+|---|---|
+| `appendExternalRows(connectionId, tableName, rows)` | 电子表格追加、多维表格新增 |
+| `updateExternalRows(connectionId, tableName, updates)` | 多维表格批量更新 |
+| `deleteExternalRows(connectionId, tableName, rowIds)` | 多维表格批量删除 |
+| `writeExternalRange(connectionId, tableName, range, rows)` | 电子表格范围覆盖 |

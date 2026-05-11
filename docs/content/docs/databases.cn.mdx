@@ -23,6 +23,8 @@ Rust 原生驱动，不依赖 JDBC。MySQL / PostgreSQL 兼容数据库开箱即
 | Elasticsearch | HTTP client | REST |
 | DM（达梦） | odbc-api | ODBC |
 | GaussDB | rust-gaussdb | GaussDB |
+| 飞书电子表格 | Feishu OpenAPI + DuckDB cache | HTTPS |
+| 飞书多维表格 | Feishu OpenAPI + DuckDB cache | HTTPS |
 
 ## MySQL 兼容
 
@@ -56,6 +58,12 @@ OceanBase 支持自动检测 Oracle 模式 — 当连接的 OceanBase 实例运�
 ## ODBC 数据库
 
 DM（达梦）通过 ODBC 连接，需要在系统上安装对应的 ODBC 驱动。
+
+## 外部表格数据源
+
+CSV/XLSX 文件和飞书云文档表格会先加载到内存 DuckDB 缓存中再查询。CSV/XLSX 是本地快照；飞书电子表格和多维表格可以手动刷新，也可以配置为每次 `SELECT` 前刷新。
+
+飞书电子表格支持发现工作表、读取范围、追加写入，以及通过外部写入 API 覆盖指定范围。飞书多维表格支持发现数据表和字段、查询记录、追加、更新和删除记录。连接字段和同步行为见[云表格数据源](/cn/docs/cloud-sources)。
 
 ### DM（达梦）
 

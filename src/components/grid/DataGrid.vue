@@ -56,7 +56,7 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
-import type { QueryResult, ColumnInfo, DatabaseType } from "@/types/database";
+import type { QueryResult, ColumnInfo, DatabaseType, ExternalRowUpdate } from "@/types/database";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import * as api from "@/lib/api";
 import {
@@ -741,7 +741,21 @@ function exitTransaction() {
   transactionActive.value = false;
 }
 
-const useTransaction = computed(() => props.editable && !!props.connectionId && !!props.database && !!props.tableMeta);
+const isFeishuBitableTableEditor = computed(
+  () =>
+    props.databaseType === "feishu_bitable" &&
+    props.context === "table-data" &&
+    !!props.connectionId &&
+    !!props.tableMeta,
+);
+const useTransaction = computed(
+  () =>
+    props.editable &&
+    !!props.connectionId &&
+    !!props.database &&
+    !!props.tableMeta &&
+    !isFeishuBitableTableEditor.value,
+);
 
 async function onToolbarRefresh() {
   if (transactionActive.value) {
@@ -1355,6 +1369,31 @@ function generateSaveStatements(): string[] {
 }
 
 async function saveChanges() {
+  if (isFeishuBitableTableEditor.value) {
+    saveError.value = "";
+    isSaving.value = true;
+    try {
+      await saveFeishuBitableChanges();
+    } catch (e: any) {
+      saveError.value = String(e.message || e);
+      isSaving.value = false;
+      return;
+    }
+    dirtyRows.value.clear();
+    newRows.value = [];
+    deletedRows.value.clear();
+    exitTransaction();
+    isSaving.value = false;
+    emit(
+      "reload",
+      props.sql,
+      searchText.value,
+      whereFilterInput.value.trim() || undefined,
+      orderByInput.value.trim() || undefined,
+    );
+    return;
+  }
+
   const stmts = generateSaveStatements();
   if (stmts.length === 0) return;
   saveError.value = "";
@@ -1399,6 +1438,54 @@ async function saveChanges() {
     whereFilterInput.value.trim() || undefined,
     orderByInput.value.trim() || undefined,
   );
+}
+
+async function saveFeishuBitableChanges() {
+  if (!props.connectionId || !props.tableMeta) {
+    throw new Error("Missing Feishu Bitable table context");
+  }
+
+  const recordIdIndex = props.result.columns.indexOf("_record_id");
+  if (recordIdIndex < 0) {
+    throw new Error("Feishu Bitable edits require the _record_id column");
+  }
+
+  const updates: ExternalRowUpdate[] = [];
+  for (const [rowIndex, changes] of dirtyRows.value.entries()) {
+    const row = props.result.rows[rowIndex];
+    const rowId = String(row?.[recordIdIndex] ?? "").trim();
+    if (!rowId) continue;
+
+    const fields: Record<string, unknown> = {};
+    for (const [columnIndex, value] of changes.entries()) {
+      const columnName = props.result.columns[columnIndex];
+      if (!columnName || columnName === "_record_id") continue;
+      fields[columnName] = value;
+    }
+    if (Object.keys(fields).length > 0) {
+      updates.push({ rowId, fields });
+    }
+  }
+
+  const rowIds = [...deletedRows.value]
+    .map((rowIndex) => String(props.result.rows[rowIndex]?.[recordIdIndex] ?? "").trim())
+    .filter(Boolean);
+
+  const writableColumnIndexes = props.result.columns
+    .map((columnName, index) => ({ columnName, index }))
+    .filter(({ columnName }) => columnName !== "_record_id")
+    .map(({ index }) => index);
+  const rowsToAppend = newRows.value.map((row) => writableColumnIndexes.map((index) => row[index] ?? null));
+
+  if (updates.length > 0) {
+    await api.updateExternalRows(props.connectionId, props.tableMeta.tableName, updates);
+  }
+  if (rowIds.length > 0) {
+    await api.deleteExternalRows(props.connectionId, props.tableMeta.tableName, rowIds);
+  }
+  if (rowsToAppend.length > 0) {
+    await api.appendExternalRows(props.connectionId, props.tableMeta.tableName, rowsToAppend);
+  }
 }
 
 function discardChanges() {

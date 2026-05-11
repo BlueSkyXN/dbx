@@ -23,6 +23,8 @@ Native Rust drivers, no JDBC dependency. MySQL and PostgreSQL compatible databas
 | Elasticsearch | HTTP client | REST |
 | DM (Dameng) | odbc-api | ODBC |
 | GaussDB | rust-gaussdb | GaussDB |
+| Feishu Sheets | Feishu OpenAPI + DuckDB cache | HTTPS |
+| Feishu Bitable | Feishu OpenAPI + DuckDB cache | HTTPS |
 
 ## MySQL Compatible
 
@@ -56,6 +58,12 @@ These databases use PostgreSQL protocol and work with the PostgreSQL driver:
 ## ODBC Databases
 
 DM (Dameng) connects through ODBC, which requires an ODBC driver installed on your system.
+
+## External Tabular Sources
+
+CSV/XLSX files and Feishu cloud tables are loaded into an in-memory DuckDB cache before querying. CSV/XLSX connections are local snapshots. Feishu Sheets and Bitable connections can be refreshed manually, or configured to refresh before each `SELECT`.
+
+Feishu Sheets supports sheet discovery, range reads, append writes, and explicit range overwrite through the external write API. Feishu Bitable supports table and field discovery, record search, append, update, and delete operations. See [Cloud Table Sources](/en/docs/cloud-sources) for connection fields and sync behavior.
 
 ### DM (Dameng)
 

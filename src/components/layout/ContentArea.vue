@@ -83,6 +83,13 @@ const hasNumericData = computed(() => {
   return r.columns.some((_, idx) => r.rows.some((row) => typeof row[idx] === "number"));
 });
 
+const queryResultEditable = computed(
+  () =>
+    !!props.activeTab.queryAnalysis &&
+    props.activeConnection?.db_type !== "feishu_sheets" &&
+    props.activeConnection?.db_type !== "feishu_bitable",
+);
+
 // Column info panel handlers
 async function onHandleClickColumn(
   matchedCols: Array<{ name: string; table: string; schema?: string }>,
@@ -270,7 +277,7 @@ function onHandleCloseColumnPanel() {
                 :result="activeTab.result"
                 :sql="activeTab.lastExecutedSql || activeTab.sql"
                 :loading="activeTab.isExecuting"
-                :editable="!!activeTab.queryAnalysis"
+                :editable="queryResultEditable"
                 context="results"
                 :database-type="activeConnection?.db_type"
                 :connection-id="activeTab.connectionId"

@@ -15,7 +15,9 @@ export type DatabaseType =
   | "dameng"
   | "gaussdb"
   | "csvfile"
-  | "xlsxfile";
+  | "xlsxfile"
+  | "feishu_sheets"
+  | "feishu_bitable";
 
 export interface ConnectionConfig {
   id: string;
@@ -97,6 +99,16 @@ export interface QueryResult {
   affected_rows: number;
   execution_time_ms: number;
   truncated?: boolean;
+}
+
+export interface ExternalWriteResult {
+  affected_rows: number;
+  raw: unknown;
+}
+
+export interface ExternalRowUpdate {
+  rowId: string;
+  fields: Record<string, unknown>;
 }
 
 export type TreeNodeType =

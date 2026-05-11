@@ -245,9 +245,13 @@ pub async fn do_execute(
             if !starts_with_external_read_keyword(sql) {
                 return Err("External data sources are read-only. Only SELECT queries are supported.".to_string());
             }
+            let ext_pool = ext_pool.clone();
             let con = ext_pool.cache.clone();
             let sql = sql.to_string();
             drop(connections);
+            if ext_pool.refresh_before_query() {
+                ext_pool.refresh_cache().await?;
+            }
             wait_for_query(cancel_token, async move {
                 let task = tokio::task::spawn_blocking(move || {
                     let con = con.lock().map_err(|e| e.to_string())?;

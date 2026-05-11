@@ -30,6 +30,8 @@
     <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
     <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
     <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Sheets-2B6DE5?logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Bitable-00A870?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>
@@ -78,7 +80,7 @@ CodeMirror 6 语法高亮、智能自动补全（表名和字段）、`Cmd+Enter
 - **数据迁移** — 在数据库之间迁移数据
 - **数据库导出** — 完整数据库导出
 - **SQL 文件执行** — 直接执行 `.sql` 文件
-- **本地文件连接** — 将 CSV/XLSX 作为只读快照查询，文件变更后可手动刷新
+- **外部表格连接** — 将 CSV/XLSX 和飞书电子表格/多维表格加载为 DuckDB 快照查询；飞书多维表格支持追加、更新和删除写入
 - **文件预览** — 拖入 Parquet、CSV、JSON 即时预览（基于 DuckDB）
 
 ### 专项浏览器

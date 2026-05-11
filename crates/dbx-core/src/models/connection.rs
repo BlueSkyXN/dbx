@@ -85,11 +85,18 @@ pub enum DatabaseType {
     CsvFile,
     #[serde(rename = "xlsxfile")]
     XlsxFile,
+    #[serde(rename = "feishu_sheets")]
+    FeishuSheets,
+    #[serde(rename = "feishu_bitable")]
+    FeishuBitable,
 }
 
 impl DatabaseType {
     pub fn is_external_tabular(&self) -> bool {
-        matches!(self, DatabaseType::CsvFile | DatabaseType::XlsxFile)
+        matches!(
+            self,
+            DatabaseType::CsvFile | DatabaseType::XlsxFile | DatabaseType::FeishuSheets | DatabaseType::FeishuBitable
+        )
     }
 
     pub fn is_file_based(&self) -> bool {
@@ -149,7 +156,12 @@ impl ConnectionConfig {
         let params = self.normalized_url_params();
 
         match self.db_type {
-            DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => {
+            DatabaseType::Sqlite
+            | DatabaseType::DuckDb
+            | DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Redis => {
@@ -200,7 +212,12 @@ impl ConnectionConfig {
         let params = self.normalized_url_params();
 
         match self.db_type {
-            DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => {
+            DatabaseType::Sqlite
+            | DatabaseType::DuckDb
+            | DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Redis => {

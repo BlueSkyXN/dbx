@@ -1,6 +1,7 @@
 import type { DatabaseType } from "@/types/database";
 
 export const FILE_BASED_EXTERNAL_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile"]);
+export const EXTERNAL_TABULAR_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile", "feishu_sheets", "feishu_bitable"]);
 
 export const SCHEMA_AWARE_TYPES = new Set<DatabaseType>([
   "postgres",
@@ -17,6 +18,8 @@ export const SQL_FILE_UNSUPPORTED_TYPES = new Set<DatabaseType>([
   "elasticsearch",
   "csvfile",
   "xlsxfile",
+  "feishu_sheets",
+  "feishu_bitable",
 ]);
 
 export const DIAGRAM_SUPPORTED_TYPES = new Set<DatabaseType>([
@@ -123,4 +126,8 @@ export function usesFetchFirst(dbType?: DatabaseType): boolean {
 
 export function isFileBasedExternal(dbType?: DatabaseType): boolean {
   return !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+}
+
+export function isExternalTabular(dbType?: DatabaseType): boolean {
+  return !!dbType && EXTERNAL_TABULAR_TYPES.has(dbType);
 }

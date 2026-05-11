@@ -35,6 +35,10 @@ export const testConnection = forward("testConnection");
 export const connectDb = forward("connectDb");
 export const disconnectDb = forward("disconnectDb");
 export const refreshExternalConnection = forward("refreshExternalConnection");
+export const appendExternalRows = forward("appendExternalRows");
+export const updateExternalRows = forward("updateExternalRows");
+export const deleteExternalRows = forward("deleteExternalRows");
+export const writeExternalRange = forward("writeExternalRange");
 export const saveConnections = forward("saveConnections");
 export const loadConnections = forward("loadConnections");
 

@@ -79,6 +79,10 @@ async fn main() {
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/refresh-external", post(routes::connection::refresh_external_connection))
+        .route("/connection/append-external-rows", post(routes::connection::append_external_rows))
+        .route("/connection/update-external-rows", post(routes::connection::update_external_rows))
+        .route("/connection/delete-external-rows", post(routes::connection::delete_external_rows))
+        .route("/connection/write-external-range", post(routes::connection::write_external_range))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
         // Schema
