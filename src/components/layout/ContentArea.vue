@@ -16,6 +16,7 @@ const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryCh
 import { useQueryStore } from "@/stores/queryStore";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExecutionState";
 import { databaseDisplayNameForTab } from "@/lib/tabPresentation";
+import { isExternalTabular } from "@/lib/databaseCapabilities";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
@@ -89,6 +90,7 @@ const queryResultEditable = computed(
     props.activeConnection?.db_type !== "feishu_sheets" &&
     props.activeConnection?.db_type !== "feishu_bitable",
 );
+const tableDdlSupported = computed(() => !isExternalTabular(props.activeConnection?.db_type));
 
 // Column info panel handlers
 async function onHandleClickColumn(
@@ -355,7 +357,7 @@ function onHandleCloseColumnPanel() {
             {{ activeTab.tableMeta.columns.length }} {{ t("tree.columns") }}
           </span>
           <Button
-            v-if="activeTab.tableMeta && activeTab.connectionId"
+            v-if="activeTab.tableMeta && activeTab.connectionId && tableDdlSupported"
             variant="ghost"
             size="sm"
             class="h-5 text-xs px-1.5 shrink-0"

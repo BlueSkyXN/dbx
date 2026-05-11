@@ -166,7 +166,11 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
         },
     };
 
-    if config.ssh_enabled && !config.ssh_host.is_empty() && !config.db_type.is_file_based() {
+    if config.ssh_enabled
+        && !config.ssh_host.is_empty()
+        && !config.db_type.is_file_based()
+        && !config.db_type.is_external_tabular()
+    {
         state.tunnels.stop_tunnel(&tunnel_id).await;
     }
 

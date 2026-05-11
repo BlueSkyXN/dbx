@@ -651,12 +651,14 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.username = "";
     config.password = "";
     config.database = undefined;
+    config.ssh_enabled = false;
   }
   if (config.db_type === "feishu_sheets" || config.db_type === "feishu_bitable") {
     config.port = 0;
     config.host = config.host || "https://open.feishu.cn";
     config.database = undefined;
     config.url_params = "";
+    config.ssh_enabled = false;
   }
   if (config.db_type === "csvfile") {
     const existing = config.external_config || {};

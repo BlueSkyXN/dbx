@@ -73,6 +73,7 @@ import {
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { buildDataGridSaveStatements, formatGridSqlLiteral } from "@/lib/dataGridSql";
 import { formatMarkdownTable } from "@/lib/markdownTable";
+import { isExternalTabular } from "@/lib/databaseCapabilities";
 import {
   matchesRowStatusFilter,
   rowStatusFilterAfterAddingRow,
@@ -756,6 +757,14 @@ const useTransaction = computed(
     !!props.tableMeta &&
     !isFeishuBitableTableEditor.value,
 );
+const canUseRowChangeControls = computed(
+  () => props.editable && !!props.tableMeta && (useTransaction.value || isFeishuBitableTableEditor.value),
+);
+
+function isGridColumnEditable(columnIndex: number): boolean {
+  if (!props.editable) return false;
+  return !(isFeishuBitableTableEditor.value && props.result.columns[columnIndex] === "_record_id");
+}
 
 async function onToolbarRefresh() {
   if (transactionActive.value) {
@@ -1220,7 +1229,7 @@ function coerceCellValue(value: string, oldVal: CellValue | undefined): CellValu
 }
 
 function startEdit(rowId: number, colIdx: number) {
-  if (!props.editable) return;
+  if (!isGridColumnEditable(colIdx)) return;
   const item = getRowItem(rowId);
   if (!item || item.isDeleted) return;
   isCancelling = false;
@@ -1305,7 +1314,8 @@ function addRow() {
   nextTick(() => {
     const el = getScrollerElement();
     if (el) el.scrollTop = el.scrollHeight;
-    startEdit(rowId, 0);
+    const firstEditableColumn = props.result.columns.findIndex((_, index) => isGridColumnEditable(index));
+    if (firstEditableColumn >= 0) startEdit(rowId, firstEditableColumn);
   });
 }
 
@@ -1738,6 +1748,7 @@ const ddlLoading = ref(false);
 const ddlWidth = ref(320);
 const ddlWrap = ref(true);
 const isResizingDdl = ref(false);
+const ddlSupported = computed(() => !isExternalTabular(props.databaseType));
 let ddlResizeStartX = 0;
 let ddlResizeStartWidth = 0;
 
@@ -1746,6 +1757,7 @@ const ddlDrawerStyle = computed(() => ({
 }));
 
 async function toggleDdl() {
+  if (!ddlSupported.value) return;
   if (showDdl.value) {
     showDdl.value = false;
     return;
@@ -1754,7 +1766,7 @@ async function toggleDdl() {
 }
 
 async function fetchDdl() {
-  if (!props.connectionId || !props.tableMeta) return;
+  if (!ddlSupported.value || !props.connectionId || !props.tableMeta) return;
   showDdl.value = true;
   ddlLoading.value = true;
   try {
@@ -1771,7 +1783,7 @@ async function fetchDdl() {
   }
 }
 
-if (showDdl.value && props.tableMeta && props.connectionId) {
+if (showDdl.value && ddlSupported.value && props.tableMeta && props.connectionId) {
   fetchDdl();
 }
 
@@ -1850,6 +1862,7 @@ defineExpose({
   onToolbarCommit,
   onToolbarRollback,
   showDdl,
+  ddlSupported,
   toggleDdl,
 });
 </script>
@@ -2022,7 +2035,7 @@ defineExpose({
               {{ t("grid.refresh") }}
             </Button>
             <Select
-              v-if="useTransaction && editable && tableMeta"
+              v-if="canUseRowChangeControls"
               :model-value="rowStatusFilter"
               @update:model-value="(value: any) => setRowStatusFilter(String(value))"
             >
@@ -2038,7 +2051,7 @@ defineExpose({
               </SelectContent>
             </Select>
             <Button
-              v-if="useTransaction && editable && tableMeta"
+              v-if="canUseRowChangeControls"
               variant="ghost"
               size="sm"
               class="h-5 text-xs px-1.5 shrink-0"
@@ -2206,7 +2219,7 @@ defineExpose({
                       }"
                       @mousedown="beginCellSelection(index, colIdx, $event)"
                       @mouseenter="extendCellSelection(index, colIdx)"
-                      @dblclick="editable && !item.isDeleted && startEdit(item.id, colIdx)"
+                      @dblclick="isGridColumnEditable(colIdx) && !item.isDeleted && startEdit(item.id, colIdx)"
                       @contextmenu="onCellContext(item.id, index, colIdx)"
                     >
                       <template v-if="editingCell?.rowId === item.id && editingCell?.col === colIdx">
@@ -2239,7 +2252,7 @@ defineExpose({
             </div>
             <!-- DDL Drawer -->
             <div
-              v-if="showDdl"
+              v-if="showDdl && ddlSupported"
               class="relative shrink-0 border-l flex flex-col bg-background min-w-0"
               :class="{ 'ddl-drawer-resizing': isResizingDdl }"
               :style="ddlDrawerStyle"
