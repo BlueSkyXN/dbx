@@ -16,6 +16,7 @@ description: 了解 DBX 可以连接哪些数据库，以及每类高级功能�
 | MySQL 兼容类型      | MariaDB、TiDB、OceanBase、Doris、SelectDB、StarRocks、Manticore Search、GoldenDB、TDSQL、PolarDB、GreatSQL、自定义 MySQL | 复用 MySQL 风格连接能力                                      |
 | PostgreSQL 兼容类型 | openGauss、KingBase、HighGo、Vastbase、CockroachDB、自定义 PostgreSQL                                             | 复用 PostgreSQL 风格连接能力                                 |
 | 文件型数据库        | SQLite、DuckDB、Microsoft Access、RQLite、Turso                                                                   | 选择本地数据库文件或 HTTP 端点，不填写主机和端口             |
+| 外部表格数据源      | CSV、XLSX、飞书电子表格、飞书多维表格                                                                            | 通过内存 DuckDB 缓存查询本地文件和飞书云文档表格             |
 | 时序与边缘数据库    | InfluxDB、IoTDB、TDengine、Databend、QuestDB                                                                      | 面向时序、IoT 或边缘场景优化                                 |
 | Agent/JDBC 扩展类型 | H2、Snowflake、Trino、Hive、DB2、Informix、Neo4j、Cassandra、BigQuery、Kylin、SunDB、XuguDB、Databricks、IRIS、JDBC | 功能覆盖取决于对应驱动路径                                   |
 
@@ -89,6 +90,12 @@ DBX 只会在具备足够元数据和 SQL 生成能力的数据库上启用高�
 | 不支持 SQL 文件执行 | Redis、MongoDB、Elasticsearch、etcd                                                                                                                                                                                                           |
 
 <Callout type="warn">如果某个数据库可以连接，但没有出现在某个功能行中，该功能可能会被隐藏或受限。这是为了避免 DBX 生成无法可靠审查的 SQL。</Callout>
+
+## 外部表格数据源
+
+CSV/XLSX 文件和飞书云文档表格会先加载到内存 DuckDB 缓存中再查询。CSV/XLSX 是本地快照；飞书电子表格和多维表格可以手动刷新，也可以配置为每次 `SELECT` 前刷新。
+
+飞书电子表格支持发现工作表、读取范围、追加写入，以及通过外部写入 API 覆盖指定范围。飞书多维表格支持发现数据表和字段、查询记录、追加、更新和删除记录。连接字段和同步行为见[云表格数据源](/cn/docs/cloud-sources)。
 
 ## 连接选项
 

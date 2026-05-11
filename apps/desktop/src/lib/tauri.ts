@@ -18,6 +18,8 @@ import type {
   RuleInfo,
   OwnerInfo,
   QueryResult,
+  ExternalWriteResult,
+  ExternalRowUpdate,
   SqlReferenceAnalysis,
   DatabaseType,
   InstalledPlugin,
@@ -575,6 +577,22 @@ export async function refreshConnections(): Promise<void> {
 
 export async function refreshExternalConnection(connectionId: string): Promise<void> {
   return invoke("refresh_external_connection", { connectionId });
+}
+
+export async function appendExternalRows(connectionId: string, tableName: string, rows: unknown[][]): Promise<ExternalWriteResult> {
+  return invoke("append_external_rows", { connectionId, tableName, rows });
+}
+
+export async function updateExternalRows(connectionId: string, tableName: string, updates: ExternalRowUpdate[]): Promise<ExternalWriteResult> {
+  return invoke("update_external_rows", { connectionId, tableName, updates });
+}
+
+export async function deleteExternalRows(connectionId: string, tableName: string, rowIds: string[]): Promise<ExternalWriteResult> {
+  return invoke("delete_external_rows", { connectionId, tableName, rowIds });
+}
+
+export async function writeExternalRange(connectionId: string, tableName: string, range: string, rows: unknown[][]): Promise<ExternalWriteResult> {
+  return invoke("write_external_range", { connectionId, tableName, range, rows });
 }
 
 export async function cancelQuery(executionId: string): Promise<boolean> {

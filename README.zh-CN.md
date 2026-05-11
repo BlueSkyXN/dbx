@@ -40,6 +40,10 @@
     <img src="https://img.shields.io/badge/CockroachDB-6933FF?logoColor=white" />
     <img src="https://img.shields.io/badge/InfluxDB-d30971?logo=influxdb&logoColor=white" />
     <img src="https://img.shields.io/badge/JDBC-4B5563?logoColor=white" />
+    <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
+    <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Sheets-2B6DE5?logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Bitable-00A870?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>
@@ -121,7 +125,7 @@ CodeMirror 6 语法高亮、元数据感知自动补全、`Cmd+Enter` 执行、�
 - **数据库导出** — 完整数据库导出
 - **数据对比** — 对比表数据并审查同步结果
 - **SQL 文件执行** — 直接执行 `.sql` 文件
-- **本地文件连接** — 将 CSV/XLSX 作为只读快照查询，文件变更后可手动刷新
+- **外部表格连接** — 将 CSV/XLSX 和飞书电子表格/多维表格加载为 DuckDB 快照查询；飞书多维表格支持追加、更新和删除写入
 - **文件预览** — 拖入 Parquet、CSV、JSON 即时预览（基于 DuckDB）
 - **连接导入** — 从 DBeaver 或 Navicat 导入连接配置
 

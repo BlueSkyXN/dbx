@@ -44,6 +44,7 @@ impl CsvSource {
     }
 
     fn reader_builder(&self) -> Result<csv::ReaderBuilder, String> {
+        self.validate_encoding()?;
         let mut builder = csv::ReaderBuilder::new();
         builder
             .delimiter(csv_char_byte(self.config.delimiter, "delimiter")?)
@@ -53,6 +54,19 @@ impl CsvSource {
             builder.quote(csv_char_byte(quote_char, "quote character")?);
         }
         Ok(builder)
+    }
+
+    fn validate_encoding(&self) -> Result<(), String> {
+        let Some(encoding) = self.config.encoding.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(());
+        };
+        if encoding.eq_ignore_ascii_case("utf-8") || encoding.eq_ignore_ascii_case("utf8") {
+            Ok(())
+        } else {
+            Err(format!(
+                "CSV encoding '{encoding}' is not supported yet; save the file as UTF-8 or leave encoding empty"
+            ))
+        }
     }
 
     fn read_csv(&self) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
@@ -304,6 +318,19 @@ mod tests {
         let err = source.read_csv().unwrap_err();
 
         assert!(err.contains("delimiter must be a single-byte ASCII"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_unsupported_encoding_instead_of_ignoring_it() {
+        let path = temp_file("csv", "id,name\n1,Ada\n");
+        let mut config = CsvExternalConfig::default();
+        config.encoding = Some("gbk".to_string());
+        let source = CsvSource::new(path.clone(), config);
+
+        let err = source.read_csv().unwrap_err();
+
+        assert!(err.contains("CSV encoding 'gbk' is not supported yet"));
         let _ = std::fs::remove_file(path);
     }
 }

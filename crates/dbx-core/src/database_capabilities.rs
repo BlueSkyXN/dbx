@@ -16,6 +16,8 @@ pub fn is_single_connection_pool(db_type: &DatabaseType) -> bool {
             | DatabaseType::DuckDb
             | DatabaseType::CsvFile
             | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable
             | DatabaseType::Rqlite
             | DatabaseType::Turso
             | DatabaseType::MongoDb
@@ -45,6 +47,8 @@ pub fn skips_tcp_probe(db_type: &DatabaseType) -> bool {
             | DatabaseType::DuckDb
             | DatabaseType::CsvFile
             | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable
             | DatabaseType::Turso
             | DatabaseType::Jdbc
             | DatabaseType::MessageQueue

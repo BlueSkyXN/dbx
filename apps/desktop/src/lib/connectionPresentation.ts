@@ -117,6 +117,10 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "xlsxfile":
       return "xlsx:///absolute/path/to/workbook.xlsx";
 
+    case "feishu_sheets":
+    case "feishu_bitable":
+      return "https://open.feishu.cn";
+
     case "access":
       return "jdbc:ucanaccess:///absolute/path/to/database.accdb";
 

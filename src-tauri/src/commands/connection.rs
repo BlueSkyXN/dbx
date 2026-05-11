@@ -570,7 +570,10 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             }
             #[cfg(not(feature = "duckdb-bundled"))]
             DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
-            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            db_type @ (DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable) => {
                 use dbx_core::external;
                 let file_path = expand_tilde(&config.host);
                 let ext_config = external::ExternalConfig::parse(&db_type, config.external_config.as_ref())?;
@@ -580,6 +583,22 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     }
                     external::ExternalConfig::Xlsx(xlsx_config) => {
                         Box::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                    external::ExternalConfig::FeishuSheets(feishu_config) => {
+                        Box::new(external::FeishuSheetsSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
+                    }
+                    external::ExternalConfig::FeishuBitable(feishu_config) => {
+                        Box::new(external::FeishuBitableSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
                     }
                 };
                 source.test_connection().await
@@ -838,7 +857,10 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         #[cfg(not(feature = "duckdb-bundled"))]
         DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
         #[cfg(feature = "duckdb-bundled")]
-        db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+        db_type @ (DatabaseType::CsvFile
+        | DatabaseType::XlsxFile
+        | DatabaseType::FeishuSheets
+        | DatabaseType::FeishuBitable) => {
             use dbx_core::external;
             let file_path = expand_tilde(&db_config.host);
             let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
@@ -849,6 +871,22 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 external::ExternalConfig::Xlsx(xlsx_config) => {
                     std::sync::Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
                 }
+                external::ExternalConfig::FeishuSheets(feishu_config) => {
+                    std::sync::Arc::new(external::FeishuSheetsSource::new(
+                        &db_config.host,
+                        &db_config.username,
+                        &db_config.password,
+                        feishu_config,
+                    ))
+                }
+                external::ExternalConfig::FeishuBitable(feishu_config) => {
+                    std::sync::Arc::new(external::FeishuBitableSource::new(
+                        &db_config.host,
+                        &db_config.username,
+                        &db_config.password,
+                        feishu_config,
+                    ))
+                }
             };
             let duckdb_con =
                 duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
@@ -857,8 +895,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             PoolKind::ExternalTabular(std::sync::Arc::new(ext_pool))
         }
         #[cfg(not(feature = "duckdb-bundled"))]
-        DatabaseType::CsvFile | DatabaseType::XlsxFile => {
-            return Err("External file source support not compiled (enable duckdb-bundled feature)".to_string());
+        DatabaseType::CsvFile | DatabaseType::XlsxFile | DatabaseType::FeishuSheets | DatabaseType::FeishuBitable => {
+            return Err("External tabular source support not compiled (enable duckdb-bundled feature)".to_string());
         }
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
@@ -1099,4 +1137,45 @@ pub async fn ensure_connection_writable(
 #[tauri::command]
 pub async fn refresh_external_connection(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
     state.refresh_external_pool(&connection_id).await
+}
+
+#[tauri::command]
+pub async fn append_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.append_external_rows(&connection_id, &table_name, rows).await
+}
+
+#[tauri::command]
+pub async fn update_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    updates: Vec<dbx_core::external::ExternalRowUpdate>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.update_external_rows(&connection_id, &table_name, updates).await
+}
+
+#[tauri::command]
+pub async fn delete_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    row_ids: Vec<String>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.delete_external_rows(&connection_id, &table_name, row_ids).await
+}
+
+#[tauri::command]
+pub async fn write_external_range(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    range: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.write_external_range(&connection_id, &table_name, &range, rows).await
 }

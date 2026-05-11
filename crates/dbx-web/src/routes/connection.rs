@@ -36,6 +36,39 @@ pub struct RefreshExternalRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AppendExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub updates: Vec<dbx_core::external::ExternalRowUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub row_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteExternalRangeRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub range: String,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
@@ -130,6 +163,49 @@ pub async fn refresh_external_connection(
     Json(body): Json<RefreshExternalRequest>,
 ) -> Result<Json<()>, AppError> {
     state.app.refresh_external_pool(&body.connection_id).await.map(Json).map_err(AppError)
+}
+
+pub async fn append_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<AppendExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state.app.append_external_rows(&body.connection_id, &body.table_name, body.rows).await.map(Json).map_err(AppError)
+}
+
+pub async fn update_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<UpdateExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .update_external_rows(&body.connection_id, &body.table_name, body.updates)
+        .await
+        .map(Json)
+        .map_err(AppError)
+}
+
+pub async fn delete_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<DeleteExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .delete_external_rows(&body.connection_id, &body.table_name, body.row_ids)
+        .await
+        .map(Json)
+        .map_err(AppError)
+}
+
+pub async fn write_external_range(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<WriteExternalRangeRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .write_external_range(&body.connection_id, &body.table_name, &body.range, body.rows)
+        .await
+        .map(Json)
+        .map_err(AppError)
 }
 
 pub async fn save_connections(

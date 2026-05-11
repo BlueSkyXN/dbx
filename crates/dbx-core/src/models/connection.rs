@@ -248,6 +248,10 @@ pub enum DatabaseType {
     CsvFile,
     #[serde(rename = "xlsxfile")]
     XlsxFile,
+    #[serde(rename = "feishu_sheets")]
+    FeishuSheets,
+    #[serde(rename = "feishu_bitable")]
+    FeishuBitable,
     #[serde(rename = "clickhouse")]
     ClickHouse,
     #[serde(rename = "sqlserver")]
@@ -326,7 +330,10 @@ pub enum DatabaseType {
 
 impl DatabaseType {
     pub fn is_external_tabular(&self) -> bool {
-        matches!(self, DatabaseType::CsvFile | DatabaseType::XlsxFile)
+        matches!(
+            self,
+            DatabaseType::CsvFile | DatabaseType::XlsxFile | DatabaseType::FeishuSheets | DatabaseType::FeishuBitable
+        )
     }
 
     pub fn is_file_based(&self) -> bool {

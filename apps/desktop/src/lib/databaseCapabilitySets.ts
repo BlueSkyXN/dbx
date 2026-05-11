@@ -38,6 +38,7 @@ export const SCHEMA_AWARE_TYPES = new Set<DatabaseType>([
 export const SINGLE_DATABASE_TYPES = new Set<DatabaseType>(["oracle", "dameng", "firebird", "oceanbase-oracle", "access", "questdb"]);
 
 export const FILE_BASED_EXTERNAL_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile"]);
+export const EXTERNAL_TABULAR_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile", "feishu_sheets", "feishu_bitable"]);
 
 export const FETCH_FIRST_TYPES = new Set<DatabaseType>(["oracle", "dameng"]);
 

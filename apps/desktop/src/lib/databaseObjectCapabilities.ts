@@ -37,6 +37,8 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["duckdb", TABLE_VIEW_OBJECTS],
   ["csvfile", TABLE_VIEW_OBJECTS],
   ["xlsxfile", TABLE_VIEW_OBJECTS],
+  ["feishu_sheets", TABLE_VIEW_OBJECTS],
+  ["feishu_bitable", TABLE_VIEW_OBJECTS],
   ["clickhouse", TABLE_VIEW_OBJECTS],
   ["doris", TABLE_VIEW_OBJECTS],
   ["starrocks", TABLE_VIEW_OBJECTS],

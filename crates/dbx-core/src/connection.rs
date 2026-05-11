@@ -110,7 +110,8 @@ pub fn database_connection_config(config: &ConnectionConfig, database: Option<&s
         if !matches!(
             db_config.db_type,
             DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::MongoDb | DatabaseType::OceanbaseOracle
-        ) {
+        ) && !db_config.db_type.is_external_tabular()
+        {
             db_config.database = Some(db.to_string());
         }
     }
@@ -521,7 +522,10 @@ impl AppState {
                 return Err("DuckDB support is not compiled in this build. Rebuild with default features.".to_string());
             }
             #[cfg(feature = "duckdb-bundled")]
-            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            db_type @ (DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable) => {
                 let file_path = expand_tilde(&db_config.host);
                 let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
                 let source: Arc<dyn external::ExternalTabularSource> = match ext_config {
@@ -531,6 +535,22 @@ impl AppState {
                     external::ExternalConfig::Xlsx(xlsx_config) => {
                         Arc::new(external::XlsxSource::new(PathBuf::from(&file_path), xlsx_config))
                     }
+                    external::ExternalConfig::FeishuSheets(feishu_config) => {
+                        Arc::new(external::FeishuSheetsSource::new(
+                            &db_config.host,
+                            &db_config.username,
+                            &db_config.password,
+                            feishu_config,
+                        ))
+                    }
+                    external::ExternalConfig::FeishuBitable(feishu_config) => {
+                        Arc::new(external::FeishuBitableSource::new(
+                            &db_config.host,
+                            &db_config.username,
+                            &db_config.password,
+                            feishu_config,
+                        ))
+                    }
                 };
                 let duckdb_con =
                     duckdb::Connection::open_in_memory().map_err(|e| format!("Failed to create DuckDB cache: {e}"))?;
@@ -539,9 +559,12 @@ impl AppState {
                 PoolKind::ExternalTabular(Arc::new(pool))
             }
             #[cfg(not(feature = "duckdb-bundled"))]
-            DatabaseType::CsvFile | DatabaseType::XlsxFile => {
+            DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => {
                 return Err(
-                    "External file source support is not compiled in this build. Rebuild with default features."
+                    "External tabular source support is not compiled in this build. Rebuild with default features."
                         .to_string(),
                 );
             }
@@ -829,7 +852,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
         let transport_layers = config.effective_transport_layers();
-        if transport_layers.is_empty() {
+        if transport_layers.is_empty() || config.db_type.is_external_tabular() {
             return Ok((config.host.clone(), config.port));
         }
 
@@ -1563,9 +1586,101 @@ impl AppState {
         pool.refresh_cache().await
     }
 
+    #[cfg(feature = "duckdb-bundled")]
+    async fn external_pool_for_connection(&self, connection_id: &str) -> Result<ExternalTabularHandle, String> {
+        let connections = self.connections.read().await;
+        match connections.get(connection_id) {
+            Some(PoolKind::ExternalTabular(pool)) => Ok(pool.clone()),
+            Some(_) => Err("Connection is not an external tabular source".to_string()),
+            None => Err("Connection is not connected".to_string()),
+        }
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    pub async fn append_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.append_rows(table_name, rows).await
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    pub async fn update_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        updates: Vec<external::ExternalRowUpdate>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.update_rows(table_name, updates).await
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    pub async fn delete_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        row_ids: Vec<String>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.delete_rows(table_name, row_ids).await
+    }
+
+    #[cfg(feature = "duckdb-bundled")]
+    pub async fn write_external_range(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        range: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.write_range(table_name, range, rows).await
+    }
+
     #[cfg(not(feature = "duckdb-bundled"))]
     pub async fn refresh_external_pool(&self, _connection_id: &str) -> Result<(), String> {
         Err("External file source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    pub async fn append_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    pub async fn update_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _updates: Vec<external::ExternalRowUpdate>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    pub async fn delete_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _row_ids: Vec<String>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-bundled"))]
+    pub async fn write_external_range(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _range: &str,
+        _rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 }
 
@@ -3171,6 +3286,11 @@ mod tests {
     fn external_tabular_database_scope_reuses_connection_pool_key() {
         assert_eq!(super::base_pool_key_for(Some(DatabaseType::CsvFile), "csv", Some("main"), false), "csv");
         assert_eq!(super::base_pool_key_for(Some(DatabaseType::XlsxFile), "xlsx", Some("main"), false), "xlsx");
+        assert_eq!(super::base_pool_key_for(Some(DatabaseType::FeishuSheets), "sheets", Some("main"), false), "sheets");
+        assert_eq!(
+            super::base_pool_key_for(Some(DatabaseType::FeishuBitable), "bitable", Some("main"), false),
+            "bitable"
+        );
         assert_eq!(super::base_pool_key_for(Some(DatabaseType::Mysql), "mysql", Some("main"), false), "mysql:main");
     }
 

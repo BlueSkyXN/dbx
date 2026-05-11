@@ -30,7 +30,7 @@ import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedV
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
 import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
-import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
+import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pencil, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
 import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 
@@ -40,6 +40,7 @@ type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
 type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type MqTokenSigningMode = "none" | "hs256" | "rs256";
+const FEISHU_DATE_TIME_DEFAULT_OPTION = "__default__";
 type JdbcDriverSelectItem = {
   id: string;
   label: string;
@@ -391,6 +392,22 @@ const driverProfiles: Record<
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
   csvfile: { type: "csvfile", port: 0, user: "", label: "CSV", icon: "csvfile" },
   xlsxfile: { type: "xlsxfile", port: 0, user: "", label: "XLSX", icon: "xlsxfile" },
+  feishu_sheets: {
+    type: "feishu_sheets",
+    port: 0,
+    user: "",
+    label: "Feishu Sheets",
+    icon: "feishu_sheets",
+    host: "https://open.feishu.cn",
+  },
+  feishu_bitable: {
+    type: "feishu_bitable",
+    port: 0,
+    user: "",
+    label: "Feishu Bitable",
+    icon: "feishu_bitable",
+    host: "https://open.feishu.cn",
+  },
   access: { type: "access", port: 0, user: "", label: "Microsoft Access", icon: "access" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
   clickhouse: {
@@ -669,6 +686,15 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.connection_string = undefined;
       form.value.transport_layers = [];
     }
+    if (profile.type === "feishu_sheets" || profile.type === "feishu_bitable") {
+      form.value.host = profile.host || "https://open.feishu.cn";
+      form.value.port = 0;
+      form.value.username = "";
+      form.value.password = "";
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+      form.value.transport_layers = [];
+    }
     if (profile.type === "h2") {
       h2ConnectionMode.value = "file";
       form.value.host = "";
@@ -878,6 +904,8 @@ const iconTypeMap: Record<string, string> = {
   access: "access",
   csvfile: "csvfile",
   xlsxfile: "xlsxfile",
+  feishu_sheets: "feishu_sheets",
+  feishu_bitable: "feishu_bitable",
   redis: "redis",
   mongodb: "mongodb",
   duckdb: "duckdb",
@@ -958,6 +986,8 @@ const dbOptions: DbOption[] = [
   { value: "duckdb", label: "DuckDB" },
   { value: "csvfile", label: "CSV" },
   { value: "xlsxfile", label: "XLSX" },
+  { value: "feishu_sheets", label: "Feishu Sheets" },
+  { value: "feishu_bitable", label: "Feishu Bitable" },
   { value: "rqlite", label: "RQLite" },
   { value: "access", label: "Microsoft Access" },
   { value: "mariadb", label: "MariaDB" },
@@ -1041,6 +1071,7 @@ const isJdbcConnection = computed(() => form.value.db_type === "jdbc");
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 const isExternalFileConnection = computed(() => form.value.db_type === "csvfile" || form.value.db_type === "xlsxfile");
+const isFeishuConnection = computed(() => form.value.db_type === "feishu_sheets" || form.value.db_type === "feishu_bitable");
 
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const filePathPlaceholder = computed(() => {
@@ -1089,6 +1120,42 @@ function ensureExternalConfigDefaults(dbType = form.value.db_type) {
     return;
   }
 
+  if (dbType === "feishu_sheets") {
+    const existing = externalConfigRecord();
+    form.value.host = form.value.host || "https://open.feishu.cn";
+    form.value.external_config = {
+      access_token: typeof existing.access_token === "string" ? existing.access_token : "",
+      spreadsheet_token: typeof existing.spreadsheet_token === "string" ? existing.spreadsheet_token : "",
+      sheet_id: typeof existing.sheet_id === "string" ? existing.sheet_id : "",
+      range: typeof existing.range === "string" ? existing.range : "",
+      has_header: existing.has_header !== false,
+      max_rows: typeof existing.max_rows === "number" ? existing.max_rows : 1000,
+      max_columns: typeof existing.max_columns === "number" ? existing.max_columns : 100,
+      value_render_option: typeof existing.value_render_option === "string" ? existing.value_render_option : "ToString",
+      date_time_render_option: normalizeFeishuDateTimeRenderOption(existing.date_time_render_option),
+      sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
+    };
+    return;
+  }
+
+  if (dbType === "feishu_bitable") {
+    const existing = externalConfigRecord();
+    form.value.host = form.value.host || "https://open.feishu.cn";
+    form.value.external_config = {
+      access_token: typeof existing.access_token === "string" ? existing.access_token : "",
+      app_token: typeof existing.app_token === "string" ? existing.app_token : "",
+      table_id: typeof existing.table_id === "string" ? existing.table_id : "",
+      view_id: typeof existing.view_id === "string" ? existing.view_id : "",
+      field_names: Array.isArray(existing.field_names) ? existing.field_names : [],
+      user_id_type: typeof existing.user_id_type === "string" ? existing.user_id_type : "open_id",
+      page_size: typeof existing.page_size === "number" ? existing.page_size : 500,
+      max_records: typeof existing.max_records === "number" ? existing.max_records : 5000,
+      automatic_fields: existing.automatic_fields === true,
+      sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
+    };
+    return;
+  }
+
   form.value.external_config = undefined;
 }
 
@@ -1117,6 +1184,81 @@ const xlsxSheetName = computed({
   },
   set: (value: string) => {
     updateExternalConfig({ sheet_name: value });
+  },
+});
+
+function externalConfigString(key: string, fallback = "") {
+  return computed({
+    get: () => {
+      const value = externalConfigRecord()[key];
+      return typeof value === "string" ? value : fallback;
+    },
+    set: (value: string) => {
+      updateExternalConfig({ [key]: value });
+    },
+  });
+}
+
+function externalConfigNumber(key: string, fallback: number) {
+  return computed({
+    get: () => {
+      const value = externalConfigRecord()[key];
+      return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+    },
+    set: (value: number) => {
+      const next = Number(value);
+      updateExternalConfig({ [key]: Number.isFinite(next) ? next : fallback });
+    },
+  });
+}
+
+function normalizeFeishuDateTimeRenderOption(value: unknown) {
+  if (value === "" || value === FEISHU_DATE_TIME_DEFAULT_OPTION) return "";
+  return typeof value === "string" ? value : "FormattedString";
+}
+
+const feishuAccessToken = externalConfigString("access_token");
+const feishuSpreadsheetToken = externalConfigString("spreadsheet_token");
+const feishuSheetId = externalConfigString("sheet_id");
+const feishuRange = externalConfigString("range");
+const feishuValueRenderOption = externalConfigString("value_render_option", "ToString");
+const feishuDateTimeRenderOption = computed({
+  get: () => {
+    const value = externalConfigRecord().date_time_render_option;
+    if (value === "") return FEISHU_DATE_TIME_DEFAULT_OPTION;
+    return typeof value === "string" ? value : "FormattedString";
+  },
+  set: (value: string) => {
+    updateExternalConfig({ date_time_render_option: value === FEISHU_DATE_TIME_DEFAULT_OPTION ? "" : value });
+  },
+});
+const feishuMaxRows = externalConfigNumber("max_rows", 1000);
+const feishuMaxColumns = externalConfigNumber("max_columns", 100);
+const feishuSyncMode = externalConfigString("sync_mode", "snapshot");
+const feishuBitableAppToken = externalConfigString("app_token");
+const feishuBitableTableId = externalConfigString("table_id");
+const feishuBitableViewId = externalConfigString("view_id");
+const feishuBitableUserIdType = externalConfigString("user_id_type", "open_id");
+const feishuBitablePageSize = externalConfigNumber("page_size", 500);
+const feishuBitableMaxRecords = externalConfigNumber("max_records", 5000);
+const feishuBitableFieldNames = computed({
+  get: () => {
+    const value = externalConfigRecord().field_names;
+    return Array.isArray(value) ? value.filter((item) => typeof item === "string").join(", ") : "";
+  },
+  set: (value: string) => {
+    updateExternalConfig({
+      field_names: value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    });
+  },
+});
+const feishuBitableAutomaticFields = computed({
+  get: () => externalConfigRecord().automatic_fields === true,
+  set: (value: boolean) => {
+    updateExternalConfig({ automatic_fields: value });
   },
 });
 
@@ -1196,7 +1338,7 @@ const etcdEndpointsLines = computed({
     form.value.etcd_endpoints = normalizeEndpointLines(value);
   },
 });
-const canUseTransportLayers = computed(() => !usesLocalFilePathInput.value);
+const canUseTransportLayers = computed(() => !usesLocalFilePathInput.value && !isFeishuConnection.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
@@ -1383,6 +1525,34 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
       ...(sheetName ? { sheet_name: sheetName } : {}),
       has_header: existing.has_header !== false,
     };
+  } else if (config.db_type === "feishu_sheets") {
+    const existing = externalConfigRecord(config.external_config);
+    config.external_config = {
+      access_token: typeof existing.access_token === "string" ? existing.access_token.trim() : "",
+      spreadsheet_token: typeof existing.spreadsheet_token === "string" ? existing.spreadsheet_token.trim() : "",
+      sheet_id: typeof existing.sheet_id === "string" ? existing.sheet_id.trim() : "",
+      range: typeof existing.range === "string" ? existing.range.trim() : "",
+      has_header: existing.has_header !== false,
+      max_rows: Math.max(1, Math.trunc(Number(existing.max_rows) || 1000)),
+      max_columns: Math.max(1, Math.min(100, Math.trunc(Number(existing.max_columns) || 100))),
+      value_render_option: typeof existing.value_render_option === "string" ? existing.value_render_option : "ToString",
+      date_time_render_option: normalizeFeishuDateTimeRenderOption(existing.date_time_render_option),
+      sync_mode: existing.sync_mode === "realtime" ? "realtime" : "snapshot",
+    };
+  } else if (config.db_type === "feishu_bitable") {
+    const existing = externalConfigRecord(config.external_config);
+    config.external_config = {
+      access_token: typeof existing.access_token === "string" ? existing.access_token.trim() : "",
+      app_token: typeof existing.app_token === "string" ? existing.app_token.trim() : "",
+      table_id: typeof existing.table_id === "string" ? existing.table_id.trim() : "",
+      view_id: typeof existing.view_id === "string" ? existing.view_id.trim() : "",
+      field_names: Array.isArray(existing.field_names) ? existing.field_names.filter((item) => typeof item === "string" && item.trim()).map((item) => String(item).trim()) : [],
+      user_id_type: typeof existing.user_id_type === "string" ? existing.user_id_type : "open_id",
+      page_size: Math.max(1, Math.min(500, Math.trunc(Number(existing.page_size) || 500))),
+      max_records: Math.max(1, Math.trunc(Number(existing.max_records) || 5000)),
+      automatic_fields: existing.automatic_fields === true,
+      sync_mode: existing.sync_mode === "realtime" ? "realtime" : "snapshot",
+    };
   } else {
     config.external_config = undefined;
   }
@@ -1484,6 +1654,14 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.username = "";
     config.password = "";
     config.database = undefined;
+    config.connection_string = undefined;
+    config.transport_layers = [];
+  }
+  if (config.db_type === "feishu_sheets" || config.db_type === "feishu_bitable") {
+    config.host = config.host?.trim() || "https://open.feishu.cn";
+    config.port = 0;
+    config.database = undefined;
+    config.url_params = "";
     config.connection_string = undefined;
     config.transport_layers = [];
   }
@@ -2783,6 +2961,140 @@ function openExternalUrl(url: string) {
                       <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                   </template>
+                </template>
+
+                <!-- Feishu cloud tabular sources -->
+                <template v-else-if="isFeishuConnection">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">OpenAPI</Label>
+                    <Input v-model="form.host" class="col-span-3" placeholder="https://open.feishu.cn" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">App ID</Label>
+                    <Input v-model="form.username" class="col-span-3" placeholder="cli_xxx" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">App Secret</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Access Token</Label>
+                    <PasswordInput v-model="feishuAccessToken" class="col-span-3" placeholder="optional tenant_access_token / user_access_token" />
+                  </div>
+
+                  <template v-if="form.db_type === 'feishu_sheets'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Spreadsheet Token</Label>
+                      <Input v-model="feishuSpreadsheetToken" class="col-span-3" placeholder="shtcn..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Sheet ID</Label>
+                      <Input v-model="feishuSheetId" class="col-span-3" placeholder="optional" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Range</Label>
+                      <Input v-model="feishuRange" class="col-span-3" placeholder="A1:Z1000 or sheetId!A1:Z1000" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Render</Label>
+                      <Select v-model="feishuValueRenderOption">
+                        <SelectTrigger class="col-span-3 w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="ToString">ToString</SelectItem>
+                          <SelectItem value="FormattedValue">FormattedValue</SelectItem>
+                          <SelectItem value="Formula">Formula</SelectItem>
+                          <SelectItem value="UnformattedValue">UnformattedValue</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Date/Time</Label>
+                      <Select v-model="feishuDateTimeRenderOption">
+                        <SelectTrigger class="col-span-3 w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="FormattedString">FormattedString</SelectItem>
+                          <SelectItem :value="FEISHU_DATE_TIME_DEFAULT_OPTION">Default serial number</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex cursor-pointer items-center gap-2">
+                        <Switch v-model="externalHasHeader" />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.firstRowHeader") }}</span>
+                      </label>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Limit</Label>
+                      <div class="col-span-3 grid grid-cols-2 gap-2">
+                        <Input v-model.number="feishuMaxRows" type="number" min="1" placeholder="Rows" />
+                        <Input v-model.number="feishuMaxColumns" type="number" min="1" max="100" placeholder="Columns" />
+                      </div>
+                    </div>
+                  </template>
+
+                  <template v-else>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">App Token</Label>
+                      <Input v-model="feishuBitableAppToken" class="col-span-3" placeholder="app..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Table ID</Label>
+                      <Input v-model="feishuBitableTableId" class="col-span-3" placeholder="optional tbl..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">View ID</Label>
+                      <Input v-model="feishuBitableViewId" class="col-span-3" placeholder="optional vew..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Fields</Label>
+                      <Input v-model="feishuBitableFieldNames" class="col-span-3" placeholder="Name, Amount" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">User ID</Label>
+                      <Select v-model="feishuBitableUserIdType">
+                        <SelectTrigger class="col-span-3 w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="open_id">open_id</SelectItem>
+                          <SelectItem value="union_id">union_id</SelectItem>
+                          <SelectItem value="user_id">user_id</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Limit</Label>
+                      <div class="col-span-3 grid grid-cols-2 gap-2">
+                        <Input v-model.number="feishuBitablePageSize" type="number" min="1" max="500" placeholder="Page" />
+                        <Input v-model.number="feishuBitableMaxRecords" type="number" min="1" placeholder="Records" />
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex cursor-pointer items-center gap-2">
+                        <Switch v-model="feishuBitableAutomaticFields" />
+                        <span class="text-xs text-muted-foreground">Return automatic fields</span>
+                      </label>
+                    </div>
+                  </template>
+
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Sync</Label>
+                    <Select v-model="feishuSyncMode">
+                      <SelectTrigger class="col-span-3 w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="snapshot">Snapshot / manual refresh</SelectItem>
+                        <SelectItem value="realtime">Refresh before SELECT</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </template>
 
                 <!-- Message Queue: admin URL and auth -->

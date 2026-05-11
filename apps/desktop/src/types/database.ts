@@ -8,6 +8,8 @@ export type DatabaseType =
   | "duckdb"
   | "csvfile"
   | "xlsxfile"
+  | "feishu_sheets"
+  | "feishu_bitable"
   | "clickhouse"
   | "sqlserver"
   | "mongodb"
@@ -346,6 +348,16 @@ export interface QueryResult {
   truncated?: boolean;
   session_id?: string | null;
   has_more?: boolean;
+}
+
+export interface ExternalWriteResult {
+  affected_rows: number;
+  raw: unknown;
+}
+
+export interface ExternalRowUpdate {
+  rowId: string;
+  fields: Record<string, unknown>;
 }
 
 export interface QueryResultRun {

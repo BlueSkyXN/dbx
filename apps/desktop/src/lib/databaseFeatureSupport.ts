@@ -1,7 +1,7 @@
 import type { DatabaseType, TreeNodeType } from "@/types/database";
 import { supportsDatabaseFeature } from "./databaseDriverManifest";
 import { canEditTableStructure } from "./tableStructureCapabilities";
-import { DATABASE_OBJECT_TREE_TYPES, FETCH_FIRST_TYPES, PG_LIKE_STRUCTURE_TYPES, SCHEMA_AWARE_TYPES, SINGLE_DATABASE_TYPES, TREE_SCHEMA_TYPES } from "./databaseCapabilitySets";
+import { DATABASE_OBJECT_TREE_TYPES, EXTERNAL_TABULAR_TYPES, FETCH_FIRST_TYPES, FILE_BASED_EXTERNAL_TYPES, PG_LIKE_STRUCTURE_TYPES, SCHEMA_AWARE_TYPES, SINGLE_DATABASE_TYPES, TREE_SCHEMA_TYPES } from "./databaseCapabilitySets";
 
 export function isSchemaAware(dbType?: DatabaseType): boolean {
   return !!dbType && SCHEMA_AWARE_TYPES.has(dbType);
@@ -32,6 +32,14 @@ export function isSingleDatabase(dbType?: DatabaseType): boolean {
 
 export function usesFetchFirst(dbType?: DatabaseType): boolean {
   return !!dbType && FETCH_FIRST_TYPES.has(dbType);
+}
+
+export function isFileBasedExternal(dbType?: DatabaseType): boolean {
+  return !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+}
+
+export function isExternalTabular(dbType?: DatabaseType): boolean {
+  return !!dbType && EXTERNAL_TABULAR_TYPES.has(dbType);
 }
 
 export function supportsSqlFileExecution(dbType?: DatabaseType): boolean {
@@ -82,7 +90,7 @@ export function supportsObjectBrowserTreeNode(dbType: DatabaseType | undefined, 
 }
 
 export function supportsTableTruncate(dbType?: DatabaseType): boolean {
-  return !!dbType && dbType !== "sqlite" && dbType !== "rqlite" && dbType !== "turso" && dbType !== "duckdb" && dbType !== "csvfile" && dbType !== "xlsxfile" && dbType !== "influxdb" && dbType !== "manticoresearch";
+  return !!dbType && !isExternalTabular(dbType) && dbType !== "sqlite" && dbType !== "rqlite" && dbType !== "turso" && dbType !== "duckdb" && dbType !== "influxdb" && dbType !== "manticoresearch";
 }
 
 export function usesPostgresLikeStructureCopy(dbType?: DatabaseType): boolean {

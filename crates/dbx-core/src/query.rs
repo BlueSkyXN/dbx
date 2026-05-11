@@ -1036,6 +1036,7 @@ pub async fn do_execute(
             if !starts_with_duckdb_result_sql_keyword(sql) {
                 return Err("External data sources are read-only. Only SELECT queries are supported.".to_string());
             }
+            let ext_pool = ext_pool.clone();
             let con = ext_pool.cache.clone();
             let interrupt_handle = con.lock().map_err(|e| e.to_string())?.interrupt_handle();
             if let Some(ref execution_id) = options.execution_id {
@@ -1047,6 +1048,9 @@ pub async fn do_execute(
             let sql = sql.to_string();
             let max_rows = options.max_rows;
             drop(connections);
+            if ext_pool.refresh_before_query() {
+                ext_pool.refresh_cache_if_stale().await?;
+            }
             let task = tokio::task::spawn_blocking(move || {
                 let con = con.lock().map_err(|e| e.to_string())?;
                 duckdb_execute_with_max_rows(&con, &sql, max_rows)

@@ -40,6 +40,10 @@
     <img src="https://img.shields.io/badge/CockroachDB-6933FF?logoColor=white" />
     <img src="https://img.shields.io/badge/InfluxDB-d30971?logo=influxdb&logoColor=white" />
     <img src="https://img.shields.io/badge/JDBC-4B5563?logoColor=white" />
+    <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
+    <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Sheets-2B6DE5?logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Bitable-00A870?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>
@@ -121,7 +125,7 @@ Virtual-scrolled table that handles large result sets. Inline editing, SQL previ
 - **Database export** — full database dump
 - **Data compare** — compare table data and review synchronization output
 - **SQL file execution** — run `.sql` files directly
-- **Local file connections** — query CSV/XLSX files as read-only snapshots, with manual refresh after file changes
+- **External tabular connections** — query CSV/XLSX files and Feishu Sheets/Bitable through DuckDB-backed snapshots; Feishu Bitable supports append, update, and delete writes
 - **File preview** — drag & drop Parquet, CSV, JSON to preview instantly (powered by DuckDB)
 - **Connection import** — bring connection profiles from DBeaver or Navicat
 

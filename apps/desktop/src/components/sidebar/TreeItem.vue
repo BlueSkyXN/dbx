@@ -73,7 +73,7 @@ import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
 import { editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import {
-  FILE_BASED_EXTERNAL_TYPES,
+  EXTERNAL_TABULAR_TYPES,
   supportsDatabaseCreation,
   supportsDatabaseSearch,
   supportsFieldLineage,
@@ -2691,7 +2691,7 @@ const isConnected = computed(() => props.node.type === "connection" && !!props.n
 const isConnectionReadonly = computed(() => props.node.type === "connection" && !!props.node.connectionId && (connectionStore.getConfig(props.node.connectionId)?.read_only ?? false));
 const canRefreshExternalSnapshot = computed(() => {
   const dbType = currentDatabaseType();
-  return props.node.type === "connection" && !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+  return props.node.type === "connection" && !!dbType && EXTERNAL_TABULAR_TYPES.has(dbType);
 });
 const canCloseDatabaseConnection = computed(() => props.node.type === "database" && !!props.node.connectionId && props.node.database != null && connectionStore.connectedIds.has(props.node.connectionId));
 const nodeIconClass = computed(() => {

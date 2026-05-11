@@ -87,6 +87,8 @@ const assetIcons: Record<string, string> = {
 const letterIcons: Record<string, { letter: string; color: string }> = {
   csvfile: { letter: "C", color: "#217346" },
   xlsxfile: { letter: "X", color: "#217346" },
+  feishu_sheets: { letter: "S", color: "#2B6DE5" },
+  feishu_bitable: { letter: "B", color: "#00A870" },
 };
 
 const normalizedType = computed(() => props.dbType.toLowerCase().replace(/[\s-]+/g, "_"));
