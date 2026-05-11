@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use super::types::{CacheState, ExternalColumnDef, ExternalTableRef, ExternalTableSnapshot};
+use super::types::{
+    CacheState, ExternalColumnDef, ExternalRowUpdate, ExternalTableRef, ExternalTableSnapshot, ExternalWriteResult,
+};
 
 /// Loads an external table snapshot into an in-memory DuckDB connection.
 pub fn load_snapshot_to_duckdb(con: &duckdb::Connection, snapshot: &ExternalTableSnapshot) -> Result<(), String> {
@@ -171,6 +173,64 @@ impl ExternalPool {
             Err(err) => *state = CacheState::Error(err.clone()),
         }
         result
+    }
+
+    pub fn refresh_before_query(&self) -> bool {
+        self.source.refresh_before_query()
+    }
+
+    pub async fn append_rows(
+        &self,
+        table_name: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<ExternalWriteResult, String> {
+        let table_ref = self.resolve_table_ref(table_name)?;
+        let result = self.source.append_rows(&table_ref, rows).await?;
+        self.refresh_cache().await?;
+        Ok(result)
+    }
+
+    pub async fn update_rows(
+        &self,
+        table_name: &str,
+        updates: Vec<ExternalRowUpdate>,
+    ) -> Result<ExternalWriteResult, String> {
+        let table_ref = self.resolve_table_ref(table_name)?;
+        let result = self.source.update_rows(&table_ref, updates).await?;
+        self.refresh_cache().await?;
+        Ok(result)
+    }
+
+    pub async fn delete_rows(&self, table_name: &str, row_ids: Vec<String>) -> Result<ExternalWriteResult, String> {
+        let table_ref = self.resolve_table_ref(table_name)?;
+        let result = self.source.delete_rows(&table_ref, row_ids).await?;
+        self.refresh_cache().await?;
+        Ok(result)
+    }
+
+    pub async fn write_range(
+        &self,
+        table_name: &str,
+        range: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<ExternalWriteResult, String> {
+        let table_ref = self.resolve_table_ref(table_name)?;
+        let result = self.source.write_range(&table_ref, range, rows).await?;
+        self.refresh_cache().await?;
+        Ok(result)
+    }
+
+    fn resolve_table_ref(&self, table_name: &str) -> Result<ExternalTableRef, String> {
+        let table_map = self.table_map.lock().map_err(|e| e.to_string())?;
+        if let Some(table_ref) = table_map.get(table_name) {
+            return Ok(table_ref.clone());
+        }
+
+        table_map
+            .values()
+            .find(|table_ref| table_ref.table_name == table_name || table_ref.display_name == table_name)
+            .cloned()
+            .ok_or_else(|| format!("Unknown external table: {table_name}"))
     }
 
     async fn refresh_cache_inner(&self) -> Result<(), String> {

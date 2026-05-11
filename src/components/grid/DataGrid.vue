@@ -56,7 +56,7 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
-import type { QueryResult, ColumnInfo, DatabaseType } from "@/types/database";
+import type { QueryResult, ColumnInfo, DatabaseType, ExternalRowUpdate } from "@/types/database";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import * as api from "@/lib/api";
 import {
@@ -73,6 +73,7 @@ import {
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { buildDataGridSaveStatements, formatGridSqlLiteral } from "@/lib/dataGridSql";
 import { formatMarkdownTable } from "@/lib/markdownTable";
+import { isExternalTabular } from "@/lib/databaseCapabilities";
 import {
   matchesRowStatusFilter,
   rowStatusFilterAfterAddingRow,
@@ -741,7 +742,29 @@ function exitTransaction() {
   transactionActive.value = false;
 }
 
-const useTransaction = computed(() => props.editable && !!props.connectionId && !!props.database && !!props.tableMeta);
+const isFeishuBitableTableEditor = computed(
+  () =>
+    props.databaseType === "feishu_bitable" &&
+    props.context === "table-data" &&
+    !!props.connectionId &&
+    !!props.tableMeta,
+);
+const useTransaction = computed(
+  () =>
+    props.editable &&
+    !!props.connectionId &&
+    !!props.database &&
+    !!props.tableMeta &&
+    !isFeishuBitableTableEditor.value,
+);
+const canUseRowChangeControls = computed(
+  () => props.editable && !!props.tableMeta && (useTransaction.value || isFeishuBitableTableEditor.value),
+);
+
+function isGridColumnEditable(columnIndex: number): boolean {
+  if (!props.editable) return false;
+  return !(isFeishuBitableTableEditor.value && props.result.columns[columnIndex] === "_record_id");
+}
 
 async function onToolbarRefresh() {
   if (transactionActive.value) {
@@ -1206,7 +1229,7 @@ function coerceCellValue(value: string, oldVal: CellValue | undefined): CellValu
 }
 
 function startEdit(rowId: number, colIdx: number) {
-  if (!props.editable) return;
+  if (!isGridColumnEditable(colIdx)) return;
   const item = getRowItem(rowId);
   if (!item || item.isDeleted) return;
   isCancelling = false;
@@ -1291,7 +1314,8 @@ function addRow() {
   nextTick(() => {
     const el = getScrollerElement();
     if (el) el.scrollTop = el.scrollHeight;
-    startEdit(rowId, 0);
+    const firstEditableColumn = props.result.columns.findIndex((_, index) => isGridColumnEditable(index));
+    if (firstEditableColumn >= 0) startEdit(rowId, firstEditableColumn);
   });
 }
 
@@ -1355,6 +1379,31 @@ function generateSaveStatements(): string[] {
 }
 
 async function saveChanges() {
+  if (isFeishuBitableTableEditor.value) {
+    saveError.value = "";
+    isSaving.value = true;
+    try {
+      await saveFeishuBitableChanges();
+    } catch (e: any) {
+      saveError.value = String(e.message || e);
+      isSaving.value = false;
+      return;
+    }
+    dirtyRows.value.clear();
+    newRows.value = [];
+    deletedRows.value.clear();
+    exitTransaction();
+    isSaving.value = false;
+    emit(
+      "reload",
+      props.sql,
+      searchText.value,
+      whereFilterInput.value.trim() || undefined,
+      orderByInput.value.trim() || undefined,
+    );
+    return;
+  }
+
   const stmts = generateSaveStatements();
   if (stmts.length === 0) return;
   saveError.value = "";
@@ -1399,6 +1448,54 @@ async function saveChanges() {
     whereFilterInput.value.trim() || undefined,
     orderByInput.value.trim() || undefined,
   );
+}
+
+async function saveFeishuBitableChanges() {
+  if (!props.connectionId || !props.tableMeta) {
+    throw new Error("Missing Feishu Bitable table context");
+  }
+
+  const recordIdIndex = props.result.columns.indexOf("_record_id");
+  if (recordIdIndex < 0) {
+    throw new Error("Feishu Bitable edits require the _record_id column");
+  }
+
+  const updates: ExternalRowUpdate[] = [];
+  for (const [rowIndex, changes] of dirtyRows.value.entries()) {
+    const row = props.result.rows[rowIndex];
+    const rowId = String(row?.[recordIdIndex] ?? "").trim();
+    if (!rowId) continue;
+
+    const fields: Record<string, unknown> = {};
+    for (const [columnIndex, value] of changes.entries()) {
+      const columnName = props.result.columns[columnIndex];
+      if (!columnName || columnName === "_record_id") continue;
+      fields[columnName] = value;
+    }
+    if (Object.keys(fields).length > 0) {
+      updates.push({ rowId, fields });
+    }
+  }
+
+  const rowIds = [...deletedRows.value]
+    .map((rowIndex) => String(props.result.rows[rowIndex]?.[recordIdIndex] ?? "").trim())
+    .filter(Boolean);
+
+  const writableColumnIndexes = props.result.columns
+    .map((columnName, index) => ({ columnName, index }))
+    .filter(({ columnName }) => columnName !== "_record_id")
+    .map(({ index }) => index);
+  const rowsToAppend = newRows.value.map((row) => writableColumnIndexes.map((index) => row[index] ?? null));
+
+  if (updates.length > 0) {
+    await api.updateExternalRows(props.connectionId, props.tableMeta.tableName, updates);
+  }
+  if (rowIds.length > 0) {
+    await api.deleteExternalRows(props.connectionId, props.tableMeta.tableName, rowIds);
+  }
+  if (rowsToAppend.length > 0) {
+    await api.appendExternalRows(props.connectionId, props.tableMeta.tableName, rowsToAppend);
+  }
 }
 
 function discardChanges() {
@@ -1651,6 +1748,7 @@ const ddlLoading = ref(false);
 const ddlWidth = ref(320);
 const ddlWrap = ref(true);
 const isResizingDdl = ref(false);
+const ddlSupported = computed(() => !isExternalTabular(props.databaseType));
 let ddlResizeStartX = 0;
 let ddlResizeStartWidth = 0;
 
@@ -1659,6 +1757,7 @@ const ddlDrawerStyle = computed(() => ({
 }));
 
 async function toggleDdl() {
+  if (!ddlSupported.value) return;
   if (showDdl.value) {
     showDdl.value = false;
     return;
@@ -1667,7 +1766,7 @@ async function toggleDdl() {
 }
 
 async function fetchDdl() {
-  if (!props.connectionId || !props.tableMeta) return;
+  if (!ddlSupported.value || !props.connectionId || !props.tableMeta) return;
   showDdl.value = true;
   ddlLoading.value = true;
   try {
@@ -1684,7 +1783,7 @@ async function fetchDdl() {
   }
 }
 
-if (showDdl.value && props.tableMeta && props.connectionId) {
+if (showDdl.value && ddlSupported.value && props.tableMeta && props.connectionId) {
   fetchDdl();
 }
 
@@ -1763,6 +1862,7 @@ defineExpose({
   onToolbarCommit,
   onToolbarRollback,
   showDdl,
+  ddlSupported,
   toggleDdl,
 });
 </script>
@@ -1935,7 +2035,7 @@ defineExpose({
               {{ t("grid.refresh") }}
             </Button>
             <Select
-              v-if="useTransaction && editable && tableMeta"
+              v-if="canUseRowChangeControls"
               :model-value="rowStatusFilter"
               @update:model-value="(value: any) => setRowStatusFilter(String(value))"
             >
@@ -1951,7 +2051,7 @@ defineExpose({
               </SelectContent>
             </Select>
             <Button
-              v-if="useTransaction && editable && tableMeta"
+              v-if="canUseRowChangeControls"
               variant="ghost"
               size="sm"
               class="h-5 text-xs px-1.5 shrink-0"
@@ -2119,7 +2219,7 @@ defineExpose({
                       }"
                       @mousedown="beginCellSelection(index, colIdx, $event)"
                       @mouseenter="extendCellSelection(index, colIdx)"
-                      @dblclick="editable && !item.isDeleted && startEdit(item.id, colIdx)"
+                      @dblclick="isGridColumnEditable(colIdx) && !item.isDeleted && startEdit(item.id, colIdx)"
                       @contextmenu="onCellContext(item.id, index, colIdx)"
                     >
                       <template v-if="editingCell?.rowId === item.id && editingCell?.col === colIdx">
@@ -2152,7 +2252,7 @@ defineExpose({
             </div>
             <!-- DDL Drawer -->
             <div
-              v-if="showDdl"
+              v-if="showDdl && ddlSupported"
               class="relative shrink-0 border-l flex flex-col bg-background min-w-0"
               :class="{ 'ddl-drawer-resizing': isResizingDdl }"
               :style="ddlDrawerStyle"

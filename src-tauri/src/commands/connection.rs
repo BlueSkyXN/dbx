@@ -41,7 +41,10 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
     let result = match probe_result {
         Err(e) => Err(e),
         Ok(()) => match config.db_type {
-            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            db_type @ (DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable) => {
                 use dbx_core::external;
                 let file_path = expand_tilde(&config.host);
                 let ext_config = external::ExternalConfig::parse(&db_type, config.external_config.as_ref())?;
@@ -51,6 +54,22 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     }
                     external::ExternalConfig::Xlsx(xlsx_config) => {
                         Box::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                    external::ExternalConfig::FeishuSheets(feishu_config) => {
+                        Box::new(external::FeishuSheetsSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
+                    }
+                    external::ExternalConfig::FeishuBitable(feishu_config) => {
+                        Box::new(external::FeishuBitableSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
                     }
                 };
                 source.test_connection().await
@@ -147,7 +166,11 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
         },
     };
 
-    if config.ssh_enabled && !config.ssh_host.is_empty() && !config.db_type.is_file_based() {
+    if config.ssh_enabled
+        && !config.ssh_host.is_empty()
+        && !config.db_type.is_file_based()
+        && !config.db_type.is_external_tabular()
+    {
         state.tunnels.stop_tunnel(&tunnel_id).await;
     }
 
@@ -244,7 +267,10 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             .await?;
             PoolKind::Gaussdb(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
         }
-        db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+        db_type @ (DatabaseType::CsvFile
+        | DatabaseType::XlsxFile
+        | DatabaseType::FeishuSheets
+        | DatabaseType::FeishuBitable) => {
             use dbx_core::external;
             let file_path = expand_tilde(&db_config.host);
             let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
@@ -254,6 +280,22 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 }
                 external::ExternalConfig::Xlsx(xlsx_config) => {
                     std::sync::Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                }
+                external::ExternalConfig::FeishuSheets(feishu_config) => {
+                    std::sync::Arc::new(external::FeishuSheetsSource::new(
+                        &db_config.host,
+                        &db_config.username,
+                        &db_config.password,
+                        feishu_config,
+                    ))
+                }
+                external::ExternalConfig::FeishuBitable(feishu_config) => {
+                    std::sync::Arc::new(external::FeishuBitableSource::new(
+                        &db_config.host,
+                        &db_config.username,
+                        &db_config.password,
+                        feishu_config,
+                    ))
                 }
             };
             let duckdb_con =
@@ -303,4 +345,45 @@ pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: Strin
 #[tauri::command]
 pub async fn refresh_external_connection(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
     state.refresh_external_pool(&connection_id).await
+}
+
+#[tauri::command]
+pub async fn append_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.append_external_rows(&connection_id, &table_name, rows).await
+}
+
+#[tauri::command]
+pub async fn update_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    updates: Vec<dbx_core::external::ExternalRowUpdate>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.update_external_rows(&connection_id, &table_name, updates).await
+}
+
+#[tauri::command]
+pub async fn delete_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    row_ids: Vec<String>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.delete_external_rows(&connection_id, &table_name, row_ids).await
+}
+
+#[tauri::command]
+pub async fn write_external_range(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    range: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.write_external_range(&connection_id, &table_name, &range, rows).await
 }

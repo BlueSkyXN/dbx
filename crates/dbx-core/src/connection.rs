@@ -60,7 +60,10 @@ pub fn metadata_connection_config(config: &ConnectionConfig) -> ConnectionConfig
 pub fn database_connection_config(config: &ConnectionConfig, database: Option<&str>) -> ConnectionConfig {
     let mut db_config = if database.is_some() { config.clone() } else { metadata_connection_config(config) };
     if let Some(db) = database {
-        if db_config.db_type != DatabaseType::Oracle && db_config.db_type != DatabaseType::Dameng {
+        if db_config.db_type != DatabaseType::Oracle
+            && db_config.db_type != DatabaseType::Dameng
+            && !db_config.db_type.is_external_tabular()
+        {
             db_config.database = Some(db.to_string());
         }
     }
@@ -223,7 +226,10 @@ impl AppState {
                 .await?;
                 PoolKind::Gaussdb(Arc::new(tokio::sync::Mutex::new(client)))
             }
-            db_type @ (DatabaseType::CsvFile | DatabaseType::XlsxFile) => {
+            db_type @ (DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable) => {
                 let file_path = expand_tilde(&db_config.host);
                 let ext_config = external::ExternalConfig::parse(&db_type, db_config.external_config.as_ref())?;
                 let source: Arc<dyn external::ExternalTabularSource> = match ext_config {
@@ -232,6 +238,22 @@ impl AppState {
                     }
                     external::ExternalConfig::Xlsx(xlsx_config) => {
                         Arc::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                    external::ExternalConfig::FeishuSheets(feishu_config) => {
+                        Arc::new(external::FeishuSheetsSource::new(
+                            &db_config.host,
+                            &db_config.username,
+                            &db_config.password,
+                            feishu_config,
+                        ))
+                    }
+                    external::ExternalConfig::FeishuBitable(feishu_config) => {
+                        Arc::new(external::FeishuBitableSource::new(
+                            &db_config.host,
+                            &db_config.username,
+                            &db_config.password,
+                            feishu_config,
+                        ))
                     }
                 };
                 let duckdb_con =
@@ -251,7 +273,7 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        if !config.ssh_enabled || config.ssh_host.is_empty() || config.db_type.is_file_based() {
+        if !config.ssh_enabled || config.ssh_host.is_empty() || config.db_type.is_external_tabular() {
             return Ok((config.host.clone(), config.port));
         }
 
@@ -317,6 +339,79 @@ impl AppState {
 
         pool.refresh_cache().await
     }
+
+    pub async fn append_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        let pool = {
+            let connections = self.connections.lock().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.append_rows(table_name, rows).await
+    }
+
+    pub async fn update_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        updates: Vec<external::ExternalRowUpdate>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        let pool = {
+            let connections = self.connections.lock().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.update_rows(table_name, updates).await
+    }
+
+    pub async fn delete_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        row_ids: Vec<String>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        let pool = {
+            let connections = self.connections.lock().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.delete_rows(table_name, row_ids).await
+    }
+
+    pub async fn write_external_range(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        range: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        let pool = {
+            let connections = self.connections.lock().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.write_range(table_name, range, rows).await
+    }
 }
 
 pub fn connection_url_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> String {
@@ -337,7 +432,12 @@ pub fn redacted_connection_url_for_endpoint(config: &ConnectionConfig, host: &st
 
 pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> Result<(), String> {
     match config.db_type {
-        DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile => Ok(()),
+        DatabaseType::Sqlite
+        | DatabaseType::DuckDb
+        | DatabaseType::CsvFile
+        | DatabaseType::XlsxFile
+        | DatabaseType::FeishuSheets
+        | DatabaseType::FeishuBitable => Ok(()),
         DatabaseType::MongoDb if config.connection_string.as_deref().is_some_and(|value| !value.is_empty()) => Ok(()),
         _ => db::probe_tcp_endpoint(&format!("{:?}", config.db_type), host, port).await,
     }
@@ -436,6 +536,8 @@ mod tests {
     fn external_tabular_database_scope_reuses_connection_pool_key() {
         assert_eq!(pool_key_for(Some(&DatabaseType::CsvFile), "csv", Some("main")), "csv");
         assert_eq!(pool_key_for(Some(&DatabaseType::XlsxFile), "xlsx", Some("main")), "xlsx");
+        assert_eq!(pool_key_for(Some(&DatabaseType::FeishuSheets), "sheets", Some("main")), "sheets");
+        assert_eq!(pool_key_for(Some(&DatabaseType::FeishuBitable), "bitable", Some("main")), "bitable");
         assert_eq!(pool_key_for(Some(&DatabaseType::Mysql), "mysql", Some("main")), "mysql:main");
     }
 

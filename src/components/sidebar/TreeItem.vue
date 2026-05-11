@@ -74,7 +74,7 @@ import {
   TREE_SCHEMA_TYPES,
   PG_LIKE_STRUCTURE_TYPES,
   CREATE_DATABASE_SUPPORTED_TYPES,
-  FILE_BASED_EXTERNAL_TYPES,
+  EXTERNAL_TABULAR_TYPES,
   isSchemaAware,
   usesFetchFirst,
 } from "@/lib/databaseCapabilities";
@@ -1035,7 +1035,7 @@ const isConnected = computed(
 );
 const canRefreshExternalSnapshot = computed(() => {
   const dbType = currentDatabaseType();
-  return props.node.type === "connection" && !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+  return props.node.type === "connection" && !!dbType && EXTERNAL_TABULAR_TYPES.has(dbType);
 });
 
 function connectionIconType(connectionId?: string) {

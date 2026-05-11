@@ -8,6 +8,8 @@ import type {
   TriggerInfo,
   QueryResult,
   SidebarLayout,
+  ExternalWriteResult,
+  ExternalRowUpdate,
 } from "@/types/database";
 import type { AiConfig } from "@/stores/settingsStore";
 import type {
@@ -82,6 +84,39 @@ export async function disconnectDb(connectionId: string): Promise<void> {
 
 export async function refreshExternalConnection(connectionId: string): Promise<void> {
   return post("/api/connection/refresh-external", { connectionId });
+}
+
+export async function appendExternalRows(
+  connectionId: string,
+  tableName: string,
+  rows: unknown[][],
+): Promise<ExternalWriteResult> {
+  return post("/api/connection/append-external-rows", { connectionId, tableName, rows });
+}
+
+export async function updateExternalRows(
+  connectionId: string,
+  tableName: string,
+  updates: ExternalRowUpdate[],
+): Promise<ExternalWriteResult> {
+  return post("/api/connection/update-external-rows", { connectionId, tableName, updates });
+}
+
+export async function deleteExternalRows(
+  connectionId: string,
+  tableName: string,
+  rowIds: string[],
+): Promise<ExternalWriteResult> {
+  return post("/api/connection/delete-external-rows", { connectionId, tableName, rowIds });
+}
+
+export async function writeExternalRange(
+  connectionId: string,
+  tableName: string,
+  range: string,
+  rows: unknown[][],
+): Promise<ExternalWriteResult> {
+  return post("/api/connection/write-external-range", { connectionId, tableName, range, rows });
 }
 
 export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {

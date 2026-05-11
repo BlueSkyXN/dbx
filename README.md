@@ -30,6 +30,8 @@
     <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
     <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
     <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Sheets-2B6DE5?logoColor=white" />
+    <img src="https://img.shields.io/badge/Feishu%20Bitable-00A870?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>
@@ -78,7 +80,7 @@ Virtual-scrolled table that handles millions of rows. Inline editing, sorting, f
 - **Data transfer** — migrate between databases
 - **Database export** — full database dump
 - **SQL file execution** — run `.sql` files directly
-- **Local file connections** — query CSV/XLSX files as read-only snapshots, with manual refresh after file changes
+- **External tabular connections** — query CSV/XLSX files and Feishu Sheets/Bitable through DuckDB-backed snapshots; Feishu Bitable supports append, update, and delete writes
 - **File preview** — drag & drop Parquet, CSV, JSON to preview instantly (powered by DuckDB)
 
 ### Specialized Browsers

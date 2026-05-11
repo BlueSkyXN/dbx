@@ -1,0 +1,66 @@
+---
+title: Cloud Table Sources
+description: Connect Feishu Sheets and Bitable as queryable external tabular sources.
+---
+
+DBX can connect to Feishu Sheets and Feishu Bitable through Feishu OpenAPI, load them into an in-memory DuckDB cache, and expose them as tables for `SELECT` queries.
+
+## Authentication
+
+Create a Feishu app with document permissions, then configure one of these credential paths:
+
+| Field | Purpose |
+|---|---|
+| OpenAPI | Base URL, usually `https://open.feishu.cn` |
+| App ID / App Secret | Used to request `tenant_access_token` through `/open-apis/auth/v3/tenant_access_token/internal` |
+| Access Token | Optional pre-issued `tenant_access_token` or `user_access_token`; when set, DBX uses it directly |
+
+The app or user behind the token must also have document access to the target spreadsheet or bitable.
+
+## Feishu Sheets
+
+Sheets connections use these OpenAPI surfaces:
+
+| Operation | Endpoint |
+|---|---|
+| List worksheets | `GET /open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/query` |
+| Read values | `GET /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values/:range` |
+| Append rows | `POST /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values_append` |
+| Overwrite range | `PUT /open-apis/sheets/v2/spreadsheets/:spreadsheetToken/values` |
+
+Configure `Spreadsheet Token`, optional `Sheet ID`, optional `Range`, render options, header handling, row/column limits, and sync mode. If `Range` is omitted, DBX reads from `A1` to the configured row/column limits.
+
+## Feishu Bitable
+
+Bitable connections use these OpenAPI surfaces:
+
+| Operation | Endpoint |
+|---|---|
+| List tables | `GET /open-apis/bitable/v1/apps/:app_token/tables` |
+| List fields | `GET /open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields` |
+| Query records | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/search` |
+| Append records | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_create` |
+| Update records | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_update` |
+| Delete records | `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_delete` |
+
+Configure `App Token`, optional `Table ID`, optional `View ID`, optional field allow-list, `user_id_type`, page size, max records, and sync mode. DBX exposes `_record_id` as the primary key so the table data grid can write Bitable record edits back through batch update/delete.
+
+## Sync Modes
+
+| Mode | Behavior |
+|---|---|
+| Snapshot | Load on connect and explicit refresh. This is the lowest-cost mode. |
+| Refresh before SELECT | Refresh the cache before every external `SELECT`. This is polling-style freshness, not a Feishu event subscription. |
+
+External writes refresh the cache after the write succeeds. Background async sync and Feishu webhook subscriptions are not enabled in this implementation.
+
+## Write API
+
+The app exposes these write operations in both Tauri and web mode:
+
+| API | Source |
+|---|---|
+| `appendExternalRows(connectionId, tableName, rows)` | Sheets append and Bitable batch create |
+| `updateExternalRows(connectionId, tableName, updates)` | Bitable batch update |
+| `deleteExternalRows(connectionId, tableName, rowIds)` | Bitable batch delete |
+| `writeExternalRange(connectionId, tableName, range, rows)` | Sheets range overwrite |

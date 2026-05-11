@@ -20,7 +20,7 @@ import {
 import type { SqlCompletionColumn, SqlCompletionTable } from "@/lib/sqlCompletion";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { FILE_BASED_EXTERNAL_TYPES, isSchemaAware, TREE_SCHEMA_TYPES } from "@/lib/databaseCapabilities";
+import { EXTERNAL_TABULAR_TYPES, isSchemaAware, TREE_SCHEMA_TYPES } from "@/lib/databaseCapabilities";
 import { buildDatabaseTreeNodes } from "@/lib/databaseTree";
 import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
 
@@ -150,6 +150,8 @@ export const useConnectionStore = defineStore("connection", () => {
       gaussdb: "GaussDB",
       csvfile: "CSV",
       xlsxfile: "XLSX",
+      feishu_sheets: "Feishu Sheets",
+      feishu_bitable: "Feishu Bitable",
     };
 
     const profile = config.driver_profile || config.db_type;
@@ -832,7 +834,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function refreshExternalConnection(connectionId: string) {
     const config = getConfig(connectionId);
-    if (!config || !FILE_BASED_EXTERNAL_TYPES.has(config.db_type)) return;
+    if (!config || !EXTERNAL_TABULAR_TYPES.has(config.db_type)) return;
 
     await ensureConnected(connectionId);
     await api.refreshExternalConnection(connectionId);
