@@ -113,6 +113,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
 
+export async function refreshExternalConnection(connectionId: string): Promise<void> {
+  return invoke("refresh_external_connection", { connectionId });
+}
+
 export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {
   return invoke("list_databases", { connectionId });
 }

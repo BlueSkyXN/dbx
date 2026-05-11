@@ -299,3 +299,8 @@ pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: Strin
     state.tunnels.stop_tunnel(&connection_id).await;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn refresh_external_connection(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
+    state.refresh_external_pool(&connection_id).await
+}

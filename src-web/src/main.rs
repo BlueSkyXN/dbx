@@ -78,6 +78,7 @@ async fn main() {
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
+        .route("/connection/refresh-external", post(routes::connection::refresh_external_connection))
         .route("/connection/save", post(routes::connection::save_connections))
         .route("/connection/list", get(routes::connection::load_connections))
         // Schema

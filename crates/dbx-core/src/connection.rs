@@ -67,6 +67,26 @@ pub fn database_connection_config(config: &ConnectionConfig, database: Option<&s
     db_config
 }
 
+fn is_preopened_embedded_pool(db_type: Option<&DatabaseType>) -> bool {
+    matches!(db_type, Some(DatabaseType::Sqlite) | Some(DatabaseType::DuckDb))
+}
+
+fn uses_connection_level_pool_key(db_type: Option<&DatabaseType>) -> bool {
+    matches!(db_type, Some(DatabaseType::Oracle) | Some(DatabaseType::Dameng))
+        || db_type.is_some_and(DatabaseType::is_external_tabular)
+}
+
+fn pool_key_for(db_type: Option<&DatabaseType>, connection_id: &str, database: Option<&str>) -> String {
+    if uses_connection_level_pool_key(db_type) {
+        connection_id.to_string()
+    } else {
+        match database {
+            Some(db) => format!("{connection_id}:{db}"),
+            None => connection_id.to_string(),
+        }
+    }
+}
+
 impl AppState {
     pub fn new(storage: Storage) -> Self {
         Self {
@@ -84,20 +104,11 @@ impl AppState {
             configs.get(connection_id).map(|c| c.db_type.clone())
         };
 
-        let is_embedded = matches!(db_type, Some(DatabaseType::Sqlite) | Some(DatabaseType::DuckDb));
-        if is_embedded {
+        if is_preopened_embedded_pool(db_type.as_ref()) {
             return Ok(connection_id.to_string());
         }
 
-        let is_single_conn = matches!(db_type, Some(DatabaseType::Oracle) | Some(DatabaseType::Dameng));
-        let pool_key = if is_single_conn {
-            connection_id.to_string()
-        } else {
-            match database {
-                Some(db) => format!("{connection_id}:{db}"),
-                None => connection_id.to_string(),
-            }
-        };
+        let pool_key = pool_key_for(db_type.as_ref(), connection_id, database);
 
         let conns = self.connections.lock().await;
         if conns.contains_key(&pool_key) {
@@ -280,27 +291,31 @@ impl AppState {
     }
 
     pub async fn reconnect_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
-        let is_single_conn = {
+        let db_type = {
             let configs = self.configs.lock().await;
-            configs
-                .get(connection_id)
-                .map(|c| {
-                    c.db_type == DatabaseType::Oracle
-                        || c.db_type == DatabaseType::Elasticsearch
-                        || c.db_type == DatabaseType::Dameng
-                })
-                .unwrap_or(false)
+            configs.get(connection_id).map(|c| c.db_type.clone())
         };
-        let pool_key = if is_single_conn {
-            connection_id.to_string()
-        } else {
-            match database {
-                Some(db) => format!("{connection_id}:{db}"),
-                None => connection_id.to_string(),
-            }
-        };
+
+        if is_preopened_embedded_pool(db_type.as_ref()) {
+            return Ok(connection_id.to_string());
+        }
+
+        let pool_key = pool_key_for(db_type.as_ref(), connection_id, database);
         self.connections.lock().await.remove(&pool_key);
         self.get_or_create_pool(connection_id, database).await
+    }
+
+    pub async fn refresh_external_pool(&self, connection_id: &str) -> Result<(), String> {
+        let pool = {
+            let connections = self.connections.lock().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.refresh_cache().await
     }
 }
 
@@ -344,8 +359,9 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &sqlx::mysql::My
 
 #[cfg(test)]
 mod tests {
-    use super::{database_connection_config, metadata_connection_config};
+    use super::{database_connection_config, metadata_connection_config, pool_key_for, AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::storage::Storage;
 
     fn mysql_config(database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
@@ -414,5 +430,73 @@ mod tests {
         let scoped = database_connection_config(&config, Some("analytics"));
 
         assert_eq!(scoped.database.as_deref(), Some("ORCL"));
+    }
+
+    #[test]
+    fn external_tabular_database_scope_reuses_connection_pool_key() {
+        assert_eq!(pool_key_for(Some(&DatabaseType::CsvFile), "csv", Some("main")), "csv");
+        assert_eq!(pool_key_for(Some(&DatabaseType::XlsxFile), "xlsx", Some("main")), "xlsx");
+        assert_eq!(pool_key_for(Some(&DatabaseType::Mysql), "mysql", Some("main")), "mysql:main");
+    }
+
+    #[tokio::test]
+    async fn external_csv_pool_is_reused_and_refresh_reloads_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx_external_csv_pool_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("people.csv");
+        let db_path = dir.join("state.sqlite");
+        std::fs::write(&csv_path, "name\nAda\n").unwrap();
+
+        let storage = Storage::open(&db_path).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = mysql_config(None);
+        config.id = "csv".to_string();
+        config.name = "CSV".to_string();
+        config.db_type = DatabaseType::CsvFile;
+        config.driver_profile = Some("csvfile".to_string());
+        config.driver_label = Some("CSV".to_string());
+        config.host = csv_path.to_string_lossy().to_string();
+        config.port = 0;
+        config.username.clear();
+        config.password.clear();
+        config.database = None;
+        state.configs.lock().await.insert(config.id.clone(), config);
+
+        let key = state.get_or_create_pool("csv", Some("main")).await.unwrap();
+        assert_eq!(key, "csv");
+        let key_again = state.get_or_create_pool("csv", Some("main")).await.unwrap();
+        assert_eq!(key_again, "csv");
+
+        {
+            let connections = state.connections.lock().await;
+            assert_eq!(connections.len(), 1);
+            assert!(matches!(connections.get("csv"), Some(PoolKind::ExternalTabular(_))));
+        }
+
+        let result = crate::query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0][0], serde_json::Value::String("Ada".to_string()));
+
+        std::fs::write(&csv_path, "name\nGrace\n").unwrap();
+        state.refresh_external_pool("csv").await.unwrap();
+
+        let refreshed =
+            crate::query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
+                .await
+                .unwrap();
+        assert_eq!(refreshed.rows[0][0], serde_json::Value::String("Grace".to_string()));
+
+        let write_err =
+            crate::query::execute_sql_statement(&state, "csv", "main", "UPDATE people SET name = 'Lin'", None, None)
+                .await
+                .unwrap_err();
+        assert!(write_err.contains("read-only"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

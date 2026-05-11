@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -224,6 +225,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.database = undefined;
     }
   }
+  ensureExternalConfigDefaults(profile.type);
 }
 
 watch(
@@ -260,6 +262,7 @@ watch(
       selectedType.value = profile;
       mongoUseUrl.value = !!config.connection_string;
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
+      ensureExternalConfigDefaults(config.db_type);
       dialogStep.value = "config";
       configTab.value = "connection";
     } else {
@@ -396,6 +399,7 @@ const filteredDbCategories = computed<DbCategory[]>(() => {
 const hasDbPickerResults = computed(() => filteredDbCategories.value.some((category) => category.options.length > 0));
 const selectedDbIcon = computed(() => iconTypeMap[selectedType.value] || selectedProfile().icon || selectedType.value);
 const isFileConnection = computed(() => ["sqlite", "duckdb", "csvfile", "xlsxfile"].includes(form.value.db_type));
+const isExternalFileConnection = computed(() => form.value.db_type === "csvfile" || form.value.db_type === "xlsxfile");
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "csvfile") return "/path/to/data.csv";
   if (form.value.db_type === "xlsxfile") return "/path/to/workbook.xlsx";
@@ -406,6 +410,34 @@ const canUseSsh = computed(() => !isFileConnection.value);
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
+});
+
+const csvDelimiter = computed({
+  get: () => {
+    const value = form.value.external_config?.delimiter;
+    if (value === "\t") return "\\t";
+    return typeof value === "string" && value.length > 0 ? value : ",";
+  },
+  set: (value: string) => {
+    updateExternalConfig({ delimiter: normalizeCsvDelimiter(value) });
+  },
+});
+
+const externalHasHeader = computed({
+  get: () => form.value.external_config?.has_header !== false,
+  set: (value: boolean) => {
+    updateExternalConfig({ has_header: value });
+  },
+});
+
+const xlsxSheetName = computed({
+  get: () => {
+    const value = form.value.external_config?.sheet_name;
+    return typeof value === "string" ? value : "";
+  },
+  set: (value: string) => {
+    updateExternalConfig({ sheet_name: value });
+  },
 });
 
 function goToConnectionStep(value = selectedType.value) {
@@ -420,6 +452,41 @@ function goToConnectionStep(value = selectedType.value) {
 function backToDatabasePicker() {
   dialogStep.value = "select";
   resetTestState();
+}
+
+function updateExternalConfig(patch: Record<string, unknown>) {
+  form.value.external_config = {
+    ...form.value.external_config,
+    ...patch,
+  };
+}
+
+function normalizeCsvDelimiter(value: string) {
+  if (value === "\\t") return "\t";
+  return value.charAt(0) || ",";
+}
+
+function ensureExternalConfigDefaults(dbType = form.value.db_type) {
+  if (dbType === "csvfile") {
+    const existing = form.value.external_config || {};
+    form.value.external_config = {
+      delimiter: normalizeCsvDelimiter(typeof existing.delimiter === "string" ? existing.delimiter : ","),
+      has_header: existing.has_header !== false,
+    };
+    return;
+  }
+
+  if (dbType === "xlsxfile") {
+    const existing = form.value.external_config || {};
+    const sheetName = typeof existing.sheet_name === "string" ? existing.sheet_name : "";
+    form.value.external_config = {
+      ...(sheetName.trim() ? { sheet_name: sheetName.trim() } : {}),
+      has_header: existing.has_header !== false,
+    };
+    return;
+  }
+
+  form.value.external_config = undefined;
 }
 
 watch(customDriverName, (value) => {
@@ -459,6 +526,22 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
     config.username = "";
     config.password = "";
     config.database = undefined;
+  }
+  if (config.db_type === "csvfile") {
+    const existing = config.external_config || {};
+    config.external_config = {
+      delimiter: normalizeCsvDelimiter(typeof existing.delimiter === "string" ? existing.delimiter : ","),
+      has_header: existing.has_header !== false,
+    };
+  } else if (config.db_type === "xlsxfile") {
+    const existing = config.external_config || {};
+    const sheetName = typeof existing.sheet_name === "string" ? existing.sheet_name.trim() : "";
+    config.external_config = {
+      ...(sheetName ? { sheet_name: sheetName } : {}),
+      has_header: existing.has_header !== false,
+    };
+  } else {
+    config.external_config = undefined;
   }
   return config;
 }
@@ -760,6 +843,41 @@ async function browseDbFilePath() {
                         <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
                       </Tooltip>
                     </div>
+                  </div>
+                  <div v-if="form.db_type === 'csvfile'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.csvDelimiter") }}</Label>
+                    <Select v-model="csvDelimiter">
+                      <SelectTrigger class="col-span-3 w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value=",">{{ t("connection.delimiterComma") }}</SelectItem>
+                        <SelectItem value="\\t">{{ t("connection.delimiterTab") }}</SelectItem>
+                        <SelectItem value=";">{{ t("connection.delimiterSemicolon") }}</SelectItem>
+                        <SelectItem value="|">{{ t("connection.delimiterPipe") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div v-if="form.db_type === 'xlsxfile'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.xlsxSheetName") }}</Label>
+                    <Input
+                      v-model="xlsxSheetName"
+                      class="col-span-3"
+                      :placeholder="t('connection.xlsxSheetNamePlaceholder')"
+                    />
+                  </div>
+                  <div v-if="isExternalFileConnection" class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <label class="col-span-3 flex items-center gap-2 cursor-pointer">
+                      <input v-model="externalHasHeader" type="checkbox" class="mr-0" />
+                      <span class="text-xs text-muted-foreground">{{ t("connection.firstRowHeader") }}</span>
+                    </label>
+                  </div>
+                  <div v-if="isExternalFileConnection" class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 text-xs text-muted-foreground">
+                      {{ t("connection.fileSnapshotHint") }}
+                    </p>
                   </div>
                 </template>
 

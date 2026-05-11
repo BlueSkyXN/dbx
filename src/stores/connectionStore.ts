@@ -20,7 +20,7 @@ import {
 import type { SqlCompletionColumn, SqlCompletionTable } from "@/lib/sqlCompletion";
 import * as api from "@/lib/api";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { isSchemaAware, TREE_SCHEMA_TYPES } from "@/lib/databaseCapabilities";
+import { FILE_BASED_EXTERNAL_TYPES, isSchemaAware, TREE_SCHEMA_TYPES } from "@/lib/databaseCapabilities";
 import { buildDatabaseTreeNodes } from "@/lib/databaseTree";
 import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
 
@@ -830,6 +830,23 @@ export const useConnectionStore = defineStore("connection", () => {
     await restoreExpandedChildren(node, expandedIds, { force: true });
   }
 
+  async function refreshExternalConnection(connectionId: string) {
+    const config = getConfig(connectionId);
+    if (!config || !FILE_BASED_EXTERNAL_TYPES.has(config.db_type)) return;
+
+    await ensureConnected(connectionId);
+    await api.refreshExternalConnection(connectionId);
+    clearConnectionError(connectionId);
+    invalidateCompletionCache(connectionId);
+    clearLoadedChildrenCache(connectionId);
+
+    const node = findNode(treeNodes.value, connectionId);
+    if (node) {
+      node.children = [];
+      await loadTreeNodeChildren(node, { force: true });
+    }
+  }
+
   function isSchemaAwareDatabase(connectionId: string): boolean {
     return isSchemaAware(getConfig(connectionId)?.db_type);
   }
@@ -1110,6 +1127,7 @@ export const useConnectionStore = defineStore("connection", () => {
     treeNodes,
     refreshAllTree,
     refreshTreeNode,
+    refreshExternalConnection,
     connectedIds,
     connectionErrors,
     setConnectionError,

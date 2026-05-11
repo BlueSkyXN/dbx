@@ -34,6 +34,7 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 export const testConnection = forward("testConnection");
 export const connectDb = forward("connectDb");
 export const disconnectDb = forward("disconnectDb");
+export const refreshExternalConnection = forward("refreshExternalConnection");
 export const saveConnections = forward("saveConnections");
 export const loadConnections = forward("loadConnections");
 

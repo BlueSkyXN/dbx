@@ -80,6 +80,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return post("/api/connection/disconnect", { connectionId });
 }
 
+export async function refreshExternalConnection(connectionId: string): Promise<void> {
+  return post("/api/connection/refresh-external", { connectionId });
+}
+
 export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
   return post("/api/connection/save", { configs });
 }

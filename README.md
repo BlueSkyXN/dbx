@@ -78,6 +78,7 @@ Virtual-scrolled table that handles millions of rows. Inline editing, sorting, f
 - **Data transfer** — migrate between databases
 - **Database export** — full database dump
 - **SQL file execution** — run `.sql` files directly
+- **Local file connections** — query CSV/XLSX files as read-only snapshots, with manual refresh after file changes
 - **File preview** — drag & drop Parquet, CSV, JSON to preview instantly (powered by DuckDB)
 
 ### Specialized Browsers
