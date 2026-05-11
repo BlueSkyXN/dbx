@@ -13,7 +13,9 @@ export type DatabaseType =
   | "starrocks"
   | "redshift"
   | "dameng"
-  | "gaussdb";
+  | "gaussdb"
+  | "csvfile"
+  | "xlsxfile";
 
 export interface ConnectionConfig {
   id: string;
@@ -40,6 +42,7 @@ export interface ConnectionConfig {
   ssl?: boolean;
   sysdba?: boolean;
   connection_string?: string;
+  external_config?: Record<string, unknown>;
 }
 
 export interface DatabaseInfo {

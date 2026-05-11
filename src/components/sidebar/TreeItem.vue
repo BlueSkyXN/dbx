@@ -74,6 +74,7 @@ import {
   TREE_SCHEMA_TYPES,
   PG_LIKE_STRUCTURE_TYPES,
   CREATE_DATABASE_SUPPORTED_TYPES,
+  FILE_BASED_EXTERNAL_TYPES,
   isSchemaAware,
   usesFetchFirst,
 } from "@/lib/databaseCapabilities";
@@ -341,6 +342,16 @@ async function refresh() {
     await connectionStore.refreshTreeNode(props.node);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function refreshExternalSnapshot() {
+  if (!props.node.connectionId) return;
+  try {
+    await connectionStore.refreshExternalConnection(props.node.connectionId);
+    toast(t("contextMenu.refreshExternalSnapshotSuccess"), 3000);
+  } catch (e: any) {
+    toast(t("contextMenu.refreshExternalSnapshotFailed", { message: e?.message || String(e) }), 5000);
   }
 }
 
@@ -1022,6 +1033,10 @@ const isConnected = computed(
     !!props.node.connectionId &&
     connectionStore.connectedIds.has(props.node.connectionId),
 );
+const canRefreshExternalSnapshot = computed(() => {
+  const dbType = currentDatabaseType();
+  return props.node.type === "connection" && !!dbType && FILE_BASED_EXTERNAL_TYPES.has(dbType);
+});
 
 function connectionIconType(connectionId?: string) {
   const config = connectionId ? connectionStore.getConfig(connectionId) : undefined;
@@ -1331,6 +1346,9 @@ const isDragging = computed(() => dragState.active && dragState.draggedId === pr
         </ContextMenuItem>
         <ContextMenuItem @click="refresh">
           <RefreshCw class="w-4 h-4" /> {{ t("contextMenu.refreshChildren") }}
+        </ContextMenuItem>
+        <ContextMenuItem v-if="canRefreshExternalSnapshot" @click="refreshExternalSnapshot">
+          <RefreshCw class="w-4 h-4" /> {{ t("contextMenu.refreshExternalSnapshot") }}
         </ContextMenuItem>
         <ContextMenuItem @click="editConnection">
           <Pencil class="w-4 h-4" /> {{ t("contextMenu.editConnection") }}

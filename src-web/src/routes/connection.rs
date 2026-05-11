@@ -22,6 +22,12 @@ pub struct DisconnectRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RefreshExternalRequest {
+    pub connection_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
@@ -89,6 +95,14 @@ pub async fn disconnect_db(
     app.configs.lock().await.remove(&body.connection_id);
     app.tunnels.stop_tunnel(&body.connection_id).await;
 
+    Ok(Json(()))
+}
+
+pub async fn refresh_external_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<RefreshExternalRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.refresh_external_pool(&body.connection_id).await.map_err(AppError)?;
     Ok(Json(()))
 }
 

@@ -28,6 +28,8 @@
     <img src="https://img.shields.io/badge/openGauss-2B7BD9?logoColor=white" />
     <img src="https://img.shields.io/badge/GaussDB-E60012?logoColor=white" />
     <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
+    <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
+    <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
   </p>
   <p>
@@ -76,6 +78,7 @@ Virtual-scrolled table that handles millions of rows. Inline editing, sorting, f
 - **Data transfer** — migrate between databases
 - **Database export** — full database dump
 - **SQL file execution** — run `.sql` files directly
+- **Local file connections** — query CSV/XLSX files as read-only snapshots, with manual refresh after file changes
 - **File preview** — drag & drop Parquet, CSV, JSON to preview instantly (powered by DuckDB)
 
 ### Specialized Browsers
