@@ -207,11 +207,19 @@ impl ExternalPool {
             con.execute_batch("BEGIN TRANSACTION")
                 .map_err(|e| format!("Failed to begin external cache refresh transaction: {e}"))?;
 
-            let load_result = load_items.iter().try_for_each(|(target_table_name, snapshot)| {
-                load_snapshot_to_duckdb_as(&con, snapshot, target_table_name)
-            });
+            let refresh_result: Result<(), String> = (|| {
+                let existing_tables = external_cache_table_names(&con)?;
+                for table_name in existing_tables {
+                    con.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name)), [])
+                        .map_err(|e| format!("Failed to drop stale external cache table '{table_name}': {e}"))?;
+                }
 
-            match load_result {
+                load_items.iter().try_for_each(|(target_table_name, snapshot)| {
+                    load_snapshot_to_duckdb_as(&con, snapshot, target_table_name)
+                })
+            })();
+
+            match refresh_result {
                 Ok(()) => con
                     .execute_batch("COMMIT")
                     .map_err(|e| format!("Failed to commit external cache refresh transaction: {e}")),
@@ -233,6 +241,21 @@ impl ExternalPool {
 
         Ok(())
     }
+}
+
+fn external_cache_table_names(con: &duckdb::Connection) -> Result<Vec<String>, String> {
+    let mut stmt = con
+        .prepare(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE' \
+             ORDER BY table_name",
+        )
+        .map_err(|e| format!("Failed to list external cache tables: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Failed to query external cache tables: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Failed to read external cache table name: {e}"))
 }
 
 impl std::fmt::Debug for ExternalPool {
@@ -272,6 +295,11 @@ mod tests {
         snapshots: Vec<ExternalTableSnapshot>,
     }
 
+    #[derive(Debug, Clone)]
+    struct MutableSnapshotSource {
+        snapshots: Arc<std::sync::Mutex<Vec<ExternalTableSnapshot>>>,
+    }
+
     #[async_trait]
     impl super::super::traits::ExternalTabularSource for SnapshotSource {
         fn capabilities(&self) -> super::super::types::ExternalCapabilities {
@@ -308,6 +336,48 @@ mod tests {
 
         fn display_name(&self) -> String {
             "snapshot-source".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl super::super::traits::ExternalTabularSource for MutableSnapshotSource {
+        fn capabilities(&self) -> super::super::types::ExternalCapabilities {
+            super::super::types::ExternalCapabilities { can_read: true, supports_refresh: true, ..Default::default() }
+        }
+
+        async fn list_tables(&self) -> Result<Vec<ExternalTableRef>, String> {
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            Ok(snapshots.iter().map(|snapshot| snapshot.table_ref.clone()).collect())
+        }
+
+        async fn get_columns(&self, table: &ExternalTableRef) -> Result<Vec<ExternalColumnDef>, String> {
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.table_ref == *table)
+                .map(|snapshot| snapshot.columns.clone())
+                .ok_or_else(|| format!("Unknown table {}", table.table_name))
+        }
+
+        async fn load_table(&self, table: &ExternalTableRef) -> Result<ExternalTableSnapshot, String> {
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.table_ref == *table)
+                .cloned()
+                .ok_or_else(|| format!("Unknown table {}", table.table_name))
+        }
+
+        async fn source_version(&self, table: &ExternalTableRef) -> Result<String, String> {
+            Ok(format!("test:{}", table.table_name))
+        }
+
+        async fn test_connection(&self) -> Result<String, String> {
+            Ok("Connection successful".to_string())
+        }
+
+        fn display_name(&self) -> String {
+            "mutable-snapshot-source".to_string()
         }
     }
 
@@ -364,6 +434,11 @@ mod tests {
     #[tokio::test]
     async fn refresh_cache_rolls_back_partial_loads_on_failure() {
         let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        {
+            let con = cache.lock().unwrap();
+            con.execute("CREATE TABLE \"existing\" (id BIGINT)", []).unwrap();
+            con.execute("INSERT INTO \"existing\" VALUES (42)", []).unwrap();
+        }
         let source = Arc::new(SnapshotSource {
             snapshots: vec![
                 snapshot("valid", vec![column("id", "BIGINT")], vec![vec![serde_json::json!(1)]]),
@@ -386,5 +461,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+        let existing_value: i64 = con.query_row("SELECT id FROM \"existing\"", [], |row| row.get(0)).unwrap();
+        assert_eq!(existing_value, 42);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_drops_tables_removed_from_source() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![
+            snapshot("active_sheet", vec![column("id", "BIGINT")], vec![vec![serde_json::json!(1)]]),
+            snapshot("deleted_sheet", vec![column("id", "BIGINT")], vec![vec![serde_json::json!(2)]]),
+        ]));
+        let pool = ExternalPool::new(Arc::new(MutableSnapshotSource { snapshots: snapshots.clone() }), cache.clone());
+
+        pool.refresh_cache().await.unwrap();
+        {
+            let con = cache.lock().unwrap();
+            let tables = external_cache_table_names(&con).unwrap();
+            assert_eq!(tables.len(), 2);
+            assert!(tables.contains(&"active_sheet".to_string()));
+            assert!(tables.contains(&"deleted_sheet".to_string()));
+        }
+
+        *snapshots.lock().unwrap() =
+            vec![snapshot("active_sheet", vec![column("id", "BIGINT")], vec![vec![serde_json::json!(3)]])];
+        pool.refresh_cache().await.unwrap();
+
+        let con = cache.lock().unwrap();
+        let tables = external_cache_table_names(&con).unwrap();
+        assert_eq!(tables, vec!["active_sheet".to_string()]);
+        let value: i64 = con.query_row("SELECT id FROM \"active_sheet\"", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, 3);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_keeps_previous_tables_on_failed_reload() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![snapshot(
+            "stable_sheet",
+            vec![column("id", "BIGINT")],
+            vec![vec![serde_json::json!(1)]],
+        )]));
+        let pool = ExternalPool::new(Arc::new(MutableSnapshotSource { snapshots: snapshots.clone() }), cache.clone());
+
+        pool.refresh_cache().await.unwrap();
+        *snapshots.lock().unwrap() =
+            vec![snapshot("stable_sheet", vec![required_column("id", "BIGINT")], vec![vec![serde_json::Value::Null]])];
+
+        let err = pool.refresh_cache().await.unwrap_err();
+        assert!(err.contains("Failed to insert row"));
+
+        let con = cache.lock().unwrap();
+        let tables = external_cache_table_names(&con).unwrap();
+        assert_eq!(tables, vec!["stable_sheet".to_string()]);
+        let value: i64 = con.query_row("SELECT id FROM \"stable_sheet\"", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, 1);
     }
 }
