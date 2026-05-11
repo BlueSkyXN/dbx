@@ -11,7 +11,9 @@ on:
 jobs:
   notify:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease) }}
+    if: |
+      (github.event_name != 'pull_request_target' || github.repository == 't8y2/dbx') &&
+      (github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease))
     steps:
       - name: Build message
         id: msg
