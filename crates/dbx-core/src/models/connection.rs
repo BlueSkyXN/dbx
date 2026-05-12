@@ -102,6 +102,16 @@ impl DatabaseType {
     pub fn is_file_based(&self) -> bool {
         matches!(self, DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::CsvFile | DatabaseType::XlsxFile)
     }
+
+    fn external_log_target(&self) -> &'static str {
+        match self {
+            DatabaseType::CsvFile => "csvfile",
+            DatabaseType::XlsxFile => "xlsxfile",
+            DatabaseType::FeishuSheets => "feishu_sheets",
+            DatabaseType::FeishuBitable => "feishu_bitable",
+            _ => "external",
+        }
+    }
 }
 
 impl ConnectionConfig {
@@ -156,14 +166,13 @@ impl ConnectionConfig {
         let params = self.normalized_url_params();
 
         match self.db_type {
-            DatabaseType::Sqlite
-            | DatabaseType::DuckDb
-            | DatabaseType::CsvFile
-            | DatabaseType::XlsxFile
-            | DatabaseType::FeishuSheets
-            | DatabaseType::FeishuBitable => {
+            DatabaseType::Sqlite | DatabaseType::DuckDb => {
                 format!("{}?mode=rwc", self.host)
             }
+            DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => format!("external://{}", self.db_type.external_log_target()),
             DatabaseType::Redis => {
                 let scheme = if self.ssl { "rediss" } else { "redis" };
                 format!("{scheme}://{host}:{port}/")
@@ -605,6 +614,35 @@ mod tests {
         assert_eq!(url, "mongodb://10.1.2.3:17000/admin?authSource=admin&authMechanism=SCRAM-SHA-1");
         assert!(!url.contains("root"));
         assert!(!url.contains("secret"));
+    }
+
+    #[test]
+    fn redacted_external_tabular_targets_omit_paths_and_tokens() {
+        let mut config = mysql_config("", "", None);
+        config.db_type = DatabaseType::CsvFile;
+        config.host = "/Users/me/private/customers.csv".to_string();
+
+        let csv_url = config.redacted_connection_url();
+
+        assert_eq!(csv_url, "external://csvfile");
+        assert!(!csv_url.contains("private"));
+        assert!(!csv_url.contains("customers"));
+
+        config.db_type = DatabaseType::FeishuSheets;
+        config.host = "https://open.feishu.cn/sheets/shtcnSensitiveToken".to_string();
+
+        let sheets_url = config.redacted_connection_url();
+
+        assert_eq!(sheets_url, "external://feishu_sheets");
+        assert!(!sheets_url.contains("shtcnSensitiveToken"));
+
+        config.db_type = DatabaseType::FeishuBitable;
+        config.host = "https://open.feishu.cn/base/appSensitiveToken".to_string();
+
+        let bitable_url = config.redacted_connection_url();
+
+        assert_eq!(bitable_url, "external://feishu_bitable");
+        assert!(!bitable_url.contains("appSensitiveToken"));
     }
 
     #[test]
