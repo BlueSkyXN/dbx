@@ -18,6 +18,7 @@ import {
 } from "./database.js";
 import type { ConnectionConfig } from "./connections.js";
 import type { TableInfo, ColumnInfo, QueryResult } from "./database.js";
+import { registerFeishuTools } from "./feishu.js";
 
 const isWebMode = !!process.env.DBX_WEB_URL;
 
@@ -61,7 +62,7 @@ function mdTable(headers: string[], rows: string[][]): string {
 
 const server = new McpServer({
   name: "dbx",
-  version: "0.2.1",
+  version: "0.2.2",
 });
 
 server.tool(
@@ -177,6 +178,8 @@ server.tool(
     return text(`Connection "${connection_name}" removed.`);
   },
 );
+
+registerFeishuTools(server);
 
 function formatCell(value: unknown): string {
   if (value === null || value === undefined) return "NULL";

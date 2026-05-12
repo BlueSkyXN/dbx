@@ -176,6 +176,35 @@ Execute a SQL query in DBX desktop app UI. **Requires DBX to be running.**
 | `sql` | Yes | SQL query |
 | `database` | No | Database name |
 
+### Feishu tools
+
+DBX MCP Server can also call Feishu OpenAPI directly. These tools do not require a DBX connection; configure credentials through environment variables or pass them per call.
+
+| Tool | Description |
+|---|---|
+| `dbx_feishu_get_tenant_access_token` | Get a Feishu `tenant_access_token` from self-built app credentials |
+| `dbx_feishu_sheets_info` | Get spreadsheet metadata and worksheet list |
+| `dbx_feishu_sheets_read` | Read Feishu Sheets cell values |
+| `dbx_feishu_sheets_write` | Overwrite a Feishu Sheets range |
+| `dbx_feishu_sheets_append` | Append rows to Feishu Sheets |
+| `dbx_feishu_bitable_list_tables` | List tables in a Feishu Bitable/Base |
+| `dbx_feishu_bitable_list_fields` | List fields in a Bitable table |
+| `dbx_feishu_bitable_search_records` | Search/list Bitable records |
+| `dbx_feishu_bitable_create_records` | Batch create Bitable records |
+| `dbx_feishu_bitable_update_records` | Batch update Bitable records |
+| `dbx_feishu_bitable_delete_records` | Batch delete Bitable records |
+
+Feishu authentication environment variables:
+
+| Variable | Description |
+|---|---|
+| `DBX_FEISHU_BASE_URL` / `FEISHU_BASE_URL` | OpenAPI base URL, default `https://open.feishu.cn` |
+| `DBX_FEISHU_ACCESS_TOKEN` / `FEISHU_ACCESS_TOKEN` | Optional pre-issued tenant/user access token |
+| `DBX_FEISHU_APP_ID` / `FEISHU_APP_ID` | Self-built app ID used to fetch `tenant_access_token` |
+| `DBX_FEISHU_APP_SECRET` / `FEISHU_APP_SECRET` | Self-built app secret |
+
+Sheets tools accept `spreadsheet_token` or a `/sheets/` URL. Bitable tools accept `base_token` or a `/base/` URL.
+
 ## How It Works
 
 ### Connection Configs
