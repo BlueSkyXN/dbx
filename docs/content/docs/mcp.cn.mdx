@@ -176,6 +176,35 @@ DBX 会自动新开一个 tab 显示数据，窗口自动置前。
 | `sql` | 是 | SQL 查询语句 |
 | `database` | 否 | 数据库名 |
 
+### 飞书工具
+
+DBX MCP Server 也可以直接调用飞书 OpenAPI。这些工具不依赖 DBX 连接，可以通过环境变量配置认证，也可以在单次调用中传入认证字段。
+
+| 工具 | 说明 |
+|---|---|
+| `dbx_feishu_get_tenant_access_token` | 使用自建应用凭证获取飞书 `tenant_access_token` |
+| `dbx_feishu_sheets_info` | 获取电子表格元数据和工作表列表 |
+| `dbx_feishu_sheets_read` | 读取飞书电子表格单元格 |
+| `dbx_feishu_sheets_write` | 覆盖写入飞书电子表格范围 |
+| `dbx_feishu_sheets_append` | 追加飞书电子表格行 |
+| `dbx_feishu_bitable_list_tables` | 列出飞书多维表格数据表 |
+| `dbx_feishu_bitable_list_fields` | 列出多维表格字段 |
+| `dbx_feishu_bitable_search_records` | 查询多维表格记录 |
+| `dbx_feishu_bitable_create_records` | 批量新增多维表格记录 |
+| `dbx_feishu_bitable_update_records` | 批量更新多维表格记录 |
+| `dbx_feishu_bitable_delete_records` | 批量删除多维表格记录 |
+
+飞书认证环境变量：
+
+| 变量 | 说明 |
+|---|---|
+| `DBX_FEISHU_BASE_URL` / `FEISHU_BASE_URL` | OpenAPI 基础地址，默认 `https://open.feishu.cn` |
+| `DBX_FEISHU_ACCESS_TOKEN` / `FEISHU_ACCESS_TOKEN` | 可选的预签发 tenant/user access token |
+| `DBX_FEISHU_APP_ID` / `FEISHU_APP_ID` | 自建应用 app ID，用于获取 `tenant_access_token` |
+| `DBX_FEISHU_APP_SECRET` / `FEISHU_APP_SECRET` | 自建应用 app secret |
+
+电子表格工具支持传 `spreadsheet_token` 或 `/sheets/` URL；多维表格工具支持传 `base_token` 或 `/base/` URL。
+
 ## 工作原理
 
 ### 连接配置

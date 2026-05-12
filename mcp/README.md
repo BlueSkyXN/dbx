@@ -7,9 +7,10 @@ MCP server for [DBX](https://github.com/t8y2/dbx) — lets AI agents (Claude Cod
 ## Features
 
 - **Zero config** — Automatically reads your DBX connections (including passwords from system keyring)
-- **7 tools** — List/add/remove connections, list tables, describe table, execute SQL, open table in DBX UI
+- **Database tools** — List/add/remove connections, list tables, describe table, execute SQL, open table in DBX UI
 - **Connection pooling** — Reuses database connections across queries
 - **PostgreSQL & MySQL** — Supports PostgreSQL, MySQL, and compatible databases (Doris, StarRocks, etc.)
+- **Feishu OpenAPI tools** — Read/write/append Feishu Sheets and list/search/create/update/delete Feishu Bitable records
 - **DBX UI integration** — Open tables directly in the DBX desktop app from your AI agent
 
 ## Quick Start
@@ -75,6 +76,31 @@ In Claude Code, just ask:
 | `dbx_describe_table` | Get column definitions for a table |
 | `dbx_execute_query` | Execute a SQL query (max 100 rows) |
 | `dbx_open_table` | Open a table in DBX desktop app UI |
+| `dbx_execute_and_show` | Execute a SQL query in DBX desktop app UI |
+| `dbx_feishu_get_tenant_access_token` | Get a Feishu tenant access token |
+| `dbx_feishu_sheets_info` | Get spreadsheet and worksheet metadata |
+| `dbx_feishu_sheets_read` | Read Feishu Sheets cell values |
+| `dbx_feishu_sheets_write` | Overwrite a Feishu Sheets range |
+| `dbx_feishu_sheets_append` | Append rows to Feishu Sheets |
+| `dbx_feishu_bitable_list_tables` | List tables in a Feishu Bitable/Base |
+| `dbx_feishu_bitable_list_fields` | List fields in a Bitable table |
+| `dbx_feishu_bitable_search_records` | Search/list Bitable records |
+| `dbx_feishu_bitable_create_records` | Batch create Bitable records |
+| `dbx_feishu_bitable_update_records` | Batch update Bitable records |
+| `dbx_feishu_bitable_delete_records` | Batch delete Bitable records |
+
+### Feishu Authentication
+
+Feishu tools accept `base_url`, `access_token`, `app_id`, and `app_secret` per call. For normal MCP use, configure credentials as environment variables instead:
+
+| Variable | Description |
+|---|---|
+| `DBX_FEISHU_BASE_URL` / `FEISHU_BASE_URL` | OpenAPI base URL, default `https://open.feishu.cn` |
+| `DBX_FEISHU_ACCESS_TOKEN` / `FEISHU_ACCESS_TOKEN` | Optional pre-issued tenant/user access token |
+| `DBX_FEISHU_APP_ID` / `FEISHU_APP_ID` | Self-built app ID used to fetch `tenant_access_token` |
+| `DBX_FEISHU_APP_SECRET` / `FEISHU_APP_SECRET` | Self-built app secret |
+
+If `access_token` is not provided, the MCP server fetches and caches `tenant_access_token` from `/open-apis/auth/v3/tenant_access_token/internal`. Feishu Sheets accepts `spreadsheet_token` or a `/sheets/` URL. Bitable accepts `base_token` or a `/base/` URL.
 
 ## How It Works
 
@@ -112,9 +138,10 @@ MIT
 ### 特性
 
 - **零配置** — 自动读取 DBX 的连接配置
-- **7 个工具** — 列出/添加/删除连接、列出表、查看表结构、执行 SQL、在 DBX 中打开表
+- **数据库工具** — 列出/添加/删除连接、列出表、查看表结构、执行 SQL、在 DBX 中打开表
 - **连接池** — 跨查询复用数据库连接
 - **PostgreSQL 和 MySQL** — 支持 PostgreSQL、MySQL 及兼容数据库（Doris、StarRocks 等）
+- **飞书 OpenAPI 工具** — 读取/写入/追加飞书电子表格，查询/新增/更新/删除飞书多维表格记录
 - **DBX UI 联动** — 从 AI 助手直接在 DBX 桌面端打开表
 
 ### 快速开始
@@ -166,6 +193,31 @@ npx @dbx-app/mcp-server
 | `dbx_describe_table` | 获取表的列定义 |
 | `dbx_execute_query` | 执行 SQL 查询（最多返回 100 行） |
 | `dbx_open_table` | 在 DBX 桌面端打开指定表 |
+| `dbx_execute_and_show` | 在 DBX 桌面端执行 SQL 并展示结果 |
+| `dbx_feishu_get_tenant_access_token` | 获取飞书 tenant access token |
+| `dbx_feishu_sheets_info` | 获取电子表格和工作表元数据 |
+| `dbx_feishu_sheets_read` | 读取飞书电子表格单元格 |
+| `dbx_feishu_sheets_write` | 覆盖写入飞书电子表格范围 |
+| `dbx_feishu_sheets_append` | 追加飞书电子表格行 |
+| `dbx_feishu_bitable_list_tables` | 列出飞书多维表格数据表 |
+| `dbx_feishu_bitable_list_fields` | 列出多维表格字段 |
+| `dbx_feishu_bitable_search_records` | 查询多维表格记录 |
+| `dbx_feishu_bitable_create_records` | 批量新增多维表格记录 |
+| `dbx_feishu_bitable_update_records` | 批量更新多维表格记录 |
+| `dbx_feishu_bitable_delete_records` | 批量删除多维表格记录 |
+
+### 飞书认证
+
+飞书工具支持每次调用传入 `base_url`、`access_token`、`app_id`、`app_secret`。常规 MCP 使用建议通过环境变量配置：
+
+| 变量 | 说明 |
+|---|---|
+| `DBX_FEISHU_BASE_URL` / `FEISHU_BASE_URL` | OpenAPI 基础地址，默认 `https://open.feishu.cn` |
+| `DBX_FEISHU_ACCESS_TOKEN` / `FEISHU_ACCESS_TOKEN` | 可选的预签发 tenant/user access token |
+| `DBX_FEISHU_APP_ID` / `FEISHU_APP_ID` | 自建应用 app ID，用于获取 `tenant_access_token` |
+| `DBX_FEISHU_APP_SECRET` / `FEISHU_APP_SECRET` | 自建应用 app secret |
+
+如果没有提供 `access_token`，MCP server 会通过 `/open-apis/auth/v3/tenant_access_token/internal` 获取并缓存 `tenant_access_token`。飞书电子表格支持传 `spreadsheet_token` 或 `/sheets/` URL；多维表格支持传 `base_token` 或 `/base/` URL。
 
 ### 工作原理
 
