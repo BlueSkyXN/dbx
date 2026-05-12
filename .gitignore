@@ -36,3 +36,6 @@ tmp/
 
 # Logs
 *.log
+AGENTS.md
+AGENTS_CN.md
+/local
