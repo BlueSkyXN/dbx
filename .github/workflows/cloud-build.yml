@@ -202,34 +202,115 @@ jobs:
         shell: bash
         run: |
           bundle_dir="target/${{ matrix.rust-target }}/release/bundle"
-          mkdir -p cloud-artifacts
+          rm -rf cloud-artifacts
+          mkdir -p \
+            cloud-artifacts/dmg \
+            cloud-artifacts/app \
+            cloud-artifacts/exe \
+            cloud-artifacts/msi \
+            cloud-artifacts/deb \
+            cloud-artifacts/appimage \
+            cloud-artifacts/rpm \
+            cloud-artifacts/zip \
+            cloud-artifacts/tar-gz \
+            cloud-artifacts/updater
 
-          find "$bundle_dir" -type f \( \
-            -name "*.dmg" -o \
-            -name "*.msi" -o \
-            -name "*.exe" -o \
-            -name "*.deb" -o \
-            -name "*.rpm" -o \
-            -name "*.AppImage" -o \
-            -name "*.zip" -o \
-            -name "*.tar.gz" -o \
-            -name "*.sig" \
-          \) -exec cp {} cloud-artifacts/ \;
+          find "$bundle_dir" -type f -name "*.dmg" -exec cp {} cloud-artifacts/dmg/ \;
+          find "$bundle_dir" -type f -name "*.exe" -exec cp {} cloud-artifacts/exe/ \;
+          find "$bundle_dir" -type f -name "*.msi" -exec cp {} cloud-artifacts/msi/ \;
+          find "$bundle_dir" -type f -name "*.deb" -exec cp {} cloud-artifacts/deb/ \;
+          find "$bundle_dir" -type f -name "*.AppImage" -exec cp {} cloud-artifacts/appimage/ \;
+          find "$bundle_dir" -type f -name "*.rpm" -exec cp {} cloud-artifacts/rpm/ \;
+          find "$bundle_dir" -type f -name "*.zip" -exec cp {} cloud-artifacts/zip/ \;
+          find "$bundle_dir" -type f -name "*.tar.gz" -exec cp {} cloud-artifacts/tar-gz/ \;
+          find "$bundle_dir" -type f -name "*.sig" -exec cp {} cloud-artifacts/updater/ \;
 
           if [[ "${{ runner.os }}" == "macOS" ]]; then
             while IFS= read -r -d '' app_path; do
               app_name="$(basename "$app_path" .app)"
-              ditto -c -k --sequesterRsrc --keepParent "$app_path" "cloud-artifacts/${app_name}-${{ matrix.id }}.app.zip"
+              ditto -c -k --sequesterRsrc --keepParent "$app_path" "cloud-artifacts/app/${app_name}-${{ matrix.id }}.app.zip"
             done < <(find "$bundle_dir" -type d -name "*.app" -print0)
           fi
 
-          find cloud-artifacts -maxdepth 1 -type f -print
-          test -n "$(find cloud-artifacts -maxdepth 1 -type f -print -quit)"
+          find cloud-artifacts -type f -print
+          test -n "$(find cloud-artifacts -type f -print -quit)"
 
-      - name: Upload desktop artifacts
+      - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DBX-${{ matrix.id }}
-          path: cloud-artifacts/*
-          if-no-files-found: error
+          name: DBX-${{ matrix.id }}-dmg
+          path: cloud-artifacts/dmg/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload macOS app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-app
+          path: cloud-artifacts/app/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Windows EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-exe
+          path: cloud-artifacts/exe/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Windows MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-msi
+          path: cloud-artifacts/msi/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-deb
+          path: cloud-artifacts/deb/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-appimage
+          path: cloud-artifacts/appimage/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-rpm
+          path: cloud-artifacts/rpm/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-zip
+          path: cloud-artifacts/zip/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload tar.gz artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-tar-gz
+          path: cloud-artifacts/tar-gz/*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload updater signature artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-${{ matrix.id }}-updater
+          path: cloud-artifacts/updater/*
+          if-no-files-found: ignore
           retention-days: 14
