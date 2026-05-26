@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use super::types::{
     CacheState, ExternalColumnDef, ExternalRowUpdate, ExternalTableRef, ExternalTableSnapshot, ExternalWriteResult,
@@ -139,12 +139,17 @@ pub fn sanitize_table_name(name: &str) -> String {
     }
 }
 
+const REALTIME_REFRESH_TTL: Duration = Duration::from_secs(5);
+
 /// Manages a DuckDB cache for one external source.
 pub struct ExternalPool {
     pub source: Arc<dyn super::traits::ExternalTabularSource>,
     pub cache: Arc<std::sync::Mutex<duckdb::Connection>>,
     pub cache_state: std::sync::Mutex<CacheState>,
-    pub table_map: std::sync::Mutex<std::collections::HashMap<String, ExternalTableRef>>,
+    pub table_map: std::sync::Mutex<HashMap<String, ExternalTableRef>>,
+    table_versions: std::sync::Mutex<HashMap<String, String>>,
+    last_refresh_at: std::sync::Mutex<Option<std::time::Instant>>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl ExternalPool {
@@ -156,23 +161,50 @@ impl ExternalPool {
             source,
             cache,
             cache_state: std::sync::Mutex::new(CacheState::Empty),
-            table_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            table_map: std::sync::Mutex::new(HashMap::new()),
+            table_versions: std::sync::Mutex::new(HashMap::new()),
+            last_refresh_at: std::sync::Mutex::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     pub async fn refresh_cache(&self) -> Result<(), String> {
+        self.refresh_cache_forced(true).await
+    }
+
+    pub async fn refresh_cache_if_stale(&self) -> Result<(), String> {
+        self.refresh_cache_forced(false).await
+    }
+
+    async fn refresh_cache_forced(&self, force: bool) -> Result<(), String> {
+        let _guard = self.refresh_lock.lock().await;
+        if !force && self.realtime_refresh_is_fresh()? {
+            return Ok(());
+        }
+
         {
             let mut state = self.cache_state.lock().map_err(|e| e.to_string())?;
             *state = CacheState::Loading;
         }
 
-        let result = self.refresh_cache_inner().await;
+        let result = self.refresh_cache_inner(force).await;
         let mut state = self.cache_state.lock().map_err(|e| e.to_string())?;
         match &result {
-            Ok(()) => *state = CacheState::Fresh,
+            Ok(()) => {
+                *state = CacheState::Fresh;
+                *self.last_refresh_at.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+            }
             Err(err) => *state = CacheState::Error(err.clone()),
         }
         result
+    }
+
+    fn realtime_refresh_is_fresh(&self) -> Result<bool, String> {
+        Ok(self
+            .last_refresh_at
+            .lock()
+            .map_err(|e| e.to_string())?
+            .is_some_and(|last_refresh_at| last_refresh_at.elapsed() < REALTIME_REFRESH_TTL))
     }
 
     pub fn refresh_before_query(&self) -> bool {
@@ -233,13 +265,16 @@ impl ExternalPool {
             .ok_or_else(|| format!("Unknown external table: {table_name}"))
     }
 
-    async fn refresh_cache_inner(&self) -> Result<(), String> {
+    async fn refresh_cache_inner(&self, force: bool) -> Result<(), String> {
         let tables = self.source.list_tables().await?;
-        let mut new_table_map = std::collections::HashMap::new();
+        let current_versions = self.table_versions.lock().map_err(|e| e.to_string())?.clone();
+        let current_table_map = self.table_map.lock().map_err(|e| e.to_string())?.clone();
+        let mut new_table_map = HashMap::new();
+        let mut new_versions = HashMap::new();
         let mut load_items = Vec::new();
+        let mut keep_table_names = Vec::new();
 
         for table_ref in &tables {
-            let snapshot = self.source.load_table(table_ref).await?;
             let mut sanitized_name = sanitize_table_name(&table_ref.table_name);
 
             if new_table_map.contains_key(&sanitized_name) {
@@ -254,13 +289,35 @@ impl ExternalPool {
                 }
             }
 
+            let source_version = if force { None } else { Some(self.source.source_version(table_ref).await?) };
+            let can_keep = source_version.as_ref().is_some_and(|source_version| {
+                cacheable_source_version(source_version)
+                    && current_table_map.get(&sanitized_name).is_some_and(|current| current == table_ref)
+                    && current_versions.get(&sanitized_name).is_some_and(|version| version == source_version)
+            });
+            if can_keep {
+                new_table_map.insert(sanitized_name.clone(), table_ref.clone());
+                new_versions.insert(sanitized_name.clone(), source_version.unwrap_or_default());
+                keep_table_names.push(sanitized_name);
+                continue;
+            }
+
+            let snapshot = self.source.load_table(table_ref).await?;
             let has_columns = !snapshot.columns.is_empty();
             if has_columns {
                 new_table_map.insert(sanitized_name.clone(), table_ref.clone());
+                let version =
+                    if let Some(source_version) = source_version.filter(|version| cacheable_source_version(version)) {
+                        source_version
+                    } else {
+                        snapshot.source_version.clone()
+                    };
+                new_versions.insert(sanitized_name.clone(), version);
             }
             load_items.push((sanitized_name, snapshot));
         }
 
+        let target_table_names: Vec<String> = new_table_map.keys().cloned().collect();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
             let con = cache.lock().map_err(|e| e.to_string())?;
@@ -270,8 +327,16 @@ impl ExternalPool {
             let refresh_result: Result<(), String> = (|| {
                 let existing_tables = external_cache_table_names(&con)?;
                 for table_name in existing_tables {
-                    con.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name)), [])
-                        .map_err(|e| format!("Failed to drop stale external cache table '{table_name}': {e}"))?;
+                    if !target_table_names.contains(&table_name) {
+                        con.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table_name)), [])
+                            .map_err(|e| format!("Failed to drop stale external cache table '{table_name}': {e}"))?;
+                    }
+                }
+
+                for kept_table_name in &keep_table_names {
+                    if !external_cache_table_exists(&con, kept_table_name)? {
+                        return Err(format!("Cached external table '{kept_table_name}' is missing"));
+                    }
                 }
 
                 load_items.iter().try_for_each(|(target_table_name, snapshot)| {
@@ -298,6 +363,10 @@ impl ExternalPool {
             let mut map = self.table_map.lock().map_err(|e| e.to_string())?;
             *map = new_table_map;
         }
+        {
+            let mut versions = self.table_versions.lock().map_err(|e| e.to_string())?;
+            *versions = new_versions;
+        }
 
         Ok(())
     }
@@ -318,6 +387,23 @@ fn external_cache_table_names(con: &duckdb::Connection) -> Result<Vec<String>, S
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Failed to read external cache table name: {e}"))
 }
 
+fn external_cache_table_exists(con: &duckdb::Connection, table_name: &str) -> Result<bool, String> {
+    let count: i64 = con
+        .query_row(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE' AND table_name = ?",
+            [table_name],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to check external cache table '{table_name}': {e}"))?;
+    Ok(count > 0)
+}
+
+fn cacheable_source_version(version: &str) -> bool {
+    let version = version.trim();
+    !version.is_empty() && version != "unknown" && !version.ends_with(":unknown")
+}
+
 impl std::fmt::Debug for ExternalPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalPool")
@@ -331,6 +417,7 @@ impl std::fmt::Debug for ExternalPool {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn table_ref(name: &str) -> ExternalTableRef {
         ExternalTableRef { source_id: "test".to_string(), table_name: name.to_string(), display_name: name.to_string() }
@@ -358,6 +445,13 @@ mod tests {
     #[derive(Debug, Clone)]
     struct MutableSnapshotSource {
         snapshots: Arc<std::sync::Mutex<Vec<ExternalTableSnapshot>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct VersionedSnapshotSource {
+        snapshots: Arc<std::sync::Mutex<Vec<ExternalTableSnapshot>>>,
+        versions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+        load_count: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -441,12 +535,65 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl super::super::traits::ExternalTabularSource for VersionedSnapshotSource {
+        fn capabilities(&self) -> super::super::types::ExternalCapabilities {
+            super::super::types::ExternalCapabilities { can_read: true, supports_refresh: true, ..Default::default() }
+        }
+
+        async fn list_tables(&self) -> Result<Vec<ExternalTableRef>, String> {
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            Ok(snapshots.iter().map(|snapshot| snapshot.table_ref.clone()).collect())
+        }
+
+        async fn get_columns(&self, table: &ExternalTableRef) -> Result<Vec<ExternalColumnDef>, String> {
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.table_ref == *table)
+                .map(|snapshot| snapshot.columns.clone())
+                .ok_or_else(|| format!("Unknown table {}", table.table_name))
+        }
+
+        async fn load_table(&self, table: &ExternalTableRef) -> Result<ExternalTableSnapshot, String> {
+            self.load_count.fetch_add(1, Ordering::SeqCst);
+            let snapshots = self.snapshots.lock().map_err(|e| e.to_string())?;
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.table_ref == *table)
+                .cloned()
+                .ok_or_else(|| format!("Unknown table {}", table.table_name))
+        }
+
+        async fn source_version(&self, table: &ExternalTableRef) -> Result<String, String> {
+            let versions = self.versions.lock().map_err(|e| e.to_string())?;
+            Ok(versions.get(&table.table_name).cloned().unwrap_or_else(|| "unknown".to_string()))
+        }
+
+        async fn test_connection(&self) -> Result<String, String> {
+            Ok("Connection successful".to_string())
+        }
+
+        fn display_name(&self) -> String {
+            "versioned-snapshot-source".to_string()
+        }
+    }
+
     fn snapshot(
         name: &str,
         columns: Vec<ExternalColumnDef>,
         rows: Vec<Vec<serde_json::Value>>,
     ) -> ExternalTableSnapshot {
         ExternalTableSnapshot { table_ref: table_ref(name), columns, rows, source_version: "test".to_string() }
+    }
+
+    fn snapshot_with_version(
+        name: &str,
+        columns: Vec<ExternalColumnDef>,
+        rows: Vec<Vec<serde_json::Value>>,
+        source_version: &str,
+    ) -> ExternalTableSnapshot {
+        ExternalTableSnapshot { source_version: source_version.to_string(), ..snapshot(name, columns, rows) }
     }
 
     #[test]
@@ -576,5 +723,145 @@ mod tests {
         assert_eq!(tables, vec!["stable_sheet".to_string()]);
         let value: i64 = con.query_row("SELECT id FROM \"stable_sheet\"", [], |row| row.get(0)).unwrap();
         assert_eq!(value, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_if_stale_uses_ttl_and_skips_unchanged_source_versions() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![snapshot_with_version(
+            "versioned_sheet",
+            vec![column("id", "BIGINT")],
+            vec![vec![serde_json::json!(1)]],
+            "v1",
+        )]));
+        let versions =
+            Arc::new(std::sync::Mutex::new(HashMap::from([("versioned_sheet".to_string(), "v1".to_string())])));
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let source = VersionedSnapshotSource {
+            snapshots: snapshots.clone(),
+            versions: versions.clone(),
+            load_count: load_count.clone(),
+        };
+        let pool = ExternalPool::new(Arc::new(source), cache.clone());
+
+        pool.refresh_cache().await.unwrap();
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+
+        pool.refresh_cache_if_stale().await.unwrap();
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+
+        *pool.last_refresh_at.lock().unwrap() =
+            Some(std::time::Instant::now() - REALTIME_REFRESH_TTL - Duration::from_secs(1));
+        pool.refresh_cache_if_stale().await.unwrap();
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+
+        *snapshots.lock().unwrap() = vec![snapshot_with_version(
+            "versioned_sheet",
+            vec![column("id", "BIGINT")],
+            vec![vec![serde_json::json!(2)]],
+            "v2",
+        )];
+        versions.lock().unwrap().insert("versioned_sheet".to_string(), "v2".to_string());
+        *pool.last_refresh_at.lock().unwrap() =
+            Some(std::time::Instant::now() - REALTIME_REFRESH_TTL - Duration::from_secs(1));
+        pool.refresh_cache_if_stale().await.unwrap();
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+
+        let con = cache.lock().unwrap();
+        let value: i64 = con.query_row("SELECT id FROM \"versioned_sheet\"", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_if_stale_does_not_keep_cache_for_different_table_ref() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let first_ref = ExternalTableRef {
+            source_id: "first".to_string(),
+            table_name: "same_name".to_string(),
+            display_name: "same_name".to_string(),
+        };
+        let second_ref = ExternalTableRef {
+            source_id: "second".to_string(),
+            table_name: "same_name".to_string(),
+            display_name: "same_name".to_string(),
+        };
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![ExternalTableSnapshot {
+            table_ref: first_ref,
+            columns: vec![column("id", "BIGINT")],
+            rows: vec![vec![serde_json::json!(1)]],
+            source_version: "v1".to_string(),
+        }]));
+        let versions = Arc::new(std::sync::Mutex::new(HashMap::from([("same_name".to_string(), "v1".to_string())])));
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let source = VersionedSnapshotSource {
+            snapshots: snapshots.clone(),
+            versions: versions.clone(),
+            load_count: load_count.clone(),
+        };
+        let pool = ExternalPool::new(Arc::new(source), cache.clone());
+
+        pool.refresh_cache().await.unwrap();
+
+        *snapshots.lock().unwrap() = vec![ExternalTableSnapshot {
+            table_ref: second_ref,
+            columns: vec![column("id", "BIGINT")],
+            rows: vec![vec![serde_json::json!(2)]],
+            source_version: "v1".to_string(),
+        }];
+        *pool.last_refresh_at.lock().unwrap() =
+            Some(std::time::Instant::now() - REALTIME_REFRESH_TTL - Duration::from_secs(1));
+        pool.refresh_cache_if_stale().await.unwrap();
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
+        let con = cache.lock().unwrap();
+        let value: i64 = con.query_row("SELECT id FROM \"same_name\"", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_if_stale_coalesces_concurrent_refreshes() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![snapshot_with_version(
+            "live_sheet",
+            vec![column("id", "BIGINT")],
+            vec![vec![serde_json::json!(1)]],
+            "v1",
+        )]));
+        let versions = Arc::new(std::sync::Mutex::new(HashMap::from([("live_sheet".to_string(), "v1".to_string())])));
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let source = VersionedSnapshotSource { snapshots, versions, load_count: load_count.clone() };
+        let pool = Arc::new(ExternalPool::new(Arc::new(source), cache));
+
+        let tasks = (0..5)
+            .map(|_| {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.refresh_cache_if_stale().await.unwrap() })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_force_ignores_realtime_ttl() {
+        let cache = Arc::new(std::sync::Mutex::new(duckdb::Connection::open_in_memory().unwrap()));
+        let snapshots = Arc::new(std::sync::Mutex::new(vec![snapshot_with_version(
+            "forced_sheet",
+            vec![column("id", "BIGINT")],
+            vec![vec![serde_json::json!(1)]],
+            "v1",
+        )]));
+        let versions = Arc::new(std::sync::Mutex::new(HashMap::from([("forced_sheet".to_string(), "v1".to_string())])));
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let source = VersionedSnapshotSource { snapshots, versions, load_count: load_count.clone() };
+        let pool = ExternalPool::new(Arc::new(source), cache);
+
+        pool.refresh_cache().await.unwrap();
+        pool.refresh_cache().await.unwrap();
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 2);
     }
 }

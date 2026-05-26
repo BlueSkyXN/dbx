@@ -16,6 +16,7 @@ const DEFAULT_FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 const BITABLE_BATCH_CREATE_LIMIT: usize = 500;
 const BITABLE_BATCH_UPDATE_LIMIT: usize = 1000;
 const BITABLE_BATCH_DELETE_LIMIT: usize = 500;
+const BITABLE_RECORD_ID_COLUMN: &str = "__dbx_record_id__";
 
 #[derive(Clone)]
 struct FeishuClient {
@@ -532,6 +533,18 @@ impl FeishuBitableSource {
         Ok(records)
     }
 
+    async fn table_revision_version(&self, table_id: &str) -> Result<String, String> {
+        let version = self
+            .list_bitable_tables()
+            .await?
+            .into_iter()
+            .find(|table| table.table_id == table_id)
+            .and_then(|table| table.revision)
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(format!("revision:{version}"))
+    }
+
     fn user_id_query(&self) -> Vec<(String, String)> {
         clean_optional(self.config.user_id_type.clone())
             .map(|user_id_type| vec![("user_id_type".to_string(), user_id_type)])
@@ -575,6 +588,10 @@ impl ExternalTabularSource for FeishuBitableSource {
         let fields = self.list_fields(&table.source_id).await?;
         let records = self.search_records(&table.source_id, &fields).await?;
         let columns = bitable_columns(&fields);
+        let source_version = self
+            .table_revision_version(&table.source_id)
+            .await
+            .unwrap_or_else(|_| format!("records:{}", records.len()));
         let rows = records
             .iter()
             .map(|record| {
@@ -586,25 +603,11 @@ impl ExternalTabularSource for FeishuBitableSource {
             })
             .collect();
 
-        Ok(ExternalTableSnapshot {
-            table_ref: table.clone(),
-            columns,
-            rows,
-            source_version: format!("records:{}", records.len()),
-        })
+        Ok(ExternalTableSnapshot { table_ref: table.clone(), columns, rows, source_version })
     }
 
     async fn source_version(&self, table: &ExternalTableRef) -> Result<String, String> {
-        let table_id = table.source_id.as_str();
-        let version = self
-            .list_bitable_tables()
-            .await?
-            .into_iter()
-            .find(|table| table.table_id == table_id)
-            .and_then(|table| table.revision)
-            .map(|revision| revision.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        Ok(format!("revision:{version}"))
+        self.table_revision_version(&table.source_id).await
     }
 
     async fn test_connection(&self) -> Result<String, String> {
@@ -667,11 +670,12 @@ impl ExternalTabularSource for FeishuBitableSource {
         table: &ExternalTableRef,
         updates: Vec<ExternalRowUpdate>,
     ) -> Result<ExternalWriteResult, String> {
+        let fields = self.list_fields(&table.source_id).await?;
         let updates = updates
             .into_iter()
             .filter_map(|mut update| {
                 let row_id = update.row_id.trim().to_string();
-                update.fields.remove("_record_id");
+                remove_bitable_internal_update_fields(&fields, &mut update.fields);
                 if row_id.is_empty() || update.fields.is_empty() {
                     None
                 } else {
@@ -885,8 +889,9 @@ fn sheet_values_to_snapshot(
 }
 
 fn bitable_columns(fields: &[BitableField]) -> Vec<ExternalColumnDef> {
+    let record_id_column = bitable_record_id_column_name(fields);
     let mut columns = vec![ExternalColumnDef {
-        name: "_record_id".to_string(),
+        name: record_id_column,
         duckdb_type: "VARCHAR".to_string(),
         is_nullable: false,
         is_primary_key: true,
@@ -901,6 +906,33 @@ fn bitable_columns(fields: &[BitableField]) -> Vec<ExternalColumnDef> {
         comment: field.ui_type.clone(),
     }));
     columns
+}
+
+fn bitable_record_id_column_name(fields: &[BitableField]) -> String {
+    let field_names =
+        fields.iter().map(|field| field.field_name.to_lowercase()).collect::<std::collections::HashSet<_>>();
+    if !field_names.contains(&BITABLE_RECORD_ID_COLUMN.to_lowercase()) {
+        return BITABLE_RECORD_ID_COLUMN.to_string();
+    }
+
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("__dbx_record_id_{suffix}__");
+        if !field_names.contains(&candidate.to_lowercase()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn remove_bitable_internal_update_fields(fields: &[BitableField], update_fields: &mut Map<String, Value>) {
+    let record_id_column = bitable_record_id_column_name(fields);
+    update_fields.remove(&record_id_column);
+
+    let has_legacy_record_id_field = fields.iter().any(|field| field.field_name == "_record_id");
+    if !has_legacy_record_id_field {
+        update_fields.remove("_record_id");
+    }
 }
 
 fn bitable_duckdb_type(field: &BitableField) -> String {
@@ -1159,5 +1191,67 @@ mod tests {
         ]);
 
         assert_eq!(bitable_value_to_json(&value), Value::String("Hello World".to_string()));
+    }
+
+    #[test]
+    fn bitable_record_id_column_avoids_user_field_collisions() {
+        let fields = vec![
+            BitableField {
+                field_name: BITABLE_RECORD_ID_COLUMN.to_string(),
+                is_primary: None,
+                field_type: None,
+                ui_type: None,
+            },
+            BitableField {
+                field_name: "__dbx_record_id_2__".to_string(),
+                is_primary: None,
+                field_type: None,
+                ui_type: None,
+            },
+        ];
+
+        let columns = bitable_columns(&fields);
+
+        assert_eq!(columns[0].name, "__dbx_record_id_3__");
+        assert_eq!(columns[1].name, BITABLE_RECORD_ID_COLUMN);
+        assert_eq!(columns[2].name, "__dbx_record_id_2__");
+    }
+
+    #[test]
+    fn bitable_update_field_cleanup_preserves_user_record_id_field() {
+        let fields = vec![BitableField {
+            field_name: "_record_id".to_string(),
+            is_primary: None,
+            field_type: None,
+            ui_type: None,
+        }];
+        let mut update_fields = Map::from_iter([
+            ("__dbx_record_id__".to_string(), Value::String("rec_internal".to_string())),
+            ("_record_id".to_string(), Value::String("user_value".to_string())),
+            ("Name".to_string(), Value::String("Ada".to_string())),
+        ]);
+
+        remove_bitable_internal_update_fields(&fields, &mut update_fields);
+
+        assert!(!update_fields.contains_key("__dbx_record_id__"));
+        assert_eq!(update_fields.get("_record_id"), Some(&Value::String("user_value".to_string())));
+        assert_eq!(update_fields.get("Name"), Some(&Value::String("Ada".to_string())));
+    }
+
+    #[test]
+    fn bitable_update_field_cleanup_drops_legacy_record_id_when_not_user_field() {
+        let fields =
+            vec![BitableField { field_name: "Name".to_string(), is_primary: None, field_type: None, ui_type: None }];
+        let mut update_fields = Map::from_iter([
+            ("__dbx_record_id__".to_string(), Value::String("rec_internal".to_string())),
+            ("_record_id".to_string(), Value::String("legacy_internal".to_string())),
+            ("Name".to_string(), Value::String("Ada".to_string())),
+        ]);
+
+        remove_bitable_internal_update_fields(&fields, &mut update_fields);
+
+        assert!(!update_fields.contains_key("__dbx_record_id__"));
+        assert!(!update_fields.contains_key("_record_id"));
+        assert_eq!(update_fields.get("Name"), Some(&Value::String("Ada".to_string())));
     }
 }

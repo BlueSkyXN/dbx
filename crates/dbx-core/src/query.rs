@@ -250,7 +250,7 @@ pub async fn do_execute(
             let sql = sql.to_string();
             drop(connections);
             if ext_pool.refresh_before_query() {
-                ext_pool.refresh_cache().await?;
+                ext_pool.refresh_cache_if_stale().await?;
             }
             wait_for_query(cancel_token, async move {
                 let task = tokio::task::spawn_blocking(move || {

@@ -5,7 +5,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 use crate::ai::{AiChatMessage, AiConfig, AiConversation};
 use crate::history::HistoryEntry;
-use crate::models::connection::ConnectionConfig;
+use crate::models::connection::{ConnectionConfig, DatabaseType};
 
 pub struct Storage {
     db: SqlitePool,
@@ -320,6 +320,7 @@ impl Storage {
             sanitized.ssh_password = String::new();
             sanitized.ssh_key_passphrase = String::new();
             sanitized.connection_string = None;
+            clear_feishu_access_token(&mut sanitized);
             let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
             sqlx::query("INSERT INTO connections (id, config_json) VALUES (?, ?)")
@@ -333,6 +334,13 @@ impl Storage {
             persist_secret_in_tx(&mut tx, &config.id, "password", &config.password).await?;
             persist_secret_in_tx(&mut tx, &config.id, "ssh_password", &config.ssh_password).await?;
             persist_secret_in_tx(&mut tx, &config.id, "ssh_key_passphrase", &config.ssh_key_passphrase).await?;
+            persist_secret_in_tx(
+                &mut tx,
+                &config.id,
+                FEISHU_ACCESS_TOKEN_KEY,
+                feishu_access_token(config).as_deref().unwrap_or_default(),
+            )
+            .await?;
             if let Some(cs) = &config.connection_string {
                 persist_secret_in_tx(&mut tx, &config.id, "connection_string", cs).await?;
             } else {
@@ -369,13 +377,25 @@ impl Storage {
             .map_err(|e| e.to_string())?;
 
         let mut configs = Vec::new();
+        let mut needs_resave = false;
         for (id, json) in rows {
             let mut config: ConnectionConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let legacy_feishu_token = feishu_access_token(&config);
             config.password = self.get_secret(&id, "password").await?.unwrap_or_default();
             config.ssh_password = self.get_secret(&id, "ssh_password").await?.unwrap_or_default();
             config.ssh_key_passphrase = self.get_secret(&id, "ssh_key_passphrase").await?.unwrap_or_default();
             config.connection_string = self.get_secret(&id, "connection_string").await?;
+            let stored_feishu_token = self.get_secret(&id, FEISHU_ACCESS_TOKEN_KEY).await?;
+            if legacy_feishu_token.is_some() {
+                needs_resave = true;
+            }
+            if let Some(token) = stored_feishu_token.or(legacy_feishu_token) {
+                set_feishu_access_token(&mut config, token);
+            }
             configs.push(config);
+        }
+        if needs_resave {
+            self.save_connections(&configs).await?;
         }
         Ok(configs)
     }
@@ -660,6 +680,47 @@ impl Storage {
 // Helpers
 // ---------------------------------------------------------------------------
 
+const FEISHU_ACCESS_TOKEN_KEY: &str = "feishu_access_token";
+
+fn is_feishu_connection(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::FeishuSheets | DatabaseType::FeishuBitable)
+}
+
+fn feishu_access_token(config: &ConnectionConfig) -> Option<String> {
+    if !is_feishu_connection(&config.db_type) {
+        return None;
+    }
+    config
+        .external_config
+        .as_ref()
+        .and_then(|value| value.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn clear_feishu_access_token(config: &mut ConnectionConfig) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    if let Some(serde_json::Value::Object(object)) = config.external_config.as_mut() {
+        object.remove("access_token");
+    }
+}
+
+fn set_feishu_access_token(config: &mut ConnectionConfig, token: String) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    let mut object = match config.external_config.take() {
+        Some(serde_json::Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert("access_token".to_string(), serde_json::Value::String(token));
+    config.external_config = Some(serde_json::Value::Object(object));
+}
+
 async fn persist_secret_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     connection_id: &str,
@@ -686,4 +747,105 @@ async fn persist_secret_in_tx(
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "dbx_storage_{name}_{}_{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
+    }
+
+    fn feishu_connection(id: &str, token: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.to_string(),
+            name: "Feishu".to_string(),
+            db_type: DatabaseType::FeishuSheets,
+            driver_profile: Some("feishu_sheets".to_string()),
+            driver_label: Some("Feishu Sheets".to_string()),
+            url_params: None,
+            host: "https://open.feishu.cn".to_string(),
+            port: 0,
+            username: "cli_test".to_string(),
+            password: "app_secret".to_string(),
+            database: None,
+            color: None,
+            ssh_enabled: false,
+            ssh_host: String::new(),
+            ssh_port: 22,
+            ssh_user: String::new(),
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_key_passphrase: String::new(),
+            ssh_expose_lan: false,
+            ssh_connect_timeout_secs: 5,
+            ssl: false,
+            sysdba: false,
+            connection_string: None,
+            external_config: Some(serde_json::json!({
+                "access_token": token,
+                "spreadsheet_token": "shtcn_test"
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_connections_moves_feishu_access_token_to_secret_store() {
+        let path = temp_db_path("save_feishu_token");
+        let storage = Storage::open(&path).await.unwrap();
+        let config = feishu_connection("feishu", "tenant-token");
+
+        storage.save_connections(&[config]).await.unwrap();
+
+        let raw_config: (String,) = sqlx::query_as("SELECT config_json FROM connections WHERE id = ?")
+            .bind("feishu")
+            .fetch_one(&storage.db)
+            .await
+            .unwrap();
+        assert!(!raw_config.0.contains("tenant-token"));
+        assert!(!raw_config.0.contains("access_token"));
+        assert_eq!(
+            storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap().as_deref(),
+            Some("tenant-token")
+        );
+
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("tenant-token"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn load_connections_migrates_legacy_feishu_access_token() {
+        let path = temp_db_path("migrate_feishu_token");
+        let storage = Storage::open(&path).await.unwrap();
+        let legacy = feishu_connection("legacy", "legacy-token");
+        let json = serde_json::to_string(&legacy).unwrap();
+        sqlx::query("INSERT INTO connections (id, config_json) VALUES (?, ?)")
+            .bind("legacy")
+            .bind(json)
+            .execute(&storage.db)
+            .await
+            .unwrap();
+
+        let loaded = storage.load_connections().await.unwrap();
+
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("legacy-token"));
+        assert_eq!(
+            storage.get_secret("legacy", FEISHU_ACCESS_TOKEN_KEY).await.unwrap().as_deref(),
+            Some("legacy-token")
+        );
+        let raw_config: (String,) = sqlx::query_as("SELECT config_json FROM connections WHERE id = ?")
+            .bind("legacy")
+            .fetch_one(&storage.db)
+            .await
+            .unwrap();
+        assert!(!raw_config.0.contains("legacy-token"));
+        assert!(!raw_config.0.contains("access_token"));
+        std::fs::remove_file(path).ok();
+    }
 }

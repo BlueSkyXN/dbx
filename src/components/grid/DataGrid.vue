@@ -74,6 +74,7 @@ import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql"
 import { buildDataGridSaveStatements, formatGridSqlLiteral } from "@/lib/dataGridSql";
 import { formatMarkdownTable } from "@/lib/markdownTable";
 import { isExternalTabular } from "@/lib/databaseCapabilities";
+import { externalRecordIdColumn, isFeishuBitableTableEditable } from "@/lib/externalTableEditing";
 import {
   matchesRowStatusFilter,
   rowStatusFilterAfterAddingRow,
@@ -742,12 +743,19 @@ function exitTransaction() {
   transactionActive.value = false;
 }
 
-const isFeishuBitableTableEditor = computed(
-  () =>
-    props.databaseType === "feishu_bitable" &&
-    props.context === "table-data" &&
-    !!props.connectionId &&
-    !!props.tableMeta,
+const feishuBitableRecordIdColumn = computed(() =>
+  props.databaseType === "feishu_bitable"
+    ? externalRecordIdColumn(props.tableMeta?.primaryKeys, props.result.columns)
+    : undefined,
+);
+const isFeishuBitableTableEditor = computed(() =>
+  isFeishuBitableTableEditable({
+    databaseType: props.databaseType,
+    context: props.context,
+    connectionId: props.connectionId,
+    tableMeta: props.tableMeta,
+    resultColumns: props.result.columns,
+  }),
 );
 const useTransaction = computed(
   () =>
@@ -761,9 +769,14 @@ const canUseRowChangeControls = computed(
   () => props.editable && !!props.tableMeta && (useTransaction.value || isFeishuBitableTableEditor.value),
 );
 
+function feishuBitableRecordIdColumnIndex(): number {
+  const recordIdColumn = feishuBitableRecordIdColumn.value;
+  return recordIdColumn ? props.result.columns.indexOf(recordIdColumn) : -1;
+}
+
 function isGridColumnEditable(columnIndex: number): boolean {
   if (!props.editable) return false;
-  return !(isFeishuBitableTableEditor.value && props.result.columns[columnIndex] === "_record_id");
+  return !(isFeishuBitableTableEditor.value && props.result.columns[columnIndex] === feishuBitableRecordIdColumn.value);
 }
 
 async function onToolbarRefresh() {
@@ -1455,9 +1468,9 @@ async function saveFeishuBitableChanges() {
     throw new Error("Missing Feishu Bitable table context");
   }
 
-  const recordIdIndex = props.result.columns.indexOf("_record_id");
+  const recordIdIndex = feishuBitableRecordIdColumnIndex();
   if (recordIdIndex < 0) {
-    throw new Error("Feishu Bitable edits require the _record_id column");
+    throw new Error("Feishu Bitable edits require the DBX record ID column");
   }
 
   const updates: ExternalRowUpdate[] = [];
@@ -1469,7 +1482,7 @@ async function saveFeishuBitableChanges() {
     const fields: Record<string, unknown> = {};
     for (const [columnIndex, value] of changes.entries()) {
       const columnName = props.result.columns[columnIndex];
-      if (!columnName || columnName === "_record_id") continue;
+      if (!columnName || columnName === feishuBitableRecordIdColumn.value) continue;
       fields[columnName] = value;
     }
     if (Object.keys(fields).length > 0) {
@@ -1483,7 +1496,7 @@ async function saveFeishuBitableChanges() {
 
   const writableColumnIndexes = props.result.columns
     .map((columnName, index) => ({ columnName, index }))
-    .filter(({ columnName }) => columnName !== "_record_id")
+    .filter(({ columnName }) => columnName !== feishuBitableRecordIdColumn.value)
     .map(({ index }) => index);
   const rowsToAppend = newRows.value.map((row) => writableColumnIndexes.map((index) => row[index] ?? null));
 

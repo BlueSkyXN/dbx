@@ -17,6 +17,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExecutionState";
 import { databaseDisplayNameForTab } from "@/lib/tabPresentation";
 import { isExternalTabular } from "@/lib/databaseCapabilities";
+import { isFeishuSheetsGridEditable } from "@/lib/externalTableEditing";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
@@ -87,7 +88,7 @@ const hasNumericData = computed(() => {
 const queryResultEditable = computed(
   () =>
     !!props.activeTab.queryAnalysis &&
-    props.activeConnection?.db_type !== "feishu_sheets" &&
+    isFeishuSheetsGridEditable(props.activeConnection?.db_type) &&
     props.activeConnection?.db_type !== "feishu_bitable",
 );
 const tableDdlSupported = computed(() => !isExternalTabular(props.activeConnection?.db_type));
