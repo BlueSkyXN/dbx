@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connection::AppState;
 use crate::models::connection::DatabaseType;
-use crate::transfer::{execute_on_pool, generate_insert, qualified_table};
+use crate::transfer::{execute_on_pool, generate_insert_typed, get_columns_for_transfer, qualified_table};
 
 pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
 pub const DEFAULT_BATCH_SIZE: usize = 500;
@@ -178,6 +178,7 @@ pub fn parse_csv_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImpor
 }
 
 pub fn parse_json_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImportFile, String> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let items = match value {
         serde_json::Value::Array(items) => items,
@@ -300,21 +301,26 @@ pub fn parse_xlsx_file(path: &str, preview_limit: usize) -> Result<ParsedImportF
     Ok(ParsedImportFile { columns, rows, total_rows })
 }
 
-pub fn parse_import_file(path: &str, preview_limit: usize) -> Result<ParsedImportFile, String> {
+pub async fn parse_import_file(path: &str, preview_limit: usize) -> Result<ParsedImportFile, String> {
     match import_file_kind(path)? {
         ImportFileKind::Csv => {
-            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
             parse_csv_bytes(&bytes, preview_limit)
         }
         ImportFileKind::Tsv => {
-            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
             parse_delimited_bytes(&bytes, b'\t', preview_limit)
         }
         ImportFileKind::Json => {
-            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
             parse_json_bytes(&bytes, preview_limit)
         }
-        ImportFileKind::Xlsx => parse_xlsx_file(path, preview_limit),
+        ImportFileKind::Xlsx => {
+            let path = path.to_string();
+            tokio::task::spawn_blocking(move || parse_xlsx_file(&path, preview_limit))
+                .await
+                .map_err(|e| e.to_string())?
+        }
     }
 }
 
@@ -347,6 +353,7 @@ pub fn mapping_indexes(
 pub fn build_import_insert_batches(
     data: &ParsedImportFile,
     mappings: &[TableImportColumnMapping],
+    target_column_types: &[(String, String)],
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
@@ -354,6 +361,15 @@ pub fn build_import_insert_batches(
 ) -> Result<Vec<ImportSqlBatch>, String> {
     let mapped = mapping_indexes(data, mappings)?;
     let columns = mapped.iter().map(|(_, target)| target.clone()).collect::<Vec<_>>();
+    let column_types = columns
+        .iter()
+        .map(|column| {
+            target_column_types
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, data_type)| data_type.clone())
+        })
+        .collect::<Vec<_>>();
     let batch_size = batch_size.max(1);
     let mut batches = Vec::new();
 
@@ -367,7 +383,7 @@ pub fn build_import_insert_batches(
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let sql = generate_insert(&columns, &rows, table, schema, db_type);
+        let sql = generate_insert_typed(&columns, &column_types, &rows, table, schema, db_type);
         if !sql.trim().is_empty() {
             batches.push(ImportSqlBatch { sql, row_count: chunk.len() });
         }
@@ -384,10 +400,10 @@ pub fn truncate_sql(table: &str, schema: &str, db_type: &DatabaseType) -> String
     }
 }
 
-pub fn preview_table_import_file_core(file_path: &str) -> Result<TableImportPreview, String> {
+pub async fn preview_table_import_file_core(file_path: &str) -> Result<TableImportPreview, String> {
     let kind = import_file_kind(file_path)?;
-    let parsed = parse_import_file(file_path, DEFAULT_PREVIEW_LIMIT)?;
-    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
+    let parsed = parse_import_file(file_path, DEFAULT_PREVIEW_LIMIT).await?;
+    let metadata = tokio::fs::metadata(file_path).await.map_err(|e| e.to_string())?;
     let file_name = Path::new(file_path).file_name().and_then(|name| name.to_str()).unwrap_or(file_path).to_string();
 
     Ok(TableImportPreview {
@@ -416,7 +432,7 @@ where
 {
     let batch_size = if request.batch_size == 0 { DEFAULT_BATCH_SIZE } else { request.batch_size };
 
-    let parsed = match parse_import_file(&request.file_path, usize::MAX) {
+    let parsed = match parse_import_file(&request.file_path, usize::MAX).await {
         Ok(parsed) => parsed,
         Err(error) => {
             progress_callback(TableImportProgress {
@@ -439,9 +455,24 @@ where
         error: None,
     });
 
+    let target_column_types = get_columns_for_transfer(
+        state,
+        pool_key,
+        &request.connection_id,
+        &request.database,
+        &request.schema,
+        &request.table,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|column| (column.name, column.data_type))
+    .collect::<Vec<_>>();
+
     let batches = match build_import_insert_batches(
         &parsed,
         &request.mappings,
+        &target_column_types,
         &request.table,
         &request.schema,
         db_type,
@@ -570,6 +601,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_json_with_utf8_bom() {
+        let parsed = parse_json_bytes(b"\xEF\xBB\xBF[{\"id\":1,\"name\":\"Ada\"}]", 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.total_rows, 1);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+    }
+
+    #[test]
     fn builds_import_insert_batches_from_mapped_columns() {
         let mappings = vec![
             TableImportColumnMapping { source_column: "id".to_string(), target_column: "user_id".to_string() },
@@ -586,7 +626,7 @@ mod tests {
         };
 
         let batches =
-            build_import_insert_batches(&data, &mappings, "users", "public", &DatabaseType::Postgres, 2).unwrap();
+            build_import_insert_batches(&data, &mappings, &[], "users", "public", &DatabaseType::Postgres, 2).unwrap();
 
         assert_eq!(batches, vec![
             ImportSqlBatch {
@@ -598,5 +638,73 @@ mod tests {
                 row_count: 1,
             },
         ]);
+    }
+
+    #[test]
+    fn import_insert_batches_use_target_column_types_for_mysql_temporal_values() {
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "start".to_string(),
+                target_column: "insurance_start_time".to_string(),
+            },
+            TableImportColumnMapping { source_column: "raw".to_string(), target_column: "raw_text".to_string() },
+        ];
+        let data = ParsedImportFile {
+            columns: vec!["start".to_string(), "raw".to_string()],
+            rows: vec![vec![
+                serde_json::json!("2026-05-12T00:00:00+00:00"),
+                serde_json::json!("2026-05-12T00:00:00+00:00"),
+            ]],
+            total_rows: 1,
+        };
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[
+                ("insurance_start_time".to_string(), "datetime".to_string()),
+                ("raw_text".to_string(), "varchar(64)".to_string()),
+            ],
+            "policies",
+            "",
+            &DatabaseType::Mysql,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(batches, vec![ImportSqlBatch {
+            sql: "INSERT INTO `policies` (`insurance_start_time`, `raw_text`) VALUES\n('2026-05-12 00:00:00', '2026-05-12T00:00:00+00:00')".to_string(),
+            row_count: 1,
+        }]);
+    }
+
+    #[test]
+    fn import_insert_batches_preserve_sqlserver_unicode_text() {
+        let mappings =
+            vec![TableImportColumnMapping { source_column: "name".to_string(), target_column: "name".to_string() }];
+        let data = ParsedImportFile {
+            columns: vec!["name".to_string()],
+            rows: vec![vec![serde_json::json!("Tiếng Việt")]],
+            total_rows: 1,
+        };
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("name".to_string(), "nvarchar(100)".to_string())],
+            "customers",
+            "dbo",
+            &DatabaseType::SqlServer,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batches,
+            vec![ImportSqlBatch {
+                sql: "INSERT INTO [dbo].[customers] ([name]) VALUES\n(N'Tiếng Việt')".to_string(),
+                row_count: 1,
+            }]
+        );
     }
 }

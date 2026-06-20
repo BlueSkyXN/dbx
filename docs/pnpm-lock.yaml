@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@orama/orama':
+        specifier: 3.1.18
+        version: 3.1.18
       '@tailwindcss/postcss':
         specifier: ^4.2.4
         version: 4.2.4
@@ -32,6 +35,9 @@ importers:
       lucide-react:
         specifier: ^0.515.0
         version: 0.515.0(react@19.2.5)
+      motion:
+        specifier: ^12.38.0
+        version: 12.38.0(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
       next:
         specifier: ^16.2.4
         version: 16.2.4(react-dom@19.2.5(react@19.2.5))(react@19.2.5)

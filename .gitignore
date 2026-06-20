@@ -1,14 +1,26 @@
 # Dependencies
 node_modules/
-.claude
+.claude/
+.codex/
+.superpowers/
+.trellis/
+.worktrees/
+openspec/
 .mcp.json
+AGENTS.md
 
 # Build output
 dist/
+coverage/
 /target/
+plugins/jdbc/target/
+plugins/jdbc/dependency-reduced-pom.xml
+plugins/jdbc/lib/*.jar
+plugins/jdbc/dist/
 docs/.next/
 docs/out/
 docs/.source/
+docs/superpowers/
 src-tauri/*.dylib
 
 # OS files
@@ -20,10 +32,12 @@ Thumbs.db
 *.swo
 *~
 .vscode/
+.idea/
 
 # GitHub (keep workflows)
 .github/*
 !.github/workflows/
+!.github/scripts/
 !.github/ISSUE_TEMPLATE/
 
 # Env
@@ -36,6 +50,16 @@ tmp/
 
 # Logs
 *.log
-AGENTS.md
-AGENTS_CN.md
-/local
+
+# Agent JDBC driver JARs
+agents/*/libs/*.jar
+
+# Generated changelog data
+releases-*.json
+
+test.pdb
+portable/
+DBX_*_x64-portable.zip
+.agents/skills
+.pnpm-store/*
+.dbx-web

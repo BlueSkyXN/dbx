@@ -13,6 +13,57 @@ pub async fn list_databases(
 }
 
 #[tauri::command]
+pub async fn list_sqlserver_linked_servers(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<Vec<db::LinkedServerInfo>, String> {
+    dbx_core::schema::list_sqlserver_linked_servers_core(&state, &connection_id).await
+}
+
+#[tauri::command]
+pub async fn list_sqlserver_linked_server_catalogs(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    server: String,
+) -> Result<Vec<db::DatabaseInfo>, String> {
+    dbx_core::schema::list_sqlserver_linked_server_catalogs_core(&state, &connection_id, &server).await
+}
+
+#[tauri::command]
+pub async fn list_sqlserver_linked_server_schemas(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    server: String,
+    catalog: String,
+) -> Result<Vec<String>, String> {
+    dbx_core::schema::list_sqlserver_linked_server_schemas_core(&state, &connection_id, &server, &catalog).await
+}
+
+#[tauri::command]
+pub async fn list_sqlserver_linked_server_tables(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    server: String,
+    catalog: String,
+    schema: String,
+    filter: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<db::TableInfo>, String> {
+    dbx_core::schema::list_sqlserver_linked_server_tables_core(
+        &state,
+        &connection_id,
+        &server,
+        &catalog,
+        &schema,
+        filter.as_deref(),
+        limit,
+        offset,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn list_schemas(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -27,8 +78,64 @@ pub async fn list_tables(
     connection_id: String,
     database: String,
     schema: String,
+    filter: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<Vec<String>>,
 ) -> Result<Vec<db::TableInfo>, String> {
-    dbx_core::schema::list_tables_core(&state, &connection_id, &database, &schema).await
+    dbx_core::schema::list_tables_core(
+        &state,
+        &connection_id,
+        &database,
+        &schema,
+        filter.as_deref(),
+        limit,
+        offset,
+        object_types.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn list_objects(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    dbx_core::schema::list_objects_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_object_statistics(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    dbx_core::schema::list_object_statistics_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_completion_objects(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    dbx_core::schema::list_completion_objects_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn get_object_source(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    name: String,
+    object_type: db::ObjectSourceKind,
+) -> Result<db::ObjectSource, String> {
+    dbx_core::schema::get_object_source_core(&state, &connection_id, &database, &schema, &name, object_type).await
 }
 
 #[tauri::command]
@@ -82,6 +189,48 @@ pub async fn get_table_ddl(
     database: String,
     schema: String,
     table: String,
+    object_type: Option<db::ObjectSourceKind>,
 ) -> Result<String, String> {
-    dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table).await
+    dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table, object_type).await
+}
+
+#[tauri::command]
+pub async fn list_functions(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::FunctionInfo>, String> {
+    dbx_core::schema::list_functions_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_sequences(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    with_last_values: bool,
+) -> Result<Vec<db::SequenceInfo>, String> {
+    dbx_core::schema::list_sequences_core(&state, &connection_id, &database, &schema, with_last_values).await
+}
+
+#[tauri::command]
+pub async fn list_rules(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::RuleInfo>, String> {
+    dbx_core::schema::list_rules_core(&state, &connection_id, &database, &schema).await
+}
+
+#[tauri::command]
+pub async fn list_owners(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: String,
+    schema: String,
+) -> Result<Vec<db::OwnerInfo>, String> {
+    dbx_core::schema::list_owners_core(&state, &connection_id, &database, &schema).await
 }

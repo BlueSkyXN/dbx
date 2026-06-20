@@ -2,22 +2,33 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+type InterruptFn = Box<dyn Fn() + Send + 'static>;
+
 #[derive(Clone, Default)]
 pub struct RunningQueries {
     inner: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    interrupts: Arc<Mutex<HashMap<String, InterruptFn>>>,
 }
 
 impl RunningQueries {
     pub fn register(&self, execution_id: String) -> RegisteredQuery {
         let token = CancellationToken::new();
-        self.inner.lock().expect("running query registry poisoned").insert(execution_id.clone(), token.clone());
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(execution_id.clone(), token.clone());
 
         RegisteredQuery { execution_id, token, running_queries: self.clone() }
     }
 
-    pub fn cancel(&self, execution_id: &str) -> bool {
-        let token = self.inner.lock().expect("running query registry poisoned").get(execution_id).cloned();
+    pub fn register_interrupt(&self, execution_id: &str, interrupt: impl Fn() + Send + 'static) {
+        self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).insert(execution_id.to_string(), Box::new(interrupt));
+    }
 
+    pub fn cancel(&self, execution_id: &str) -> bool {
+        let token = self.inner.lock().unwrap_or_else(|e| e.into_inner()).get(execution_id).cloned();
+        let interrupt = self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
+
+        if let Some(interrupt) = interrupt {
+            interrupt();
+        }
         if let Some(token) = token {
             token.cancel();
             true
@@ -28,11 +39,12 @@ impl RunningQueries {
 
     #[cfg(test)]
     pub fn has(&self, execution_id: &str) -> bool {
-        self.inner.lock().expect("running query registry poisoned").contains_key(execution_id)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).contains_key(execution_id)
     }
 
     fn remove(&self, execution_id: &str) {
-        self.inner.lock().expect("running query registry poisoned").remove(execution_id);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
+        self.interrupts.lock().unwrap_or_else(|e| e.into_inner()).remove(execution_id);
     }
 }
 

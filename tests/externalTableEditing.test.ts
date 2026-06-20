@@ -1,17 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  externalRecordIdColumn,
-  isFeishuBitableTableEditable,
-  isFeishuSheetsGridEditable,
-} from "../src/lib/externalTableEditing.ts";
+import { externalRecordIdColumn, isFeishuBitableTableEditable, isFeishuSheetsGridEditable } from "../apps/desktop/src/lib/externalTableEditing.ts";
 
 test("Feishu Bitable editing uses the primary key column returned by the backend", () => {
   assert.equal(externalRecordIdColumn(["__dbx_record_id__"], ["__dbx_record_id__", "Name"]), "__dbx_record_id__");
-  assert.equal(
-    externalRecordIdColumn(["__dbx_record_id_2__"], ["__dbx_record_id__", "__dbx_record_id_2__", "Name"]),
-    "__dbx_record_id_2__",
-  );
+  assert.equal(externalRecordIdColumn(["__dbx_record_id_2__"], ["__dbx_record_id__", "__dbx_record_id_2__", "Name"]), "__dbx_record_id_2__");
   assert.equal(externalRecordIdColumn(["__dbx_record_id__"], ["Name"]), undefined);
 });
 

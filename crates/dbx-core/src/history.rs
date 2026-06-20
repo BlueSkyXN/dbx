@@ -4,6 +4,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
+    #[serde(default)]
+    pub connection_id: String,
     pub connection_name: String,
     pub database: String,
     pub sql: String,
@@ -11,9 +13,25 @@ pub struct HistoryEntry {
     pub execution_time_ms: u128,
     pub success: bool,
     pub error: Option<String>,
+    #[serde(default = "default_activity_kind")]
+    pub activity_kind: String,
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub affected_rows: Option<i64>,
+    #[serde(default)]
+    pub rollback_sql: Option<String>,
+    #[serde(default)]
+    pub details_json: Option<String>,
 }
 
 pub const MAX_HISTORY: usize = 1000;
+
+fn default_activity_kind() -> String {
+    "query".to_string()
+}
 
 pub fn read_all(path: &Path) -> Result<Vec<HistoryEntry>, String> {
     if !path.exists() {
