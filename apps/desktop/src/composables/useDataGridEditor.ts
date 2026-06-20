@@ -2,6 +2,7 @@ import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBefo
 import * as api from "@/lib/api";
 import type { CellValue } from "@/lib/cellValue";
 import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
+import { applyDirtyRowsToResultRows } from "@/lib/dataGridResultRows";
 import { normalizeDataGridSaveError } from "@/lib/dataGridSql";
 import { rowStatusFilterAfterAddingRow, type RowStatusFilter } from "@/lib/gridRowStatus";
 import { supportsDataGridTransaction } from "@/lib/tableEditing";
@@ -722,6 +723,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         isSaving.value = false;
         return;
       }
+      applyDirtyRowsToResultRows(result.value.rows, dirtyRows.value);
       dirtyRows.value.clear();
       newRows.value = [];
       deletedRows.value.clear();
@@ -797,14 +799,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     } catch (e) {
       console.warn("[DBX] failed to record data grid history", e);
     }
-    for (const [sourceIndex, changes] of dirtyRows.value) {
-      const row = result.value.rows[sourceIndex];
-      if (row) {
-        for (const [colIdx, value] of changes) {
-          row[colIdx] = value;
-        }
-      }
-    }
+    applyDirtyRowsToResultRows(result.value.rows, dirtyRows.value);
     dirtyRows.value.clear();
     newRows.value = [];
     deletedRows.value.clear();
