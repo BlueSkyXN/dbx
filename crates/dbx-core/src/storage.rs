@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::ai::{AiChatMessage, AiConfig, AiConversation};
 use crate::connection_secrets::{
-    MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX,
-    MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX,
+    FEISHU_ACCESS_TOKEN_KEY, MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY,
+    MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{HistoryEntry, MAX_HISTORY};
@@ -353,6 +353,45 @@ fn scrub_mq_token_signing_secret(config: &mut ConnectionConfig) {
         return;
     };
     scrub_json_secret(signing, "key");
+}
+
+fn is_feishu_connection(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::FeishuSheets | DatabaseType::FeishuBitable)
+}
+
+fn feishu_access_token(config: &ConnectionConfig) -> Option<String> {
+    if !is_feishu_connection(&config.db_type) {
+        return None;
+    }
+    config
+        .external_config
+        .as_ref()
+        .and_then(|value| value.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn scrub_feishu_access_token(config: &mut ConnectionConfig) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    if let Some(serde_json::Value::Object(object)) = config.external_config.as_mut() {
+        object.remove("access_token");
+    }
+}
+
+fn set_feishu_access_token(config: &mut ConnectionConfig, token: String) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    let mut object = match config.external_config.take() {
+        Some(serde_json::Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert("access_token".to_string(), serde_json::Value::String(token));
+    config.external_config = Some(serde_json::Value::Object(object));
 }
 
 fn delete_secret_prefix_in_tx(
@@ -800,6 +839,7 @@ impl Storage {
                 sanitized.connection_string = None;
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
+                scrub_feishu_access_token(&mut sanitized);
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
                 tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
@@ -836,6 +876,7 @@ impl Storage {
                 sanitized.connection_string = None;
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
+                scrub_feishu_access_token(&mut sanitized);
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
                 tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
@@ -885,6 +926,12 @@ impl Storage {
                 }
                 persist_mq_auth_secrets_in_tx(&tx, &config)?;
                 persist_mq_token_signing_secret_in_tx(&tx, &config)?;
+                persist_secret_in_tx(
+                    &tx,
+                    &config.id,
+                    FEISHU_ACCESS_TOKEN_KEY,
+                    feishu_access_token(&config).as_deref().unwrap_or_default(),
+                )?;
             }
 
             if configs.is_empty() {
@@ -915,6 +962,7 @@ impl Storage {
         let mut configs = Vec::new();
         for (id, json) in rows {
             let mut config: ConnectionConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let legacy_feishu_token = feishu_access_token(&config);
             config.password = self.get_secret(&id, "password").await?.unwrap_or_default();
             for index in 0..config.transport_layers.len() {
                 let layer_for_key = config.transport_layers[index].clone();
@@ -963,13 +1011,26 @@ impl Storage {
             }
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();
             config.connection_string = self.get_secret(&id, "connection_string").await?;
+            let stored_feishu_token = self.get_secret(&id, FEISHU_ACCESS_TOKEN_KEY).await?;
+            let mut needs_feishu_secret_rewrite = legacy_feishu_token.is_some();
+            match (stored_feishu_token, legacy_feishu_token) {
+                (Some(token), _) => set_feishu_access_token(&mut config, token),
+                (None, Some(token)) => {
+                    self.set_secret(&id, FEISHU_ACCESS_TOKEN_KEY, &token).await?;
+                    set_feishu_access_token(&mut config, token);
+                    needs_feishu_secret_rewrite = true;
+                }
+                (None, None) => {}
+            }
             let needs_mq_auth_rewrite = self.hydrate_mq_auth_secrets(&id, &mut config).await?;
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
-            let needs_mq_secret_rewrite = needs_mq_auth_rewrite || needs_mq_token_signing_rewrite;
-            if needs_mq_secret_rewrite {
+            let needs_secret_rewrite =
+                needs_mq_auth_rewrite || needs_mq_token_signing_rewrite || needs_feishu_secret_rewrite;
+            if needs_secret_rewrite {
                 let mut sanitized = config.clone().canonicalized();
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
+                scrub_feishu_access_token(&mut sanitized);
                 let sanitized_json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
                 let update_id = id.clone();
                 self.with_conn(move |conn| {
@@ -1844,8 +1905,10 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopIconTheme, DesktopSettings, Storage};
-    use crate::connection_secrets::{MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY};
+    use super::{feishu_access_token, DesktopIconTheme, DesktopSettings, Storage};
+    use crate::connection_secrets::{
+        FEISHU_ACCESS_TOKEN_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
+    };
     use crate::models::connection::{ConnectionConfig, DatabaseType};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1908,6 +1971,21 @@ mod tests {
         }
     }
 
+    fn feishu_connection(id: &str, token: &str) -> ConnectionConfig {
+        let mut config = mq_connection(id, "");
+        config.name = "Feishu".to_string();
+        config.db_type = DatabaseType::FeishuSheets;
+        config.driver_profile = Some("feishu_sheets".to_string());
+        config.driver_label = Some("Feishu Sheets".to_string());
+        config.host = "https://open.feishu.cn".to_string();
+        config.port = 0;
+        config.external_config = Some(serde_json::json!({
+            "access_token": token,
+            "spreadsheet_token": "shtcn_test"
+        }));
+        config
+    }
+
     async fn raw_connection_json(storage: &Storage, id: &str) -> String {
         let id = id.to_string();
         storage
@@ -1938,6 +2016,44 @@ mod tests {
 
     fn mq_token_signing_key(config: &ConnectionConfig) -> Option<&str> {
         config.external_config.as_ref()?.get("tokenSigning")?.get("key")?.as_str()
+    }
+
+    #[tokio::test]
+    async fn save_connections_moves_feishu_access_token_to_secret_table_and_restores_it() {
+        let path = temp_db_path("feishu-token-secrets");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_connections(&[feishu_connection("feishu", "tenant-token")]).await.unwrap();
+
+        let raw_json = raw_connection_json(&storage, "feishu").await;
+        assert!(!raw_json.contains("tenant-token"));
+        assert!(!raw_json.contains("access_token"));
+        assert_eq!(
+            storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap().as_deref(),
+            Some("tenant-token")
+        );
+
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("tenant-token"));
+    }
+
+    #[tokio::test]
+    async fn load_connections_migrates_legacy_feishu_access_token_out_of_config_json() {
+        let path = temp_db_path("feishu-token-legacy-migration");
+        let storage = Storage::open(&path).await.unwrap();
+        insert_raw_connection(&storage, &feishu_connection("feishu", "legacy-token")).await;
+
+        let loaded = storage.load_connections().await.unwrap();
+
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("legacy-token"));
+        assert_eq!(
+            storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap().as_deref(),
+            Some("legacy-token")
+        );
+        let raw_json = raw_connection_json(&storage, "feishu").await;
+        assert!(!raw_json.contains("legacy-token"));
+        assert!(!raw_json.contains("access_token"));
     }
 
     #[tokio::test]

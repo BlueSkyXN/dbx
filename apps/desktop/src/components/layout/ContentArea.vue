@@ -46,18 +46,22 @@ const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryCh
 import { useQueryStore } from "@/stores/queryStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
+import * as api from "@/lib/api";
 import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExecutionState";
 import { databaseDisplayNameForTab, executionSummaryItems, nextExecutionSummaryView, resultGridCacheKey, resultRunItems, tabularResultItems } from "@/lib/tabPresentation";
 import { defaultQueryResultArchiveFileName } from "@/lib/queryResultArchive";
 import { saveQueryResultArchiveFile } from "@/lib/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/tableEditing";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
+import { externalRecordIdColumn, isFeishuBitableTableEditable, isFeishuSheetsGridEditable } from "@/lib/externalTableEditing";
 import { formatShortcut } from "@/lib/shortcutRegistry";
 import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/chartData";
 import type { SqlExecutionOverride } from "@/lib/sqlExecutionTarget";
+import type { CellValue } from "@/lib/cellValue";
+import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import { useTabScroll } from "@/composables/useTabScroll";
-import type { QueryTab, ConnectionConfig, TableInfoTab } from "@/types/database";
+import type { QueryTab, ConnectionConfig, TableInfoTab, ExternalRowUpdate } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
 type DataGridHandle = {
@@ -160,9 +164,86 @@ const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumn
 const redisKeyBrowserRef = ref<SearchableBrowserHandle>();
 const etcdKeyBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
-const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
+const queryResultEditable = computed(() => !!props.activeTab.queryAnalysis && isFeishuSheetsGridEditable(activeEffectiveDatabaseType.value) && activeEffectiveDatabaseType.value !== "feishu_bitable");
+const feishuBitableRecordIdColumn = computed(() => (activeEffectiveDatabaseType.value === "feishu_bitable" && props.activeTab.result ? externalRecordIdColumn(activeDataTabTableMeta.value?.primaryKeys, props.activeTab.result.columns) : undefined));
+const dataTabSourceColumns = computed(() => {
+  const resultColumns = props.activeTab.result?.columns;
+  if (!resultColumns || activeEffectiveDatabaseType.value !== "feishu_bitable") return undefined;
+  const recordIdColumn = feishuBitableRecordIdColumn.value;
+  return resultColumns.map((column) => (recordIdColumn && column === recordIdColumn ? undefined : column));
+});
+const dataTabEditable = computed(() => {
+  if (
+    props.activeTab.result &&
+    isFeishuBitableTableEditable({
+      databaseType: activeEffectiveDatabaseType.value,
+      context: "table-data",
+      connectionId: props.activeTab.connectionId,
+      tableMeta: activeDataTabTableMeta.value,
+      resultColumns: props.activeTab.result.columns,
+    })
+  ) {
+    return true;
+  }
+  return isTableDataEditable(activeEffectiveDatabaseType.value, activeDataTabTableMeta.value?.primaryKeys ?? [], activeDataTabTableMeta.value?.tableType);
+});
+const externalTableSaveHandler = computed<CustomSaveHandler | undefined>(() => {
+  const result = props.activeTab.result;
+  const tableMeta = activeDataTabTableMeta.value;
+  const connectionId = props.activeTab.connectionId;
+  const recordIdColumn = feishuBitableRecordIdColumn.value;
+  if (
+    !result ||
+    !recordIdColumn ||
+    !isFeishuBitableTableEditable({
+      databaseType: activeEffectiveDatabaseType.value,
+      context: "table-data",
+      connectionId,
+      tableMeta,
+      resultColumns: result.columns,
+    })
+  ) {
+    return undefined;
+  }
+
+  return {
+    async save(changes) {
+      if (!connectionId || !tableMeta) throw new Error("Missing Feishu Bitable table context");
+      const recordIdIndex = changes.columns.indexOf(recordIdColumn);
+      if (recordIdIndex < 0) throw new Error("Feishu Bitable edits require the DBX record ID column");
+
+      const updates: ExternalRowUpdate[] = [];
+      for (const [rowIndex, rowChanges] of changes.dirtyRows.entries()) {
+        const row = changes.rows[rowIndex];
+        const rowId = String(row?.[recordIdIndex] ?? "").trim();
+        if (!rowId) continue;
+
+        const fields: Record<string, unknown> = {};
+        for (const [columnIndex, value] of rowChanges.entries()) {
+          const columnName = changes.columns[columnIndex];
+          if (!columnName || columnName === recordIdColumn) continue;
+          fields[columnName] = value;
+        }
+        if (Object.keys(fields).length > 0) {
+          updates.push({ rowId, fields });
+        }
+      }
+
+      const rowIds = [...changes.deletedRows].map((rowIndex) => String(changes.rows[rowIndex]?.[recordIdIndex] ?? "").trim()).filter(Boolean);
+      const writableColumnIndexes = changes.columns
+        .map((columnName, index) => ({ columnName, index }))
+        .filter(({ columnName }) => columnName !== recordIdColumn)
+        .map(({ index }) => index);
+      const rowsToAppend = changes.newRows.map((row) => writableColumnIndexes.map((index) => row[index] ?? null) as CellValue[]);
+
+      if (updates.length > 0) await api.updateExternalRows(connectionId, tableMeta.tableName, updates);
+      if (rowIds.length > 0) await api.deleteExternalRows(connectionId, tableMeta.tableName, rowIds);
+      if (rowsToAppend.length > 0) await api.appendExternalRows(connectionId, tableMeta.tableName, rowsToAppend);
+    },
+  };
+});
 
 const activeSqlFormatDialect = computed<SqlFormatDialect>(() => {
   switch (activeEffectiveDatabaseType.value) {
@@ -676,7 +757,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                             {{ dataGridRef?.multiRowTranspose ? t("grid.transposeMultiRow") : t("grid.transposeSingleRow") }}
                           </span>
                         </span>
-                        <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value: boolean) => dataGridRef?.setMultiRowTranspose(value)" />
+                        <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value) => dataGridRef?.setMultiRowTranspose(value)" />
                       </label>
                     </LightTooltip>
                     <label class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent" :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }">
@@ -753,7 +834,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :initial-order-by-input="activeTab.orderByInput"
                 :sql="activeTab.lastExecutedSql || activeTab.sql"
                 :loading="activeTab.isExecuting"
-                :editable="!!activeTab.queryAnalysis"
+                :editable="queryResultEditable"
                 :source-columns="activeTab.querySourceColumns"
                 context="results"
                 :database-type="activeEffectiveDatabaseType"
@@ -768,12 +849,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :total-row-count="activeTab.resultTotalRowCount"
                 :total-row-count-loading="activeTab.resultTotalRowCountLoading"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
-                :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
+                :full-export-result="(onProgress) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
                 :all-export-results="allResultExportSheets"
-                @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
-                @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
-                @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
-                @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string) => emit('sort', column, columnIndex, direction, whereInput)"
+                @update:order-by-input="(v) => (activeTab.orderByInput = v)"
+                @reload="(sql, searchText, whereInput, orderBy, limit, offset) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
+                @paginate="(offset, limit, whereInput, orderBy) => emit('paginate', offset, limit, whereInput, orderBy)"
+                @sort="(column, columnIndex, direction, whereInput) => emit('sort', column, columnIndex, direction, whereInput)"
               >
                 <template v-if="activeTab.result?.columns.includes('Error')" #error-actions="{ errorMessage }">
                   <Button variant="outline" size="sm" class="h-7 gap-1.5 px-2.5 text-xs" @click="emit('fixWithAi', String(errorMessage))">
@@ -919,7 +1000,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                       {{ dataGridRef?.multiRowTranspose ? t("grid.transposeMultiRow") : t("grid.transposeSingleRow") }}
                     </span>
                   </span>
-                  <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value: boolean) => dataGridRef?.setMultiRowTranspose(value)" />
+                  <Switch size="sm" :model-value="!!dataGridRef?.multiRowTranspose" :aria-label="t('grid.transposeMultiRow')" @update:model-value="(value) => dataGridRef?.setMultiRowTranspose(value)" />
                 </label>
               </LightTooltip>
               <label class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent" :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }">
@@ -945,7 +1026,9 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
+          :editable="dataTabEditable"
+          :source-columns="dataTabSourceColumns"
+          :custom-save-handler="externalTableSaveHandler"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"
@@ -956,12 +1039,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :page-offset="activeTab.resultPageOffset"
           :page-limit="activeTab.resultPageLimit"
           :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
-          :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
-          @update:where-input="(v: string) => (activeTab.whereInput = v)"
-          @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
-          @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
-          @paginate="(offset: number, limit: number, whereInput?: string, orderBy?: string) => emit('paginate', offset, limit, whereInput, orderBy)"
-          @sort="(column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string) => emit('sort', column, columnIndex, direction, whereInput)"
+          :full-export-result="(onProgress) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
+          @update:where-input="(v) => (activeTab.whereInput = v)"
+          @update:order-by-input="(v) => (activeTab.orderByInput = v)"
+          @reload="(sql, searchText, whereInput, orderBy, limit, offset) => emit('reload', sql, searchText, whereInput, orderBy, limit, offset)"
+          @paginate="(offset, limit, whereInput, orderBy) => emit('paginate', offset, limit, whereInput, orderBy)"
+          @sort="(column, columnIndex, direction, whereInput) => emit('sort', column, columnIndex, direction, whereInput)"
         />
         <QueryLoadingState v-else-if="activeTab.isExecuting" class="h-full" :label-key="queryExecutionLabelKey(activeTab)" :elapsed-seconds="queryRunningElapsedSeconds" show-cancel :cancel-disabled="!canCancelQueryExecution(activeTab)" :cancelling="activeTab.isCancelling" @cancel="emit('cancel')" />
         <div v-else class="h-full flex flex-col items-center justify-center gap-3 text-muted-foreground text-sm">

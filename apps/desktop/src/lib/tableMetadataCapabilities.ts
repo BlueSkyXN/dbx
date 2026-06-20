@@ -1,4 +1,5 @@
 import type { DatabaseType } from "@/types/database";
+import { EXTERNAL_TABULAR_TYPES } from "./databaseCapabilitySets";
 
 export interface TableMetadataCapabilities {
   columns: boolean;
@@ -56,5 +57,14 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
 };
 
 export function getTableMetadataCapabilities(dbType?: DatabaseType): TableMetadataCapabilities {
+  if (dbType && EXTERNAL_TABULAR_TYPES.has(dbType)) {
+    return {
+      ...defaultCapabilities,
+      indexes: false,
+      foreignKeys: false,
+      triggers: false,
+      ddl: false,
+    };
+  }
   return { ...defaultCapabilities, ...(dbType ? capabilityByType[dbType] : undefined) };
 }

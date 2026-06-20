@@ -124,6 +124,7 @@ import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE, normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/paginationPageSize";
 import { allNullColumnIndexes, filterColumnVisibilityOptions, hiddenColumnIndexesWithAllNullColumns, invertedHiddenColumnIndexes, nextHiddenColumnIndexes, removeAutoHiddenColumnIndexes, visibleColumnIndexesForFilter } from "@/lib/dataGridColumnVisibility";
 import { parseClipboardTable } from "@/lib/gridSelection";
+import { externalRecordIdColumn } from "@/lib/externalTableEditing";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
@@ -1655,7 +1656,12 @@ watch(allNullColumnIndexesForResult, () => {
   autoHiddenNullColumnIndexes.value = new Set();
   hideAllNullColumns();
 });
+const feishuBitableRecordIdColumn = computed(() => (props.databaseType === "feishu_bitable" ? externalRecordIdColumn(props.tableMeta?.primaryKeys, props.result.columns) : undefined));
+function isFeishuBitableRecordIdColumn(columnIndex: number): boolean {
+  return !!feishuBitableRecordIdColumn.value && props.result.columns[columnIndex] === feishuBitableRecordIdColumn.value;
+}
 const firstVisibleColumnIndex = computed(() => visibleColumnIndexes.value[0] ?? 0);
+const firstEditableVisibleColumnIndex = computed(() => visibleColumnIndexes.value.find((index) => !isFeishuBitableRecordIdColumn(index)) ?? firstVisibleColumnIndex.value);
 function actualColumnIndex(visibleColumnIndex: number): number {
   return visibleColumnIndexes.value[visibleColumnIndex] ?? visibleColumnIndex;
 }
@@ -2444,7 +2450,7 @@ const editor = useDataGridEditor({
   currentWhereInput: computed(() => currentWhereInput()),
   orderByInput,
   rowStatusFilter,
-  initialEditColumn: firstVisibleColumnIndex,
+  initialEditColumn: firstEditableVisibleColumnIndex,
   getRowItem,
   pageSize,
   currentPage,
@@ -2558,6 +2564,7 @@ const saveToolbarState = computed(() =>
     isSaving: isSaving.value,
   }),
 );
+const canUseRowChangeControls = computed(() => !!props.editable && (!!props.tableMeta || !!props.customSaveHandler) && (useTransaction.value || !!props.customSaveHandler));
 const hasSearchBarSlot = computed(() => !!slots["search-bar"]);
 const showDataGridTopbar = computed(
   () =>
@@ -2577,6 +2584,7 @@ function canEditRowItem(item: RowItem | undefined): boolean {
 }
 
 function canEditCellItem(item: RowItem | undefined, columnIndex: number): boolean {
+  if (isFeishuBitableRecordIdColumn(columnIndex)) return false;
   if (!canEditRowItem(item) || !canEditColumn(columnIndex)) return false;
   if (!item?.isNew) {
     const column = props.result.columns[columnIndex] ?? "";
@@ -6272,7 +6280,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
           "
         >
           <div class="data-grid-topbar flex items-stretch relative">
-            <div v-if="useTransaction && editable && (tableMeta || customSaveHandler)" class="flex items-center px-2 py-0.5 border-r shrink-0">
+            <div v-if="canUseRowChangeControls" class="flex items-center px-2 py-0.5 border-r shrink-0">
               <Select :model-value="rowStatusFilter" @update:model-value="(value: any) => setRowStatusFilter(String(value))">
                 <SelectTrigger class="h-5 max-w-28 border-0 bg-transparent px-0 py-0 text-xs font-medium text-foreground/70 shadow-none focus-visible:ring-0 data-[state=open]:text-foreground [&_svg]:size-3">
                   <SelectValue :placeholder="t('grid.filterRows')" />
@@ -6297,7 +6305,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
             </template>
             <template v-if="canShowWhereSearch">
               <div ref="searchSplitContainerRef" class="flex flex-1 min-w-0">
-                <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0 relative" :class="{ 'border-l': useTransaction && editable && (tableMeta || customSaveHandler) }" :style="whereSearchPaneStyle">
+                <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0 relative" :class="{ 'border-l': canUseRowChangeControls }" :style="whereSearchPaneStyle">
                   <Popover v-model:open="filterBuilderOpen">
                     <PopoverTrigger as-child>
                       <button
