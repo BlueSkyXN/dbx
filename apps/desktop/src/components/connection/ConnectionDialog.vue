@@ -2419,7 +2419,14 @@ const feishuBitableFieldNames = computed({
     const value = externalConfigRecord(form.value.external_config).field_names;
     return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").join(", ") : "";
   },
-  set: (value: string) => setExternalConfigValue("field_names", value.split(",").map((item) => item.trim()).filter(Boolean)),
+  set: (value: string) =>
+    setExternalConfigValue(
+      "field_names",
+      value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
 });
 const feishuMaxRows = externalConfigNumber("max_rows", 1000);
 const feishuMaxColumns = externalConfigNumber("max_columns", 100);
@@ -3104,9 +3111,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       app_token: typeof existing.app_token === "string" ? existing.app_token.trim() : "",
       table_id: typeof existing.table_id === "string" ? existing.table_id.trim() : "",
       view_id: typeof existing.view_id === "string" ? existing.view_id.trim() : "",
-      field_names: Array.isArray(existing.field_names)
-        ? existing.field_names.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
-        : [],
+      field_names: Array.isArray(existing.field_names) ? existing.field_names.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [],
       page_size: Number.isFinite(Number(existing.page_size)) ? Number(existing.page_size) : 500,
       max_records: Number.isFinite(Number(existing.max_records)) ? Number(existing.max_records) : 5000,
       automatic_fields: existing.automatic_fields === true,
