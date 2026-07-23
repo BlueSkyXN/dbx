@@ -1,8 +1,7 @@
 name: Issue Triage Labels
 
 on:
-  issues:
-    types: [opened, edited, reopened]
+  workflow_dispatch:
 
 concurrency:
   group: issue-database-label-${{ github.event.issue.number }}

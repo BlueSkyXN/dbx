@@ -1,12 +1,6 @@
 name: Sync Mirrors
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "**"
-  delete:
   workflow_dispatch:
 
 # Mirror providers reject concurrent forced updates to the same ref. Serialize all

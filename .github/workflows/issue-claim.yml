@@ -1,8 +1,7 @@
 name: Issue Claim
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
 
 concurrency:
   group: issue-claim-${{ github.event.issue.number }}

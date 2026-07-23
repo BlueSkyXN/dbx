@@ -1,16 +1,6 @@
 name: Update Nix pnpm hash
 
 on:
-  push:
-    branches: [main]
-    paths:
-      # Keep this list aligned with the pnpm fixed-output inputs in ci.yml.
-      - 'package.json'
-      - 'packages/**/package.json'
-      - 'pnpm-lock.yaml'
-      - 'pnpm-workspace.yaml'
-      - 'flake.nix'
-      - 'flake.lock'
   workflow_dispatch:
 
 permissions:

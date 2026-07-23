@@ -1,8 +1,7 @@
 name: Agents Release
 
 on:
-  push:
-    tags: ["agents-v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write

@@ -1,12 +1,7 @@
 name: Notifications
 
 on:
-  # issues:
-  #   types: [opened]
-  pull_request_target:
-    types: [opened, closed]
-  release:
-    types: [published, released]
+  workflow_dispatch:
 
 jobs:
   notify:
