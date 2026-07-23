@@ -19,6 +19,8 @@ pub const MQ_AUTH_API_KEY_VALUE_KEY: &str = "mq.auth.api_key_value";
 pub const MQ_AUTH_CLIENT_SECRET_KEY: &str = "mq.auth.client_secret";
 pub const MQ_TOKEN_SIGNING_SECRET_PREFIX: &str = "mq.token_signing.";
 pub const MQ_TOKEN_SIGNING_KEY: &str = "mq.token_signing.key";
+pub const NACOS_AUTH_SECRET_PREFIX: &str = "nacos.auth.";
+pub const NACOS_AUTH_PASSWORD_KEY: &str = "nacos.auth.password";
 pub const FEISHU_ACCESS_TOKEN_KEY: &str = "feishu_access_token";
 
 pub trait ConnectionSecretStore {
@@ -107,6 +109,7 @@ pub fn save_connections_to_file(
         persist_optional_secret(store, &config.id, INIT_SCRIPT_KEY, config.init_script.as_deref())?;
         persist_mq_auth_secrets(store, config)?;
         persist_mq_token_signing_secret(store, config)?;
+        persist_nacos_auth_secrets(store, config)?;
         persist_optional_secret(store, &config.id, FEISHU_ACCESS_TOKEN_KEY, feishu_access_token(config).as_deref())?;
 
         // New configs persist transport-layer secrets only. Remove legacy transport secret slots after the
@@ -177,6 +180,7 @@ pub fn load_connections_from_file(
         }
         hydrate_mq_auth_secrets(store, config, &mut needs_rewrite)?;
         hydrate_mq_token_signing_secret(store, config, &mut needs_rewrite)?;
+        hydrate_nacos_auth_secret(store, config, &mut needs_rewrite)?;
         let stored_feishu_token = store.get_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
         if legacy_feishu_token.is_some() {
             needs_rewrite = true;
@@ -367,6 +371,7 @@ fn delete_removed_connection_secrets(
         store.delete_secret(&config.id, INIT_SCRIPT_KEY)?;
         delete_secret_prefix(store, &config.id, MQ_AUTH_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQ_TOKEN_SIGNING_SECRET_PREFIX)?;
+        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
         store.delete_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
     }
     Ok(())
@@ -463,6 +468,44 @@ fn persist_mq_token_signing_secret(store: &dyn ConnectionSecretStore, config: &C
     persist_json_secret_if_present(store, &config.id, MQ_TOKEN_SIGNING_KEY, signing, "key")
 }
 
+fn persist_nacos_auth_secrets(store: &dyn ConnectionSecretStore, config: &ConnectionConfig) -> Result<(), String> {
+    if config.db_type != DatabaseType::Nacos {
+        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
+        return Ok(());
+    }
+
+    let Some(auth) = mq_auth_object(config.external_config.as_ref()) else {
+        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
+        return Ok(());
+    };
+
+    if mq_auth_kind(auth).as_deref() == Some("usernamePassword") {
+        replace_nacos_auth_secret(store, &config.id, auth, "password")?;
+    } else {
+        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
+    }
+
+    Ok(())
+}
+
+fn replace_nacos_auth_secret(
+    store: &dyn ConnectionSecretStore,
+    connection_id: &str,
+    auth: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), String> {
+    let current = auth.get(field).and_then(serde_json::Value::as_str).filter(|secret| !secret.is_empty());
+    let existing = if current.is_none() { store.get_secret(connection_id, NACOS_AUTH_PASSWORD_KEY)? } else { None };
+    delete_secret_prefix(store, connection_id, NACOS_AUTH_SECRET_PREFIX)?;
+    match current {
+        Some(secret) => store.set_secret(connection_id, NACOS_AUTH_PASSWORD_KEY, secret),
+        None => match existing {
+            Some(secret) => store.set_secret(connection_id, NACOS_AUTH_PASSWORD_KEY, &secret),
+            None => Ok(()),
+        },
+    }
+}
+
 fn hydrate_mq_auth_secrets(
     store: &dyn ConnectionSecretStore,
     config: &mut ConnectionConfig,
@@ -505,6 +548,25 @@ fn hydrate_mq_token_signing_secret(
     };
 
     hydrate_json_secret(store, &config.id, MQ_TOKEN_SIGNING_KEY, signing, "key", needs_rewrite)
+}
+
+fn hydrate_nacos_auth_secret(
+    store: &dyn ConnectionSecretStore,
+    config: &mut ConnectionConfig,
+    needs_rewrite: &mut bool,
+) -> Result<(), String> {
+    if config.db_type != DatabaseType::Nacos {
+        return Ok(());
+    }
+
+    let Some(auth) = mq_auth_object_mut(config.external_config.as_mut()) else {
+        return Ok(());
+    };
+    if mq_auth_kind(auth).as_deref() != Some("usernamePassword") {
+        return Ok(());
+    }
+
+    hydrate_json_secret(store, &config.id, NACOS_AUTH_PASSWORD_KEY, auth, "password", needs_rewrite)
 }
 
 fn persist_json_secret_if_present(
@@ -560,6 +622,18 @@ fn scrub_mq_token_signing_secret(config: &mut ConnectionConfig) {
         return;
     };
     scrub_json_secret(signing, "key");
+}
+
+fn scrub_nacos_auth_secrets(config: &mut ConnectionConfig) {
+    if config.db_type != DatabaseType::Nacos {
+        return;
+    }
+    let Some(auth) = mq_auth_object_mut(config.external_config.as_mut()) else {
+        return;
+    };
+    if mq_auth_kind(auth).as_deref() == Some("usernamePassword") {
+        scrub_json_secret(auth, "password");
+    }
 }
 
 fn scrub_json_secret(auth: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
@@ -708,6 +782,7 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
             config.init_script = None;
             scrub_mq_auth_secrets(&mut config);
             scrub_mq_token_signing_secret(&mut config);
+            scrub_nacos_auth_secrets(&mut config);
             scrub_feishu_access_token(&mut config);
             config
         })

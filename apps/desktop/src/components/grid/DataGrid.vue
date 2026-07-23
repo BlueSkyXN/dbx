@@ -108,31 +108,73 @@ import {
   transposeFieldWidth,
   transposeScrollLeftForRecord,
   visibleTransposeRecordWindow,
-} from "@/lib/dataGridTranspose";
-import { matchesRowStatusFilter, type RowStatus, type RowStatusFilter } from "@/lib/gridRowStatus";
-import { displayCellValue, type CellValue } from "@/lib/cellValue";
-import { getApplicablePreviewActions } from "@/lib/resultPreviewRegistry";
-import "@/lib/previewHandlers/geometryMapPreview";
-import { BINARY_CELL_DOWNLOAD_MODES, binaryCellDisplayText, binaryCellDownloadFileName, binaryCellDownloadPayload, canDownloadBinaryCellValue, downloadBinaryCellPayload, isBinaryCellColumnType, parseBinaryCellBytes, type BinaryCellDownloadMode } from "@/lib/binaryCellDownload";
-import { buildBinaryHexViewRows } from "@/lib/binaryHexViewer";
-import { canFormatCellDetailJson, cellDetailEditorText, defaultCellDetailTab, formatJsonText, isGeometryColumnType, linkedCellDetailTarget, valueEditorActions, visibleCellDetailTabs, type CellDetailTab } from "@/lib/cellDetailPresentation";
-import { renderWktOnCanvas, isHexGeometry } from "@/lib/geometryPreview";
-import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "@/lib/dataGridDetail";
-import { applyColumnFormatter, buildColumnFormatterKey, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit } from "@/lib/columnFormatter";
-import { temporalCellEditorKind, type TemporalCellEditorKind } from "@/lib/dataGridTemporalEditor";
-import { isEnumColumn, enumValuesForColumn } from "@/lib/dataGridEnumEditor";
-import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isToggleTransposeShortcut } from "@/lib/keyboardShortcuts";
-import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGridScrollGutter";
-import { canGoNextDataGridPage } from "@/lib/dataGridPagination";
-import { CANVAS_DATA_GRID_ROW_HEIGHT, drawCanvasDataGrid } from "@/lib/canvasDataGridRenderer";
-import { dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGridSaveUi";
-import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editorThemes";
-import { appendColumnValueFilterCondition, buildColumnValueFilterCondition, combineWhereInputs, filterModeNeedsValue, parseFilterValue } from "@/lib/dataGridColumnFilter";
-import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
-import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE, normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/paginationPageSize";
-import { allNullColumnIndexes, filterColumnVisibilityOptions, hiddenColumnIndexesWithAllNullColumns, invertedHiddenColumnIndexes, nextHiddenColumnIndexes, removeAutoHiddenColumnIndexes, visibleColumnIndexesForFilter } from "@/lib/dataGridColumnVisibility";
-import { parseClipboardTable } from "@/lib/gridSelection";
-import { externalRecordIdColumn } from "@/lib/externalTableEditing";
+} from "@/lib/dataGrid/dataGridTranspose";
+import { canApplyGridSelectionValue, canDeleteGridRowItem, canEditGridCellDetail, matchesRowStatusFilter, shouldShowQuickEntryDraftRow, type RowStatus, type RowStatusFilter } from "@/lib/dataGrid/gridRowStatus";
+import { displayCellValue, firstLineCellDisplayValue, limitDataGridCellDisplay, SQLSERVER_DATA_GRID_CELL_DISPLAY_MAX_LENGTH, type CellValue } from "@/lib/dataGrid/cellValue";
+import { getApplicablePreviewActions } from "@/lib/dataGrid/resultPreviewRegistry";
+import "@/lib/dataGrid/geometryMapPreview";
+import {
+  BINARY_CELL_DOWNLOAD_MODES,
+  binaryCellDisplayText,
+  binaryCellDownloadFileName,
+  binaryCellDownloadPayload,
+  canDownloadBinaryCellValue,
+  downloadBinaryCellPayload,
+  isBinaryCellColumnType,
+  parseBinaryCellBytes,
+  retainBinaryCellDownloadMenuForHover,
+  type BinaryCellDownloadMode,
+} from "@/lib/dataGrid/binaryCellDownload";
+import { buildBinaryHexViewRows } from "@/lib/dataGrid/binaryHexViewer";
+import { canFormatCellDetailJson, cellDetailEditorText, compactJsonText, defaultCellDetailTab, formatJsonText, isGeometryColumnType, linkedCellDetailTarget, looksLikeJsonContainerText, valueEditorActions, visibleCellDetailTabs, type CellDetailTab } from "@/lib/dataGrid/cellDetailPresentation";
+import { buildDataGridCellDetail, buildDataGridColumnDetail, buildDataGridRowDetail, CELL_DETAIL_VALUE_PREVIEW_MAX_LENGTH, dataGridColumnDetailJson, dataGridColumnDetailTsv, dataGridRowDetailJson, dataGridRowDetailTsv, type DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
+import { applyColumnFormatter, buildColumnFormatterKey, getSupportedTimeZoneOptions, normalizeColumnFormatter, resolveColumnFormatter, type ColumnFormatterConfig, type DateTimeFormatterUnit, DateTimePatterns } from "@/lib/dataGrid/columnFormatter";
+import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
+import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
+import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
+import { canGoNextDataGridPage, hasCompleteLocalDataGridResult } from "@/lib/dataGrid/dataGridPagination";
+import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
+import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
+import { CANVAS_DATA_GRID_ROW_HEIGHT, dataGridSearchMatchKey, drawCanvasDataGrid } from "@/lib/dataGrid/canvasDataGridRenderer";
+import { DATA_GRID_DARK_STRIPED_ROW_BG, DATA_GRID_LIGHT_STRIPED_ROW_BG } from "@/lib/dataGrid/dataGridPaintTheme";
+import { createRowLowerTextCache } from "@/lib/dataGrid/dataGridRowLowerText";
+import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
+import type { QueryEditabilityReason } from "@/lib/sql/sqlAnalysis";
+import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editor/editorThemes";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
+import {
+  appendColumnValueFilterCondition,
+  buildColumnValueFilterCondition,
+  buildColumnValuesFilterCondition,
+  combineWhereInputs,
+  filterModeHasCompleteValue,
+  filterModeIsSupportedForDatabase,
+  filterModeNeedsValue,
+  filterModeUsesList,
+  filterModeUsesRange,
+  parseFilterValue,
+  parseFilterValues,
+  removeColumnValueFilterCondition,
+  replaceColumnValueFilterCondition,
+} from "@/lib/dataGrid/dataGridColumnFilter";
+import { normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/dataGrid/paginationPageSize";
+import { allNullColumnIndexes } from "@/lib/dataGrid/dataGridColumnVisibility";
+import { buildDataGridColumnLookupItems, filterDataGridColumnLookupItems } from "@/lib/dataGrid/dataGridColumnLookup";
+import { uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
+import { dataGridColumnLayoutScopeKey, TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVENT, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
+import { summarizeSelection } from "@/lib/dataGrid/gridSelection";
+import { externalRecordIdColumn } from "@/lib/table/externalTableEditing";
+import {
+  createDataGridCellContextMenuItems,
+  createDataGridColumnContextMenuItems,
+  createDataGridCompactColumnActionItems,
+  createDataGridContextMenuItems,
+  createDataGridFilterSubmenu,
+  createDataGridRowContextMenuItems,
+  createDataGridSortMenuItems,
+  dataGridSelectedSortMenuValue,
+  type DataGridColumnSortState,
+} from "@/lib/dataGrid/dataGridContextMenu";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
@@ -1690,59 +1732,6 @@ const previewActions = computed(() => {
   if (!props.result) return [];
   return getApplicablePreviewActions(props.result);
 });
-const displayableColumnCount = computed(() => displayableColumnIndexes.value.length);
-const hiddenColumnCount = computed(() => displayableColumnCount.value - visibleColumnCount.value);
-const allNullColumnIndexesForResult = computed(() => allNullColumnIndexes(props.result.rows, displayableColumnIndexes.value));
-const allNullColumnCount = computed(() => allNullColumnIndexesForResult.value.length);
-const canToggleAllNullColumns = computed(() => nullColumnsHidden.value || (allNullColumnCount.value > 0 && displayableColumnCount.value > 1));
-function filteredColumnVisibilityOptions(query: string) {
-  const displayable = new Set(displayableColumnIndexes.value);
-  return filterColumnVisibilityOptions(props.result.columns, query).filter((option) => displayable.has(option.index));
-}
-function isColumnVisible(columnIndex: number): boolean {
-  return !hiddenColumnIndexes.value.has(columnIndex);
-}
-function toggleColumnVisibility(columnIndex: number) {
-  hiddenColumnIndexes.value = nextHiddenColumnIndexes({
-    columnIndex,
-    hiddenIndexes: hiddenColumnIndexes.value,
-    totalColumns: displayableColumnCount.value,
-  });
-}
-function showAllColumns() {
-  hiddenColumnIndexes.value = new Set();
-}
-function invertColumnVisibility() {
-  hiddenColumnIndexes.value = invertedHiddenColumnIndexes(displayableColumnIndexes.value, hiddenColumnIndexes.value);
-}
-function showAllNullColumns() {
-  hiddenColumnIndexes.value = removeAutoHiddenColumnIndexes(hiddenColumnIndexes.value, autoHiddenNullColumnIndexes.value);
-  autoHiddenNullColumnIndexes.value = new Set();
-  nullColumnsHidden.value = false;
-}
-function hideAllNullColumns() {
-  const next = hiddenColumnIndexesWithAllNullColumns({
-    availableIndexes: displayableColumnIndexes.value,
-    hiddenIndexes: hiddenColumnIndexes.value,
-    allNullIndexes: new Set(allNullColumnIndexesForResult.value),
-  });
-  hiddenColumnIndexes.value = next.hiddenIndexes;
-  autoHiddenNullColumnIndexes.value = next.autoHiddenIndexes;
-  nullColumnsHidden.value = next.autoHiddenIndexes.size > 0;
-}
-function toggleAllNullColumns() {
-  if (nullColumnsHidden.value) {
-    showAllNullColumns();
-  } else {
-    hideAllNullColumns();
-  }
-}
-watch(allNullColumnIndexesForResult, () => {
-  if (!nullColumnsHidden.value) return;
-  hiddenColumnIndexes.value = removeAutoHiddenColumnIndexes(hiddenColumnIndexes.value, autoHiddenNullColumnIndexes.value);
-  autoHiddenNullColumnIndexes.value = new Set();
-  hideAllNullColumns();
-});
 const feishuBitableRecordIdColumn = computed(() => (props.databaseType === "feishu_bitable" ? externalRecordIdColumn(props.tableMeta?.primaryKeys, props.result.columns) : undefined));
 function isFeishuBitableRecordIdColumn(columnIndex: number): boolean {
   return !!feishuBitableRecordIdColumn.value && props.result.columns[columnIndex] === feishuBitableRecordIdColumn.value;
@@ -2732,6 +2721,7 @@ const editor = useDataGridEditor({
   currentWhereInput: computed(() => currentWhereInput()),
   orderByInput,
   rowStatusFilter,
+  dataGridQuickEntryEnabled: computed(() => settingsStore.editorSettings.dataGridQuickEntry),
   initialEditColumn: firstEditableVisibleColumnIndex,
   getRowItem,
   pageSize,
@@ -2859,7 +2849,6 @@ const saveToolbarState = computed(() =>
     isSaving: isSaving.value,
   }),
 );
-const canUseRowChangeControls = computed(() => !!props.editable && (!!props.tableMeta || !!props.customSaveHandler) && (useTransaction.value || !!props.customSaveHandler));
 const hasSearchBarSlot = computed(() => !!slots["search-bar"]);
 const hasResultToolbarLeadingSlot = computed(() => !!slots["result-toolbar-leading"]);
 const hasResultToolbarActionsSlot = computed(() => !!slots["result-toolbar-actions"]);
@@ -7605,64 +7594,75 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
     <CustomContextMenu :items="gridContextMenuItems" v-slot="{ onContextMenu }">
       <div v-if="hasData || canShowWhereSearch" class="flex-1 flex flex-col overflow-hidden" @contextmenu="onContextMenu">
         <!-- Search bar -->
-        <div
-          v-if="showDataGridTopbar"
-          class="data-grid-topbar-scroll shrink-0 overflow-x-auto border-b bg-muted/20"
-          @scroll="
-            updateWhereSuggestionPosition();
-            updateOrderBySuggestionPosition();
-          "
-        >
-          <div class="data-grid-topbar flex items-stretch relative">
-            <div v-if="canUseRowChangeControls" class="flex items-center px-2 py-0.5 border-r shrink-0">
-              <Select :model-value="rowStatusFilter" @update:model-value="(value: any) => setRowStatusFilter(String(value))">
-                <SelectTrigger class="h-5 max-w-28 border-0 bg-transparent px-0 py-0 text-xs font-medium text-foreground/70 shadow-none focus-visible:ring-0 data-[state=open]:text-foreground [&_svg]:size-3">
-                  <SelectValue :placeholder="t('grid.filterRows')" />
-                </SelectTrigger>
-                <SelectContent position="popper">
-                  <SelectItem value="all">{{ t("grid.filterAllRows") }}</SelectItem>
-                  <SelectItem value="changed">{{ t("grid.filterChangedRows") }}</SelectItem>
-                  <SelectItem value="edited">{{ t("grid.statusEdited") }}</SelectItem>
-                  <SelectItem value="new">{{ t("grid.statusNew") }}</SelectItem>
-                  <SelectItem value="deleted">{{ t("grid.statusDeleted") }}</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <template v-if="hasLocalColumnFilters && !canShowWhereSearch && !hasSearchBarSlot">
-              <div class="flex items-center gap-1 px-2 py-0.5 min-w-0">
-                <button type="button" class="flex shrink-0 items-center gap-1 rounded border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15" :title="t('grid.clearLocalFilters')" @click="clearLocalFilter()">
-                  <Filter class="h-3 w-3" />
-                  {{ localFilterCount }}
-                  <X class="h-3 w-3" />
-                </button>
+        <!-- Leave real vertical space around the 28px controls instead of fitting them against the border. -->
+        <div ref="dataGridTopbarRef" v-if="showDataGridTopbar" class="data-grid-topbar-shell flex h-8 min-w-0 shrink-0 items-center border-b bg-muted/20">
+          <div v-if="hasResultToolbarLeadingSlot" class="flex shrink-0 items-center border-r">
+            <slot name="result-toolbar-leading" :compact="compactDataGridToolbar" />
+          </div>
+          <!-- Clip both axes instead of creating a hidden scroll container around the toolbar controls. -->
+          <div class="data-grid-topbar-scroll min-w-0 flex-1 overflow-clip">
+            <div class="data-grid-topbar flex items-stretch relative" :class="{ 'data-grid-topbar--compact': compactDataGridToolbar }">
+              <div v-if="useTransaction && editable && hasDataGridSaveTarget" class="flex items-center px-2 py-0.5 border-r shrink-0">
+                <Select :model-value="rowStatusFilter" @update:model-value="(value: any) => setRowStatusFilter(String(value))">
+                  <SelectTrigger class="h-5 max-w-28 border-0 bg-transparent px-0 py-0 text-xs font-medium text-foreground/70 shadow-none focus-visible:ring-0 data-[state=open]:text-foreground [&_svg]:size-3">
+                    <SelectValue :placeholder="t('grid.filterRows')" />
+                  </SelectTrigger>
+                  <SelectContent position="popper">
+                    <SelectItem value="all">{{ t("grid.filterAllRows") }}</SelectItem>
+                    <SelectItem value="changed">{{ t("grid.filterChangedRows") }}</SelectItem>
+                    <SelectItem value="edited">{{ t("grid.statusEdited") }}</SelectItem>
+                    <SelectItem value="new">{{ t("grid.statusNew") }}</SelectItem>
+                    <SelectItem value="deleted">{{ t("grid.statusDeleted") }}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
-            </template>
-            <template v-if="canShowWhereSearch">
-              <div ref="searchSplitContainerRef" class="flex flex-1 min-w-0">
-                <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0 relative" :class="{ 'border-l': canUseRowChangeControls }" :style="whereSearchPaneStyle">
-                  <Popover v-model:open="filterBuilderOpen">
-                    <PopoverTrigger as-child>
-                      <button
-                        type="button"
-                        class="relative flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[11px] font-medium transition-colors"
-                        :class="filterButtonActive ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15' : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground'"
-                        :disabled="!canUseWhereSearch"
-                        @click="ensureStructuredFilterRule"
-                      >
-                        <Filter class="h-3 w-3" />
-                        <span v-if="filterButtonCount" class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] leading-none text-primary-foreground">
-                          {{ filterButtonCount }}
-                        </span>
-                      </button>
-                    </PopoverTrigger>
-                    <PopoverContent align="start" class="w-[380px] max-w-[calc(100vw-24px)] gap-3 p-3">
-                      <div class="flex items-center justify-between gap-3">
-                        <div class="text-xs font-medium text-foreground">{{ t("grid.filter") }}</div>
-                        <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="addStructuredFilterRule">
-                          <Plus class="mr-1 h-3.5 w-3.5" />
-                          {{ t("grid.filterBuilderAddRule") }}
-                        </Button>
-                      </div>
+              <template v-if="hasLocalColumnFilters && !canShowWhereSearch && !hasSearchBarSlot">
+                <div class="flex items-center gap-1 px-2 py-0.5 min-w-0">
+                  <button type="button" class="flex shrink-0 items-center gap-1 rounded border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[11px] font-medium text-primary hover:bg-primary/15" :title="t('grid.clearLocalFilters')" @click="clearLocalFilter()">
+                    <Filter class="h-3 w-3" />
+                    {{ localFilterCount }}
+                    <X class="h-3 w-3" />
+                  </button>
+                </div>
+              </template>
+              <template v-if="canShowWhereSearch">
+                <DataGridQueryControls
+                  v-model:where-input="whereFilterInput"
+                  v-model:order-by-input="orderByInput"
+                  v-model:filter-builder-open="filterBuilderOpen"
+                  :columns="props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns"
+                  :condition-columns="conditionColumns"
+                  :history-scope="conditionHistoryScope"
+                  :can-use-where-search="canUseWhereSearch"
+                  :compact="compactDataGridToolbar"
+                  :leading-border="!!(useTransaction && editable && hasDataGridSaveTarget)"
+                  :filter-button-active="filterButtonActive"
+                  :filter-button-count="filterButtonCount"
+                  :has-local-column-filters="hasLocalColumnFilters"
+                  :local-filter-count="localFilterCount"
+                  :local-filter-summaries="localFilterSummaries"
+                  :rules="structuredFilterRules"
+                  :filtered-columns="filteredFilterBuilderColumnOptions"
+                  :mode-options="filterModeOptions"
+                  :column-search="filterBuilderColumnSearch"
+                  :apply-where="applyWhereFilter"
+                  :apply-order-by="applyOrderBySearch"
+                  :clear-order-by="clearOrderByInput"
+                  @update:column-search="filterBuilderColumnSearch = $event"
+                  @ensure-rule="ensureStructuredFilterRule"
+                  @add-rule="addStructuredFilterRule"
+                  @apply-filters="applyStructuredFilters"
+                  @reset-filters="resetStructuredFilters"
+                  @clear-filters="clearAllFilters"
+                  @remove-rule="removeStructuredFilterRule"
+                  @update-rule="updateStructuredFilterRule"
+                  @clear-local-filter="clearLocalFilter"
+                />
+              </template>
+
+              <slot name="search-bar" :local-filter-count="localFilterCount + serverColumnFilterCount" :has-local-column-filters="hasLocalColumnFilters || hasServerColumnFilters" :local-filter-summaries="localFilterSummaries" :clear-local-filter="clearLocalFilter" />
+            </div>
+          </div>
 
           <DataGridToolbar
             class="ml-auto"

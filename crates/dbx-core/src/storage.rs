@@ -11,6 +11,7 @@ use crate::ai::{AiChatMessage, AiConfig, AiConfigItem, AiConversation, AiProvide
 use crate::connection_secrets::{
     FEISHU_ACCESS_TOKEN_KEY, MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY,
     MQ_AUTH_SECRET_PREFIX, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX,
+    NACOS_AUTH_PASSWORD_KEY, NACOS_AUTH_SECRET_PREFIX,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{
@@ -652,6 +653,18 @@ fn scrub_mq_token_signing_secret(config: &mut ConnectionConfig) {
         return;
     };
     scrub_json_secret(signing, "key");
+}
+
+fn scrub_nacos_auth_secrets(config: &mut ConnectionConfig) {
+    if config.db_type != DatabaseType::Nacos {
+        return;
+    }
+    let Some(auth) = nacos_auth_object_mut(config.external_config.as_mut()) else {
+        return;
+    };
+    if auth.get("kind").and_then(serde_json::Value::as_str) == Some("usernamePassword") {
+        scrub_json_secret(auth, "password");
+    }
 }
 
 fn is_feishu_connection(db_type: &DatabaseType) -> bool {
@@ -2015,6 +2028,7 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
     scrub_mq_auth_secrets(&mut sanitized);
     scrub_mq_token_signing_secret(&mut sanitized);
     scrub_nacos_auth_secrets(&mut sanitized);
+    scrub_feishu_access_token(&mut sanitized);
     let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
     tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
@@ -2076,7 +2090,13 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
     }
     persist_mq_auth_secrets_in_tx(tx, &config)?;
     persist_mq_token_signing_secret_in_tx(tx, &config)?;
-    persist_nacos_auth_secrets_in_tx(tx, &config)
+    persist_nacos_auth_secrets_in_tx(tx, &config)?;
+    persist_secret_in_tx(
+        tx,
+        &config.id,
+        FEISHU_ACCESS_TOKEN_KEY,
+        feishu_access_token(&config).as_deref().unwrap_or_default(),
+    )
 }
 
 impl Storage {
@@ -2100,6 +2120,7 @@ impl Storage {
                 sanitized.init_script = None;
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
+                scrub_nacos_auth_secrets(&mut sanitized);
                 scrub_feishu_access_token(&mut sanitized);
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
@@ -2128,71 +2149,7 @@ impl Storage {
             tx.execute("DELETE FROM connections", []).map_err(|e| e.to_string())?;
 
             for config in &configs {
-                let config = config.canonicalized();
-                let config_id = config.id.clone();
-                let mut sanitized = config.clone();
-                sanitized.password = String::new();
-                scrub_transport_layer_secrets(&mut sanitized);
-                sanitized.redis_sentinel_password = String::new();
-                sanitized.connection_string = None;
-                scrub_mq_auth_secrets(&mut sanitized);
-                scrub_mq_token_signing_secret(&mut sanitized);
-                scrub_feishu_access_token(&mut sanitized);
-                let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
-
-                tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
-                    .map_err(|e| e.to_string())?;
-
-                persist_secret_in_tx(&tx, &config.id, "password", &config.password)?;
-                delete_secret_prefix_in_tx(&tx, &config.id, TRANSPORT_LAYER_SECRET_PREFIX)?;
-                for (index, layer) in config.transport_layers.iter().enumerate() {
-                    match layer {
-                        TransportLayerConfig::Ssh(ssh) => {
-                            persist_secret_in_tx(
-                                &tx,
-                                &config.id,
-                                &transport_layer_ssh_password_key(index, layer),
-                                &ssh.password,
-                            )?;
-                            persist_secret_in_tx(
-                                &tx,
-                                &config.id,
-                                &transport_layer_ssh_key_passphrase_key(index, layer),
-                                &ssh.key_passphrase,
-                            )?;
-                        }
-                        TransportLayerConfig::Proxy(proxy) => {
-                            persist_secret_in_tx(
-                                &tx,
-                                &config.id,
-                                &transport_layer_proxy_password_key(index, layer),
-                                &proxy.password,
-                            )?;
-                        }
-                    }
-                }
-                persist_secret_in_tx(&tx, &config.id, "redis_sentinel_password", &config.redis_sentinel_password)?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_password", "")?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_key_passphrase", "")?;
-                persist_secret_in_tx(&tx, &config.id, "proxy_password", "")?;
-                delete_secret_prefix_in_tx(&tx, &config.id, SSH_TUNNEL_SECRET_PREFIX)?;
-                if let Some(cs) = &config.connection_string {
-                    persist_secret_in_tx(&tx, &config.id, "connection_string", cs)?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM connection_secrets WHERE connection_id = ?1 AND key = ?2",
-                        params![config.id, "connection_string"],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                persist_mq_auth_secrets_in_tx(&tx, &config)?;
-                persist_mq_token_signing_secret_in_tx(&tx, &config)?;
-                persist_secret_in_tx(
-                    &tx,
-                    &config.id,
-                    FEISHU_ACCESS_TOKEN_KEY,
-                    feishu_access_token(&config).as_deref().unwrap_or_default(),
-                )?;
+                persist_connection_in_tx(&tx, config)?;
             }
 
             if configs.is_empty() {
@@ -2331,6 +2288,7 @@ impl Storage {
             }
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();
             config.connection_string = self.get_secret(&id, "connection_string").await?;
+            config.init_script = self.get_secret(&id, "init_script").await?;
             let stored_feishu_token = self.get_secret(&id, FEISHU_ACCESS_TOKEN_KEY).await?;
             let mut needs_feishu_secret_rewrite = legacy_feishu_token.is_some();
             match (stored_feishu_token, legacy_feishu_token) {
@@ -2344,12 +2302,16 @@ impl Storage {
             }
             let needs_mq_auth_rewrite = self.hydrate_mq_auth_secrets(&id, &mut config).await?;
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
-            let needs_secret_rewrite =
-                needs_mq_auth_rewrite || needs_mq_token_signing_rewrite || needs_feishu_secret_rewrite;
+            let needs_nacos_auth_rewrite = self.hydrate_nacos_auth_secret(&id, &mut config).await?;
+            let needs_secret_rewrite = needs_mq_auth_rewrite
+                || needs_mq_token_signing_rewrite
+                || needs_nacos_auth_rewrite
+                || needs_feishu_secret_rewrite;
             if needs_secret_rewrite {
                 let mut sanitized = config.clone().canonicalized();
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
+                scrub_nacos_auth_secrets(&mut sanitized);
                 scrub_feishu_access_token(&mut sanitized);
                 let sanitized_json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
                 let update_id = id.clone();
@@ -3513,11 +3475,19 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{feishu_access_token, DesktopIconTheme, DesktopSettings, Storage};
-    use crate::connection_secrets::{
-        FEISHU_ACCESS_TOKEN_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY,
+    use super::{
+        feishu_access_token, maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings,
+        McpGlobalPolicy, McpGlobalPolicyState, Storage, MCP_GLOBAL_POLICY_KEY,
     };
-    use crate::models::connection::{ConnectionConfig, DatabaseType};
+    use crate::connection_secrets::{
+        FEISHU_ACCESS_TOKEN_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
+    };
+    use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
+    use crate::models::connection::{
+        ConnectionConfig, DatabaseConnectionInfo, DatabaseType, SshTunnelConfig, TransportLayerConfig,
+    };
+    use crate::saved_sql::SavedSqlFile;
+    use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {

@@ -39,18 +39,23 @@ import {
   reorderEntry as reorderEntryOp,
   buildConnectionGroupPathMap,
   type DropPosition,
-} from "@/lib/sidebarLayout";
-import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject, SqlCompletionTable } from "@/lib/sqlCompletion";
-import * as api from "@/lib/api";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { EXTERNAL_TABULAR_TYPES, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
-import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/databaseTree";
-import { buildSqlServerDatabaseTreeNodes, SQLSERVER_DEFAULT_SCHEMA } from "@/lib/sqlServerTree";
-import { findDatabaseTreeNode } from "@/lib/treeRefreshTarget";
-import { shouldMarkDisconnected } from "@/lib/connectionHealth";
-import { connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connectionAttemptTimeout";
-import { filterDatabaseNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
+} from "@/lib/sidebar/sidebarLayout";
+import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
+import { mergeSqlObjectNavigationType, sqlObjectNavigationTypeFromTableType } from "@/lib/sql/sqlNavigation";
+import * as api from "@/lib/backend/api";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
+import { connectionIsDorisFamilyCatalogCapable, isInternalDorisCatalog, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
+import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, compareSidebarNames, sortSidebarDatabases, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
+import { buildSqlServerDatabaseTreeNodes } from "@/lib/database/sqlServerTree";
+import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
+import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
+import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
+import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
+import { deleteTabResultSnapshotsForOwner } from "@/lib/tabs/tabResultCache";
+import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/database/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
   buildGroupedObjectTreeNodes,
@@ -850,8 +855,6 @@ export const useConnectionStore = defineStore("connection", () => {
       etcd: "etcd",
       zookeeper: "Apache ZooKeeper",
       duckdb: "DuckDB",
-      csvfile: "CSV",
-      xlsxfile: "XLSX",
       clickhouse: "ClickHouse",
       sqlserver: "SQL Server",
       mongodb: "MongoDB",
@@ -4149,23 +4152,6 @@ export const useConnectionStore = defineStore("connection", () => {
     await restoreExpandedChildren(node, expandedIds, { force: true });
   }
 
-  async function refreshExternalConnection(connectionId: string) {
-    const config = getConfig(connectionId);
-    if (!config || !EXTERNAL_TABULAR_TYPES.has(config.db_type)) return;
-
-    await ensureConnected(connectionId);
-    await api.refreshExternalConnection(connectionId);
-    clearConnectionError(connectionId);
-    invalidateCompletionCache(connectionId);
-    clearLoadedChildrenCache(connectionId);
-
-    const node = findNode(treeNodes.value, connectionId);
-    if (node) {
-      node.children = [];
-      await loadTreeNodeChildren(node, { force: true });
-    }
-  }
-
   async function refreshDatabaseTreeNode(connectionId: string, database: string) {
     const node = findDatabaseTreeNode(treeNodes.value, connectionId, database);
     if (node) {
@@ -5577,7 +5563,6 @@ export const useConnectionStore = defineStore("connection", () => {
     collapseAllTreeNodes,
     refreshSidebarObjectPagination,
     refreshTreeNode,
-    refreshExternalConnection,
     refreshDatabaseTreeNode,
     refreshObjectListTreeNode,
     connectedIds,

@@ -1,11 +1,11 @@
-import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, type ComputedRef, type Ref } from "vue";
-import * as api from "@/lib/api";
-import type { CellValue } from "@/lib/cellValue";
-import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
-import { applyDirtyRowsToResultRows } from "@/lib/dataGridResultRows";
-import { normalizeDataGridSaveError } from "@/lib/dataGridSql";
-import { rowStatusFilterAfterAddingRow, type RowStatusFilter } from "@/lib/gridRowStatus";
-import { supportsDataGridTransaction } from "@/lib/tableEditing";
+import { ref, computed, nextTick, watch, getCurrentInstance, onActivated, onBeforeUnmount, onDeactivated, onMounted, toRaw, type ComputedRef, type Ref } from "vue";
+import * as api from "@/lib/backend/api";
+import type { CellValue } from "@/lib/dataGrid/cellValue";
+import { coerceDataGridCellValue, dataGridCellEditorText } from "@/lib/dataGrid/dataGridCellCoercion";
+import { focusDataGridEditorWithoutScrolling, preserveDataGridScrollPosition } from "@/lib/dataGrid/dataGridEditorFocus";
+import { normalizeDataGridSaveError } from "@/lib/dataGrid/dataGridSql";
+import { rowStatusFilterAfterAddingRow, type RowStatusFilter } from "@/lib/dataGrid/gridRowStatus";
+import { supportsDataGridTransaction } from "@/lib/table/tableEditing";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useHistoryStore } from "@/stores/historyStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
@@ -1220,12 +1220,13 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         await finishInterruptedSaveChanges(snapshot);
         return;
       }
-      applyDirtyRowsToResultRows(result.value.rows, dirtyRows.value);
-      dirtyRows.value.clear();
-      newRows.value = [];
-      deletedRows.value.clear();
-      exitTransaction();
-      isSaving.value = false;
+      snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
+      customHandler.applySavedChanges?.({ dirtyRows: snapshot.dirtyRows, columns: result.value.columns });
+      applyDirtyRowsToResult(snapshot);
+      options.onResultPayloadMutated?.();
+      clearSavedPendingChanges(snapshot);
+      if (!hasPendingChanges.value) exitTransaction();
+      clearPendingChangeHistory();
       if (shouldReloadAfterSave) {
         reloadCurrentData();
       }
@@ -1316,12 +1317,12 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     } catch (e) {
       console.warn("[DBX] failed to record data grid history", e);
     }
-    applyDirtyRowsToResultRows(result.value.rows, dirtyRows.value);
-    dirtyRows.value.clear();
-    newRows.value = [];
-    deletedRows.value.clear();
-    exitTransaction();
-    isSaving.value = false;
+    applyDirtyRowsToResult(snapshot);
+    options.onResultPayloadMutated?.();
+    snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
+    clearSavedPendingChanges(snapshot);
+    if (!hasPendingChanges.value) exitTransaction();
+    clearPendingChangeHistory();
     if (shouldReloadAfterSave) {
       reloadCurrentData();
     }
