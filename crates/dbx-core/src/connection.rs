@@ -305,7 +305,11 @@ pub fn database_connection_config(config: &ConnectionConfig, database: Option<&s
     if let Some(db) = database {
         if !matches!(
             db_config.db_type,
-            DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::MongoDb | DatabaseType::OceanbaseOracle
+            DatabaseType::Oracle
+                | DatabaseType::Dameng
+                | DatabaseType::MongoDb
+                | DatabaseType::OceanbaseOracle
+                | DatabaseType::CloudflareD1
         ) && !db_config.db_type.is_external_tabular()
         {
             db_config.database = Some(db.to_string());
