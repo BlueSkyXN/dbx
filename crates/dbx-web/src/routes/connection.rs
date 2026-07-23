@@ -33,6 +33,20 @@ pub struct CloseDatabaseConnectionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConnectionIdentifierQuoteRequest {
+    pub connection_id: String,
+    pub database: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveConnectionDatabaseInfoRequest {
+    pub connection_id: String,
+    pub database_info: Option<DatabaseConnectionInfo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RefreshExternalRequest {
     pub connection_id: String,
 }
@@ -283,14 +297,19 @@ pub async fn refresh_external_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<RefreshExternalRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.refresh_external_pool(&body.connection_id).await.map(Json).map_err(AppError)
+    state.app.refresh_external_pool(&body.connection_id).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn append_external_rows(
     State(state): State<Arc<WebState>>,
     Json(body): Json<AppendExternalRowsRequest>,
 ) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
-    state.app.append_external_rows(&body.connection_id, &body.table_name, body.rows).await.map(Json).map_err(AppError)
+    state
+        .app
+        .append_external_rows(&body.connection_id, &body.table_name, body.rows)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
 }
 
 pub async fn update_external_rows(
@@ -302,7 +321,7 @@ pub async fn update_external_rows(
         .update_external_rows(&body.connection_id, &body.table_name, body.updates)
         .await
         .map(Json)
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn delete_external_rows(
@@ -314,7 +333,7 @@ pub async fn delete_external_rows(
         .delete_external_rows(&body.connection_id, &body.table_name, body.row_ids)
         .await
         .map(Json)
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn write_external_range(
@@ -326,7 +345,7 @@ pub async fn write_external_range(
         .write_external_range(&body.connection_id, &body.table_name, &body.range, body.rows)
         .await
         .map(Json)
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn save_connections(

@@ -311,8 +311,7 @@ mod tests {
     #[test]
     fn rejects_non_ascii_delimiter() {
         let path = temp_file("csv", "id,name\n1,Ada\n");
-        let mut config = CsvExternalConfig::default();
-        config.delimiter = '，';
+        let config = CsvExternalConfig { delimiter: '，', ..Default::default() };
         let source = CsvSource::new(path.clone(), config);
 
         let err = source.read_csv().unwrap_err();
@@ -324,8 +323,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_encoding_instead_of_ignoring_it() {
         let path = temp_file("csv", "id,name\n1,Ada\n");
-        let mut config = CsvExternalConfig::default();
-        config.encoding = Some("gbk".to_string());
+        let config = CsvExternalConfig { encoding: Some("gbk".to_string()), ..Default::default() };
         let source = CsvSource::new(path.clone(), config);
 
         let err = source.read_csv().unwrap_err();
