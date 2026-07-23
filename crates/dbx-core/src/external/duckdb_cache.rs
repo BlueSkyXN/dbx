@@ -32,7 +32,7 @@ fn load_snapshot_to_duckdb_as(
             format!(
                 "{} {}{}",
                 quote_identifier(&target_col.name),
-                &source_col.duckdb_type,
+                source_col.duckdb_type,
                 if source_col.is_nullable { "" } else { " NOT NULL" }
             )
         })

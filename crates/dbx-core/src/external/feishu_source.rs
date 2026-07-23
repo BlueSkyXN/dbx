@@ -210,7 +210,7 @@ impl FeishuSheetsSource {
             .sheets
             .into_iter()
             .filter(|sheet| sheet.resource_type.as_deref().unwrap_or("sheet") == "sheet")
-            .filter(|sheet| target_sheet.as_deref().map_or(true, |target| sheet.sheet_id == target))
+            .filter(|sheet| target_sheet.as_deref().is_none_or(|target| sheet.sheet_id == target))
             .collect::<Vec<_>>();
 
         if sheets.is_empty() {
@@ -301,7 +301,7 @@ impl ExternalTabularSource for FeishuSheetsSource {
             can_write: true,
             can_append: true,
             can_delete_rows: false,
-            supports_multiple_tables: self.config.sheet_id.as_ref().map_or(true, |value| value.trim().is_empty()),
+            supports_multiple_tables: self.config.sheet_id.as_ref().is_none_or(|value| value.trim().is_empty()),
             supports_refresh: true,
             supports_file_watch: false,
             supports_schema_detection: true,
@@ -428,7 +428,7 @@ impl FeishuBitableSource {
             tables.extend(
                 data.items
                     .into_iter()
-                    .filter(|table| target_table.as_deref().map_or(true, |target| table.table_id == target)),
+                    .filter(|table| target_table.as_deref().is_none_or(|target| table.table_id == target)),
             );
             if !data.has_more.unwrap_or(false) {
                 break;
@@ -467,7 +467,7 @@ impl FeishuBitableSource {
             }
             let data: BitableFieldsData = self.client.get_data(&path, &query).await?;
             fields.extend(data.items.into_iter().filter(|field| {
-                wanted.as_ref().map_or(true, |wanted| wanted.iter().any(|name| name == &field.field_name))
+                wanted.as_ref().is_none_or(|wanted| wanted.iter().any(|name| name == &field.field_name))
             }));
             if !data.has_more.unwrap_or(false) {
                 break;
@@ -560,7 +560,7 @@ impl ExternalTabularSource for FeishuBitableSource {
             can_write: true,
             can_append: true,
             can_delete_rows: true,
-            supports_multiple_tables: self.config.table_id.as_ref().map_or(true, |value| value.trim().is_empty()),
+            supports_multiple_tables: self.config.table_id.as_ref().is_none_or(|value| value.trim().is_empty()),
             supports_refresh: true,
             supports_file_watch: false,
             supports_schema_detection: true,

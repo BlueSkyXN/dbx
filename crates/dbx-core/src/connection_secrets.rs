@@ -800,6 +800,9 @@ mod tests {
         CONNECTION_STRING_KEY, FEISHU_ACCESS_TOKEN_KEY, MAIN_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
         MQ_TOKEN_SIGNING_KEY, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
     };
+    use crate::models::connection::{
+        ConnectionConfig, DatabaseType, HttpTunnelConfig, SshTunnelConfig, TransportLayerConfig,
+    };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::Path;
