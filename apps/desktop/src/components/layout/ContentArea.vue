@@ -218,11 +218,12 @@ const documentBrowserRef = ref<SearchableBrowserHandle>();
 const etcdKeyBrowserRef = ref<SearchableBrowserHandle>();
 const zookeeperKeyBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
-const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
 const queryResultEditable = computed(() => !!props.activeTab.queryAnalysis && isFeishuSheetsGridEditable(activeEffectiveDatabaseType.value) && activeEffectiveDatabaseType.value !== "feishu_bitable");
-const feishuBitableRecordIdColumn = computed(() => (activeEffectiveDatabaseType.value === "feishu_bitable" && props.activeTab.result ? externalRecordIdColumn(activeDataTabTableMeta.value?.primaryKeys, props.activeTab.result.columns) : undefined));
+const feishuBitableRecordIdColumn = computed(() =>
+  activeEffectiveDatabaseType.value === "feishu_bitable" && props.activeTab.result ? externalRecordIdColumn(activeDataTabTableMeta.value?.primaryKeys, props.activeTab.result.columns) : undefined,
+);
 const dataTabSourceColumns = computed(() => {
   const resultColumns = props.activeTab.result?.columns;
   if (!resultColumns || activeEffectiveDatabaseType.value !== "feishu_bitable") return undefined;
@@ -259,7 +260,9 @@ const externalTableSaveHandler = computed<CustomSaveHandler | undefined>(() => {
       tableMeta,
       resultColumns: result.columns,
     })
-  ) return undefined;
+  ) {
+    return undefined;
+  }
 
   return {
     async save(changes) {
@@ -279,8 +282,13 @@ const externalTableSaveHandler = computed<CustomSaveHandler | undefined>(() => {
         }
         if (Object.keys(fields).length > 0) updates.push({ rowId, fields });
       }
-      const rowIds = [...changes.deletedRows].map((rowIndex) => String(changes.rows[rowIndex]?.[recordIdIndex] ?? "").trim()).filter(Boolean);
-      const writableColumnIndexes = changes.columns.map((columnName, index) => ({ columnName, index })).filter(({ columnName }) => columnName !== recordIdColumn).map(({ index }) => index);
+      const rowIds = [...changes.deletedRows]
+        .map((rowIndex) => String(changes.rows[rowIndex]?.[recordIdIndex] ?? "").trim())
+        .filter(Boolean);
+      const writableColumnIndexes = changes.columns
+        .map((columnName, index) => ({ columnName, index }))
+        .filter(({ columnName }) => columnName !== recordIdColumn)
+        .map(({ index }) => index);
       const rowsToAppend = changes.newRows.map((row) => writableColumnIndexes.map((index) => row[index] ?? null) as CellValue[]);
       if (updates.length > 0) await api.updateExternalRows(connectionId, tableMeta.tableName, updates);
       if (rowIds.length > 0) await api.deleteExternalRows(connectionId, tableMeta.tableName, rowIds);

@@ -3,7 +3,7 @@ import { filterDatabaseNamesForVisiblePicker, normalizeVisibleDatabaseSelection 
 
 const DRAFT_VISIBLE_DATABASES_PREFIX = "__visible_draft_";
 
-const UNSUPPORTED_VISIBLE_DATABASE_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile", "feishu_sheets", "feishu_bitable", "elasticsearch", "qdrant", "milvus", "etcd"]);
+const UNSUPPORTED_VISIBLE_DATABASE_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile", "feishu_sheets", "feishu_bitable", "cloudflare-d1", "turso", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper"]);
 
 type VisibleDatabaseConnectionFields = Pick<
   ConnectionConfig,

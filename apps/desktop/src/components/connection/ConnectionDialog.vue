@@ -689,8 +689,22 @@ const driverProfiles: Record<
   duckdb: { type: "duckdb", port: 0, user: "", label: "DuckDB", icon: "duckdb" },
   csvfile: { type: "csvfile", port: 0, user: "", label: "CSV", icon: "csvfile" },
   xlsxfile: { type: "xlsxfile", port: 0, user: "", label: "XLSX", icon: "xlsxfile" },
-  feishu_sheets: { type: "feishu_sheets", port: 0, user: "", label: "Feishu Sheets", icon: "feishu_sheets", host: "https://open.feishu.cn" },
-  feishu_bitable: { type: "feishu_bitable", port: 0, user: "", label: "Feishu Bitable", icon: "feishu_bitable", host: "https://open.feishu.cn" },
+  feishu_sheets: {
+    type: "feishu_sheets",
+    port: 0,
+    user: "",
+    label: "Feishu Sheets",
+    icon: "feishu_sheets",
+    host: "https://open.feishu.cn",
+  },
+  feishu_bitable: {
+    type: "feishu_bitable",
+    port: 0,
+    user: "",
+    label: "Feishu Bitable",
+    icon: "feishu_bitable",
+    host: "https://open.feishu.cn",
+  },
   access: { type: "access", port: 0, user: "", label: "Microsoft Access", icon: "access" },
   mongodb: { type: "mongodb", port: 27017, user: "", label: "MongoDB", icon: "mongodb" },
   "mongodb-legacy": { type: "mongodb", port: 27017, user: "", label: "MongoDB (Legacy)", icon: "mongodb" },
@@ -2349,17 +2363,49 @@ function externalConfigNumber(key: string, fallback: number) {
 function ensureExternalConfigDefaults(dbType = form.value.db_type) {
   const existing = externalConfigRecord(form.value.external_config);
   if (dbType === "csvfile") {
-    form.value.external_config = { ...existing, delimiter: typeof existing.delimiter === "string" ? existing.delimiter : ",", has_header: existing.has_header !== false };
+    form.value.external_config = {
+      ...existing,
+      delimiter: typeof existing.delimiter === "string" ? existing.delimiter : ",",
+      has_header: existing.has_header !== false,
+    };
   } else if (dbType === "xlsxfile") {
-    form.value.external_config = { ...existing, sheet_name: typeof existing.sheet_name === "string" ? existing.sheet_name : "", has_header: existing.has_header !== false };
+    form.value.external_config = {
+      ...existing,
+      sheet_name: typeof existing.sheet_name === "string" ? existing.sheet_name : "",
+      has_header: existing.has_header !== false,
+    };
   } else if (dbType === "feishu_sheets") {
-    form.value.external_config = { ...existing, access_token: typeof existing.access_token === "string" ? existing.access_token : "", spreadsheet_token: typeof existing.spreadsheet_token === "string" ? existing.spreadsheet_token : "", sheet_id: typeof existing.sheet_id === "string" ? existing.sheet_id : "", range: typeof existing.range === "string" ? existing.range : "", has_header: existing.has_header !== false, max_rows: typeof existing.max_rows === "number" ? existing.max_rows : 1000, max_columns: typeof existing.max_columns === "number" ? existing.max_columns : 100, sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot" };
+    form.value.external_config = {
+      ...existing,
+      access_token: typeof existing.access_token === "string" ? existing.access_token : "",
+      spreadsheet_token: typeof existing.spreadsheet_token === "string" ? existing.spreadsheet_token : "",
+      sheet_id: typeof existing.sheet_id === "string" ? existing.sheet_id : "",
+      range: typeof existing.range === "string" ? existing.range : "",
+      has_header: existing.has_header !== false,
+      max_rows: typeof existing.max_rows === "number" ? existing.max_rows : 1000,
+      max_columns: typeof existing.max_columns === "number" ? existing.max_columns : 100,
+      sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
+    };
   } else if (dbType === "feishu_bitable") {
-    form.value.external_config = { ...existing, access_token: typeof existing.access_token === "string" ? existing.access_token : "", app_token: typeof existing.app_token === "string" ? existing.app_token : "", table_id: typeof existing.table_id === "string" ? existing.table_id : "", view_id: typeof existing.view_id === "string" ? existing.view_id : "", field_names: Array.isArray(existing.field_names) ? existing.field_names : [], page_size: typeof existing.page_size === "number" ? existing.page_size : 500, max_records: typeof existing.max_records === "number" ? existing.max_records : 5000, automatic_fields: existing.automatic_fields === true, sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot" };
+    form.value.external_config = {
+      ...existing,
+      access_token: typeof existing.access_token === "string" ? existing.access_token : "",
+      app_token: typeof existing.app_token === "string" ? existing.app_token : "",
+      table_id: typeof existing.table_id === "string" ? existing.table_id : "",
+      view_id: typeof existing.view_id === "string" ? existing.view_id : "",
+      field_names: Array.isArray(existing.field_names) ? existing.field_names : [],
+      page_size: typeof existing.page_size === "number" ? existing.page_size : 500,
+      max_records: typeof existing.max_records === "number" ? existing.max_records : 5000,
+      automatic_fields: existing.automatic_fields === true,
+      sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
+    };
   }
 }
 const csvDelimiter = externalConfigString("delimiter", ",");
-const externalHasHeader = computed({ get: () => externalConfigRecord(form.value.external_config).has_header !== false, set: (value: boolean) => setExternalConfigValue("has_header", value) });
+const externalHasHeader = computed({
+  get: () => externalConfigRecord(form.value.external_config).has_header !== false,
+  set: (value: boolean) => setExternalConfigValue("has_header", value),
+});
 const xlsxSheetName = externalConfigString("sheet_name");
 const feishuAccessToken = externalConfigString("access_token");
 const feishuSpreadsheetToken = externalConfigString("spreadsheet_token");
@@ -2368,13 +2414,22 @@ const feishuRange = externalConfigString("range");
 const feishuBitableAppToken = externalConfigString("app_token");
 const feishuBitableTableId = externalConfigString("table_id");
 const feishuBitableViewId = externalConfigString("view_id");
-const feishuBitableFieldNames = computed({ get: () => { const value = externalConfigRecord(form.value.external_config).field_names; return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").join(", ") : ""; }, set: (value: string) => setExternalConfigValue("field_names", value.split(",").map((item) => item.trim()).filter(Boolean)) });
+const feishuBitableFieldNames = computed({
+  get: () => {
+    const value = externalConfigRecord(form.value.external_config).field_names;
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string").join(", ") : "";
+  },
+  set: (value: string) => setExternalConfigValue("field_names", value.split(",").map((item) => item.trim()).filter(Boolean)),
+});
 const feishuMaxRows = externalConfigNumber("max_rows", 1000);
 const feishuMaxColumns = externalConfigNumber("max_columns", 100);
 const feishuSyncMode = externalConfigString("sync_mode", "snapshot");
 const feishuBitablePageSize = externalConfigNumber("page_size", 500);
 const feishuBitableMaxRecords = externalConfigNumber("max_records", 5000);
-const feishuBitableAutomaticFields = computed({ get: () => externalConfigRecord(form.value.external_config).automatic_fields === true, set: (value: boolean) => setExternalConfigValue("automatic_fields", value) });
+const feishuBitableAutomaticFields = computed({
+  get: () => externalConfigRecord(form.value.external_config).automatic_fields === true,
+  set: (value: boolean) => setExternalConfigValue("automatic_fields", value),
+});
 const sqliteExtensionPaths = computed({
   get: () => sqliteExtensionPathsFromParams(form.value.url_params),
   set: (value: string) => {
@@ -2994,7 +3049,11 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.url_params = "";
   } else if (config.db_type === "csvfile") {
     const existing = externalConfigRecord(config.external_config);
-    config.external_config = { ...existing, delimiter: typeof existing.delimiter === "string" ? existing.delimiter : ",", has_header: existing.has_header !== false };
+    config.external_config = {
+      ...existing,
+      delimiter: typeof existing.delimiter === "string" ? existing.delimiter : ",",
+      has_header: existing.has_header !== false,
+    };
     config.host = config.host?.trim() || "";
     config.port = 0;
     config.username = "";
@@ -3004,7 +3063,11 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
     config.transport_layers = [];
   } else if (config.db_type === "xlsxfile") {
     const existing = externalConfigRecord(config.external_config);
-    config.external_config = { ...existing, sheet_name: typeof existing.sheet_name === "string" ? existing.sheet_name.trim() : "", has_header: existing.has_header !== false };
+    config.external_config = {
+      ...existing,
+      sheet_name: typeof existing.sheet_name === "string" ? existing.sheet_name.trim() : "",
+      has_header: existing.has_header !== false,
+    };
     config.host = config.host?.trim() || "";
     config.port = 0;
     config.username = "";
@@ -3041,7 +3104,9 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       app_token: typeof existing.app_token === "string" ? existing.app_token.trim() : "",
       table_id: typeof existing.table_id === "string" ? existing.table_id.trim() : "",
       view_id: typeof existing.view_id === "string" ? existing.view_id.trim() : "",
-      field_names: Array.isArray(existing.field_names) ? existing.field_names.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim()) : [],
+      field_names: Array.isArray(existing.field_names)
+        ? existing.field_names.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+        : [],
       page_size: Number.isFinite(Number(existing.page_size)) ? Number(existing.page_size) : 500,
       max_records: Number.isFinite(Number(existing.max_records)) ? Number(existing.max_records) : 5000,
       automatic_fields: existing.automatic_fields === true,
@@ -4282,7 +4347,18 @@ async function browseKafkaKerberosFile(target: "keytab" | "krb5") {
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "csvfile" ? [{ name: "CSV", extensions: ["csv", "tsv"] }] : form.value.db_type === "xlsxfile" ? [{ name: "Excel Workbook", extensions: ["xlsx", "xlsm", "xls"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : undefined;
+    const filters =
+      form.value.db_type === "duckdb"
+        ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
+        : form.value.db_type === "csvfile"
+          ? [{ name: "CSV", extensions: ["csv", "tsv"] }]
+          : form.value.db_type === "xlsxfile"
+            ? [{ name: "Excel Workbook", extensions: ["xlsx", "xlsm", "xls"] }]
+            : form.value.db_type === "access"
+              ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
+              : form.value.db_type === "h2"
+                ? [{ name: "H2", extensions: ["db"] }]
+                : undefined;
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -4962,21 +5038,75 @@ function openExternalUrl(url: string) {
                     <PasswordInput v-model="feishuAccessToken" class="col-span-3" />
                   </div>
                   <template v-if="form.db_type === 'feishu_sheets'">
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Spreadsheet Token</Label><Input v-model="feishuSpreadsheetToken" class="col-span-3" placeholder="shtcn..." /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Sheet ID</Label><Input v-model="feishuSheetId" class="col-span-3" placeholder="Optional" /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Range</Label><Input v-model="feishuRange" class="col-span-3" placeholder="A1:Z1000 or sheetId!A1:Z1000" /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><span /><label class="col-span-3 flex cursor-pointer items-center gap-2"><Switch v-model="externalHasHeader" /><span class="text-xs text-muted-foreground">{{ t("connection.firstRowHeader") }}</span></label></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Limit</Label><div class="col-span-3 grid grid-cols-2 gap-2"><Input v-model.number="feishuMaxRows" type="number" min="1" placeholder="Rows" /><Input v-model.number="feishuMaxColumns" type="number" min="1" max="100" placeholder="Columns" /></div></div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Spreadsheet Token</Label>
+                      <Input v-model="feishuSpreadsheetToken" class="col-span-3" placeholder="shtcn..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Sheet ID</Label>
+                      <Input v-model="feishuSheetId" class="col-span-3" placeholder="Optional" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Range</Label>
+                      <Input v-model="feishuRange" class="col-span-3" placeholder="A1:Z1000 or sheetId!A1:Z1000" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex cursor-pointer items-center gap-2">
+                        <Switch v-model="externalHasHeader" />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.firstRowHeader") }}</span>
+                      </label>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Limit</Label>
+                      <div class="col-span-3 grid grid-cols-2 gap-2">
+                        <Input v-model.number="feishuMaxRows" type="number" min="1" placeholder="Rows" />
+                        <Input v-model.number="feishuMaxColumns" type="number" min="1" max="100" placeholder="Columns" />
+                      </div>
+                    </div>
                   </template>
                   <template v-else>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">App Token</Label><Input v-model="feishuBitableAppToken" class="col-span-3" placeholder="app..." /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Table ID</Label><Input v-model="feishuBitableTableId" class="col-span-3" placeholder="tbl..." /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">View ID</Label><Input v-model="feishuBitableViewId" class="col-span-3" placeholder="Optional" /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Fields</Label><Input v-model="feishuBitableFieldNames" class="col-span-3" placeholder="Name, Amount" /></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Limit</Label><div class="col-span-3 grid grid-cols-2 gap-2"><Input v-model.number="feishuBitablePageSize" type="number" min="1" max="500" placeholder="Page" /><Input v-model.number="feishuBitableMaxRecords" type="number" min="1" placeholder="Records" /></div></div>
-                    <div class="grid grid-cols-4 items-center gap-4"><span /><label class="col-span-3 flex cursor-pointer items-center gap-2"><Switch v-model="feishuBitableAutomaticFields" /><span class="text-xs text-muted-foreground">Return automatic fields</span></label></div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">App Token</Label>
+                      <Input v-model="feishuBitableAppToken" class="col-span-3" placeholder="app..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Table ID</Label>
+                      <Input v-model="feishuBitableTableId" class="col-span-3" placeholder="tbl..." />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">View ID</Label>
+                      <Input v-model="feishuBitableViewId" class="col-span-3" placeholder="Optional" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Fields</Label>
+                      <Input v-model="feishuBitableFieldNames" class="col-span-3" placeholder="Name, Amount" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">Limit</Label>
+                      <div class="col-span-3 grid grid-cols-2 gap-2">
+                        <Input v-model.number="feishuBitablePageSize" type="number" min="1" max="500" placeholder="Page" />
+                        <Input v-model.number="feishuBitableMaxRecords" type="number" min="1" placeholder="Records" />
+                      </div>
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <span />
+                      <label class="col-span-3 flex cursor-pointer items-center gap-2">
+                        <Switch v-model="feishuBitableAutomaticFields" />
+                        <span class="text-xs text-muted-foreground">Return automatic fields</span>
+                      </label>
+                    </div>
                   </template>
-                  <div class="grid grid-cols-4 items-center gap-4"><Label :class="connectionLabelClass">Sync</Label><Select v-model="feishuSyncMode"><SelectTrigger class="col-span-3 h-9"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="snapshot">Snapshot / manual refresh</SelectItem><SelectItem value="realtime">Refresh before SELECT</SelectItem></SelectContent></Select></div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">Sync</Label>
+                    <Select v-model="feishuSyncMode">
+                      <SelectTrigger class="col-span-3 h-9"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="snapshot">Snapshot / manual refresh</SelectItem>
+                        <SelectItem value="realtime">Refresh before SELECT</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </template>
 
                 <!-- Message Queue: admin URL and auth -->

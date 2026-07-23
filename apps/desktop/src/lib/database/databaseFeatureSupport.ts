@@ -1,7 +1,7 @@
 import type { ConnectionConfig, DatabaseType, TreeNodeType } from "@/types/database";
 import { supportsDatabaseFeature } from "@/lib/database/databaseDriverManifest";
 import { canEditTableStructure } from "@/lib/table/tableStructureCapabilities";
-import { CLEARABLE_QUERY_SCHEMA_TYPES, DATABASE_OBJECT_TREE_TYPES, DATABASE_SCHEMA_QUALIFIED_TYPES, FETCH_FIRST_TYPES, PG_LIKE_STRUCTURE_TYPES, SCHEMA_AWARE_TYPES, SINGLE_DATABASE_TYPES, TREE_SCHEMA_TYPES } from "@/lib/database/databaseCapabilitySets";
+import { DATABASE_OBJECT_TREE_TYPES, DATABASE_SCHEMA_QUALIFIED_TYPES, FETCH_FIRST_TYPES, PG_LIKE_STRUCTURE_TYPES, SCHEMA_AWARE_TYPES, SINGLE_DATABASE_TYPES, TREE_SCHEMA_TYPES } from "@/lib/database/databaseCapabilitySets";
 
 export function isSchemaAware(dbType?: DatabaseType): boolean {
   return !!dbType && SCHEMA_AWARE_TYPES.has(dbType);
@@ -70,7 +70,7 @@ export function isSingleDatabase(dbType?: DatabaseType): boolean {
 }
 
 export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
-  return !!dbType && CLEARABLE_QUERY_SCHEMA_TYPES.has(dbType);
+  return dbType === "oracle" || dbType === "dameng" || dbType === "gaussdb" || dbType === "oceanbase-oracle";
 }
 
 export function usesFetchFirst(dbType?: DatabaseType): boolean {
