@@ -192,6 +192,11 @@ jobs:
       - name: Build Tauri app
         shell: bash
         run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export PATH="/c/Strawberry/perl/bin:$PATH"
+            perl -MLocale::Maketext::Simple -e 'print "Strawberry Perl ready"'
+          fi
+
           build_args=(--ci --no-sign --target "${{ matrix.rust-target }}")
 
           if [[ "${{ github.event_name }}" != "workflow_dispatch" || "${{ inputs.updater_artifacts }}" != "true" ]]; then
