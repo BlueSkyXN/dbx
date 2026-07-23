@@ -3,7 +3,8 @@ use tauri::State;
 
 use crate::commands::connection::{ensure_connection_writable, AppState};
 use dbx_core::db::redis_driver::{
-    RedisCommandResult, RedisCommandSafety, RedisDatabaseInfo, RedisScanResult, RedisValue,
+    classify_command, parse_command_argv, RedisCollectionPage, RedisCommandResult, RedisCommandSafety,
+    RedisDatabaseInfo, RedisScanResult, RedisValue,
 };
 
 #[tauri::command]
@@ -35,9 +36,19 @@ pub async fn redis_scan_keys_batch(
     pattern: String,
     count: usize,
     max_iterations: usize,
+    include_types: Option<bool>,
 ) -> Result<RedisScanResult, String> {
-    dbx_core::redis_ops::redis_scan_keys_batch_core(&state, &connection_id, db, cursor, &pattern, count, max_iterations)
-        .await
+    dbx_core::redis_ops::redis_scan_keys_batch_core(
+        &state,
+        &connection_id,
+        db,
+        cursor,
+        &pattern,
+        count,
+        max_iterations,
+        include_types.unwrap_or(true),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -285,10 +296,12 @@ pub async fn redis_execute_command(
     command: String,
     skip_safety_check: Option<bool>,
 ) -> Result<RedisCommandResult, String> {
+    let argv = parse_command_argv(&command).map_err(|error| format!("Invalid Redis command: {error}"))?;
+    let cmd_name = argv[0].to_ascii_uppercase();
+    let safety = classify_command(&cmd_name);
     // In read-only mode, only allow safe read commands through the raw command interface
     if let Some(name) = dbx_core::query::connection_readonly_name(&state, &connection_id).await {
-        let cmd_name = command.split_whitespace().next().unwrap_or("");
-        if dbx_core::db::redis_driver::classify_command(cmd_name) != RedisCommandSafety::Allowed {
+        if safety != RedisCommandSafety::Allowed {
             return Err(format!(
                 "Read-only mode: connection '{}' has read-only protection enabled. Command '{}' blocked.",
                 name, cmd_name
@@ -314,9 +327,19 @@ pub async fn redis_load_more(
     key_type: String,
     cursor: u64,
     count: usize,
-) -> Result<RedisValue, String> {
-    dbx_core::redis_ops::redis_load_more_in_db_core(&state, &connection_id, db, &key_raw, &key_type, cursor, count)
-        .await
+    filter: Option<String>,
+) -> Result<RedisCollectionPage, String> {
+    dbx_core::redis_ops::redis_load_more_in_db_core(
+        &state,
+        &connection_id,
+        db,
+        &key_raw,
+        &key_type,
+        cursor,
+        count,
+        filter.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -329,4 +352,23 @@ pub async fn redis_pubsub_publish(
 ) -> Result<u64, String> {
     ensure_connection_writable(&state, &connection_id, "PUBLISH").await?;
     dbx_core::redis_ops::redis_publish_core(&state, &connection_id, db, &channel, &message).await
+}
+
+#[tauri::command]
+pub async fn redis_slowlog_get(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    count: usize,
+    node_host: Option<String>,
+    node_port: Option<u16>,
+) -> Result<Vec<dbx_core::db::redis_driver::RedisSlowlogEntry>, String> {
+    dbx_core::redis_ops::redis_slowlog_get_core(&state, &connection_id, count, node_host, node_port).await
+}
+
+#[tauri::command]
+pub async fn redis_cluster_master_nodes(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<Vec<dbx_core::db::redis_driver::RedisNodeEndpoint>, String> {
+    dbx_core::redis_ops::redis_cluster_master_nodes_core(&state, &connection_id).await
 }

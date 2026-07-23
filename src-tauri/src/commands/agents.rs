@@ -4,12 +4,14 @@ use tauri::{Emitter, State};
 
 use dbx_core::agent_manager::{AgentDriverInfo, DriverStoreUsage, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
 use dbx_core::agent_service::{
-    build_agent_list, fetch_registry, import_agent_jar, import_agents_from_zip as import_agents_from_zip_core,
-    install_agent_driver, invalidate_registry_cache, reinstall_agent_jre, uninstall_agent_driver, uninstall_agent_jre,
-    upgrade_all_agent_drivers, AgentProgressEvent, UpgradeAllAgentDriversResult,
+    build_agent_list, clear_agent_download_cache, fetch_registry_from, import_agent_driver,
+    import_agents_from_zip as import_agents_from_zip_core, inspect_offline_zip, install_agent_driver_from,
+    invalidate_registry_cache, reinstall_agent_jre_from, uninstall_agent_driver, uninstall_agent_jre,
+    upgrade_all_agent_drivers_from, AgentProgressEvent, OfflineImportPlan, UpgradeAllAgentDriversResult,
 };
 use dbx_core::connection::AppState;
 use dbx_core::driver_runtime::DriverRuntimeSummary;
+use dbx_core::DownloadSource;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentUpdateBlocker {
@@ -23,14 +25,27 @@ pub async fn list_installed_agents_local(state: State<'_, Arc<AppState>>) -> Res
 }
 
 #[tauri::command]
-pub async fn list_installed_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<AgentDriverInfo>, String> {
-    let registry = fetch_registry().await.ok();
+pub async fn list_installed_agents(
+    state: State<'_, Arc<AppState>>,
+    source: Option<DownloadSource>,
+) -> Result<Vec<AgentDriverInfo>, String> {
+    let registry = fetch_registry_from(source.unwrap_or_default()).await.ok();
     Ok(build_agent_list(&state.agent_manager, registry.as_ref()))
+}
+
+#[tauri::command]
+pub async fn is_agent_installed(state: State<'_, Arc<AppState>>, db_type: String) -> Result<bool, String> {
+    Ok(state.agent_manager.is_driver_installed(&db_type))
 }
 
 #[tauri::command]
 pub async fn get_driver_store_usage(state: State<'_, Arc<AppState>>) -> Result<DriverStoreUsage, String> {
     Ok(state.agent_manager.collect_driver_store_usage(state.plugins.root_dir()))
+}
+
+#[tauri::command]
+pub async fn clear_driver_download_cache(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    clear_agent_download_cache(&state.agent_manager)
 }
 
 #[tauri::command]
@@ -53,24 +68,31 @@ pub async fn install_agent(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     db_type: String,
+    source: Option<DownloadSource>,
 ) -> Result<(), String> {
     ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
     let app_handle = app.clone();
-    install_agent_driver(&state.agent_manager, &db_type, move |event| emit_agent_progress(&app_handle, event)).await
+    install_agent_driver_from(&state.agent_manager, &db_type, source.unwrap_or_default(), move |event| {
+        emit_agent_progress(&app_handle, event)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn upgrade_all_agents(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
+    source: Option<DownloadSource>,
 ) -> Result<UpgradeAllAgentDriversResult, String> {
-    let registry = fetch_registry().await?;
+    let source = source.unwrap_or_default();
+    let registry = fetch_registry_from(source).await?;
     let agents = build_agent_list(&state.agent_manager, Some(&registry));
     let updatable: Vec<String> =
         agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
     ensure_no_agent_update_blockers(state.inner().as_ref(), &updatable).await?;
     let app_handle = app.clone();
-    upgrade_all_agent_drivers(&state.agent_manager, move |event| emit_agent_progress(&app_handle, event)).await
+    upgrade_all_agent_drivers_from(&state.agent_manager, source, move |event| emit_agent_progress(&app_handle, event))
+        .await
 }
 
 #[tauri::command]
@@ -140,6 +162,8 @@ pub async fn import_agents_from_zip(
 ) -> Result<u32, String> {
     let am = &state.agent_manager;
     let zip_path = std::path::PathBuf::from(&path);
+    let plan = inspect_offline_zip(&zip_path)?;
+    ensure_no_offline_import_blockers(state.inner().as_ref(), &plan).await?;
     let app_handle = app.clone();
     let result = import_agents_from_zip_core(am, &zip_path, |event| emit_agent_progress(&app_handle, event))?;
     let count = result.drivers_installed.len() as u32;
@@ -148,12 +172,23 @@ pub async fn import_agents_from_zip(
 }
 
 #[tauri::command]
+pub async fn import_agent_driver_cmd(
+    state: State<'_, Arc<AppState>>,
+    db_type: String,
+    path: String,
+) -> Result<(), String> {
+    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+}
+
+#[tauri::command]
 pub async fn import_agent_jar_cmd(
     state: State<'_, Arc<AppState>>,
     db_type: String,
     path: String,
 ) -> Result<(), String> {
-    import_agent_jar(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
 }
 
 #[tauri::command]
@@ -161,10 +196,14 @@ pub async fn reinstall_jre(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     jre_key: Option<String>,
+    source: Option<DownloadSource>,
 ) -> Result<(), String> {
     let key = jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY);
     let app_handle = app.clone();
-    reinstall_agent_jre(&state.agent_manager, key, move |event| emit_agent_progress(&app_handle, event)).await
+    reinstall_agent_jre_from(&state.agent_manager, key, source.unwrap_or_default(), move |event| {
+        emit_agent_progress(&app_handle, event)
+    })
+    .await
 }
 
 fn emit_agent_progress(app: &tauri::AppHandle, event: AgentProgressEvent) {
@@ -172,7 +211,7 @@ fn emit_agent_progress(app: &tauri::AppHandle, event: AgentProgressEvent) {
 }
 
 async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) -> Result<(), String> {
-    let blockers = agent_update_blockers(state, db_types).await;
+    let blockers = update_blockers_from_keys(state.prepare_agent_driver_updates(db_types).await, db_types);
     if blockers.is_empty() {
         return Ok(());
     }
@@ -180,12 +219,31 @@ async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) 
     Err(format!("请先关闭以下数据库连接后再更新驱动: {labels}"))
 }
 
+async fn ensure_no_offline_import_blockers(state: &AppState, plan: &OfflineImportPlan) -> Result<(), String> {
+    let mut driver_keys = plan.driver_keys.clone();
+    if plan.includes_jre {
+        // Replacing a managed JRE affects every running Java Agent, so include
+        // all active runtimes in the same connection-aware update preflight.
+        driver_keys.extend(state.agent_manager.active_daemon_keys().await);
+        driver_keys.extend(state.active_agent_connection_driver_keys().await);
+        driver_keys.sort();
+        driver_keys.dedup();
+    }
+    ensure_no_agent_update_blockers(state, &driver_keys).await
+}
+
 async fn agent_update_blockers(state: &AppState, db_types: &[String]) -> Vec<AgentUpdateBlocker> {
+    update_blockers_from_keys(state.active_agent_connection_driver_keys().await, db_types)
+}
+
+fn update_blockers_from_keys(
+    active_keys: std::collections::HashSet<String>,
+    db_types: &[String],
+) -> Vec<AgentUpdateBlocker> {
     let candidate_keys: std::collections::HashSet<&str> = db_types.iter().map(String::as_str).collect();
     if candidate_keys.is_empty() {
         return Vec::new();
     }
-    let active_keys = state.active_agent_driver_keys().await;
     let mut blockers = active_keys
         .into_iter()
         .filter(|key| candidate_keys.contains(key.as_str()))

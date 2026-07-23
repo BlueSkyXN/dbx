@@ -1,15 +1,17 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onBeforeUnmount, h } from "vue";
+import { computed, ref, onMounted, onBeforeUnmount, h, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown } from "@lucide/vue";
+import { invoke } from "@tauri-apps/api/core";
+import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
-import { shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { AppThemeMode } from "@/lib/appTheme";
+import { isSystemAppThemeMode, type AppThemeMode } from "@/lib/app/appTheme";
 
 const GithubIcon = {
   render() {
@@ -27,7 +29,9 @@ const props = defineProps<{
   showAiPanel: boolean;
   showHistory: boolean;
   showSqlLibrary: boolean;
+  showSqlFilePanel: boolean;
   showDriverStore: boolean;
+  showSettingsPage: boolean;
   checkingUpdates: boolean;
   hasUpdateAvailable: boolean;
   agentDriverUpdateCount: number;
@@ -42,6 +46,7 @@ const emit = defineEmits<{
   "toggle-ai": [];
   "toggle-history": [];
   "toggle-sql-library": [];
+  "toggle-sql-file-panel": [];
   "open-github": [];
   "open-settings": [];
   "open-driver-store": [];
@@ -53,19 +58,35 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
+const checkingUpdates = computed(() => props.checkingUpdates);
 
-const themeItems = computed(() => [
-  { value: "light", label: t("toolbar.themeLight"), icon: Sun },
-  { value: "dark", label: t("toolbar.themeDark"), icon: Moon },
-  { value: "system", label: t("toolbar.themeSystem"), icon: SunMoon },
-]);
 const themeTriggerIcon = computed(() => {
-  if (props.themeMode === "system") return SunMoon;
+  if (isSystemAppThemeMode(props.themeMode)) return SunMoon;
   return props.isDark ? Moon : Sun;
 });
+
+const themeCycle: AppThemeMode[] = ["light", "dark", "system"];
+
+function nextThemeMode(mode: AppThemeMode): AppThemeMode {
+  const index = themeCycle.indexOf(mode);
+  return themeCycle[(index + 1) % themeCycle.length] ?? themeCycle[0];
+}
+
+function themeModeLabel(mode: AppThemeMode): string {
+  if (mode === "light") return t("toolbar.themeLight");
+  if (mode === "dark") return t("toolbar.themeDark");
+  return t("toolbar.themeSystem");
+}
+
+function cycleThemeMode() {
+  const next = nextThemeMode(props.themeMode);
+  emit("set-theme-mode", next);
+  toast(`${t("toolbar.theme")}: ${themeModeLabel(next)}`, 1600);
+}
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isDesktop) return;
@@ -75,7 +96,9 @@ function onToolbarDblClick(e: MouseEvent) {
 }
 
 const toolbarEl = ref<HTMLElement>();
+const newConnectionLabelEl = ref<HTMLElement>();
 const toolbarCollapsed = ref(false);
+const shouldReserveTrafficLightInset = computed(() => shouldReserveMacTrafficLightInset(isMac, isFullscreen.value, isDesktop));
 
 function checkToolbarWidth() {
   const el = toolbarEl.value;
@@ -89,7 +112,19 @@ function checkToolbarWidth() {
 
 const rightWrapper = ref<HTMLElement>();
 const rightOverflowCount = ref(0);
-let prevRightAvailable = 0;
+let toolbarLayoutRaf = 0;
+let trafficLightSyncRaf = 0;
+let settlingRightOverflow = false;
+let pendingRightOverflowSettle = false;
+const measuredTrafficLightInset = ref<number | null>(null);
+
+type MacosTrafficLightLayout = {
+  x: number;
+  y: number;
+  center_y: number;
+  previous_center_y: number;
+  reserved_inset: number;
+};
 
 /** Ordered list of right-side item keys that can overflow into "More".
  *  Items earlier in the list overflow first when space shrinks. */
@@ -127,6 +162,15 @@ const collapsibleRightItemDefs = computed(() => {
       disabled: false,
     });
   }
+  if (toolbarItems.value.sqlFileTree) {
+    items.push({
+      key: "sqlFileTree",
+      label: t("sqlFileTree.title"),
+      icon: FolderTree,
+      action: () => emit("toggle-sql-file-panel"),
+      disabled: false,
+    });
+  }
   if (toolbarItems.value.history) {
     items.push({
       key: "history",
@@ -149,8 +193,8 @@ const collapsibleRightItemDefs = computed(() => {
     items.push({
       key: "theme",
       label: t("toolbar.theme"),
-      icon: SunMoon,
-      action: () => {},
+      icon: themeTriggerIcon.value,
+      action: cycleThemeMode,
       disabled: false,
     });
   }
@@ -184,45 +228,130 @@ const overflowRightMenuItems = computed(() => {
   }));
 });
 
-function checkRightOverflow() {
+async function settleRightOverflowOnce() {
   const wrapper = rightWrapper.value;
   if (!wrapper) return;
 
-  const available = wrapper.clientWidth;
-  const growing = available > prevRightAvailable + 1;
-  prevRightAvailable = available;
+  const defsLength = collapsibleRightItemDefs.value.length;
+  if (rightOverflowCount.value > defsLength) {
+    rightOverflowCount.value = defsLength;
+    await nextTick();
+  }
 
-  if (wrapper.scrollWidth > wrapper.clientWidth) {
-    // Overflow — move one more item to "More" (always, even when growing
-    // brought an item back that still doesn't fit)
-    if (rightOverflowCount.value < collapsibleRightItemDefs.value.length) {
+  for (let i = 0; i <= defsLength + 1; i++) {
+    const current = rightWrapper.value;
+    if (!current) return;
+
+    if (current.scrollWidth > current.clientWidth + 1 && rightOverflowCount.value < defsLength) {
       rightOverflowCount.value++;
+      await nextTick();
+      continue;
     }
-  } else if (growing && rightOverflowCount.value > 0) {
-    // Window growing — try bringing one item back
+
+    if (rightOverflowCount.value <= 0) return;
+
     rightOverflowCount.value--;
+    await nextTick();
+
+    const restored = rightWrapper.value;
+    if (restored && restored.scrollWidth <= restored.clientWidth + 1) {
+      continue;
+    }
+
+    rightOverflowCount.value++;
+    await nextTick();
+    return;
   }
 }
+
+async function settleRightOverflow() {
+  if (settlingRightOverflow) {
+    pendingRightOverflowSettle = true;
+    return;
+  }
+
+  settlingRightOverflow = true;
+  try {
+    do {
+      pendingRightOverflowSettle = false;
+      await nextTick();
+      await settleRightOverflowOnce();
+    } while (pendingRightOverflowSettle);
+  } finally {
+    settlingRightOverflow = false;
+  }
+}
+
+function scheduleToolbarLayout() {
+  if (toolbarLayoutRaf) cancelAnimationFrame(toolbarLayoutRaf);
+  toolbarLayoutRaf = requestAnimationFrame(() => {
+    toolbarLayoutRaf = 0;
+    checkToolbarWidth();
+    scheduleTrafficLightSync();
+    void settleRightOverflow();
+  });
+}
+
+function scheduleTrafficLightSync() {
+  if (!shouldReserveTrafficLightInset.value) return;
+  if (trafficLightSyncRaf) cancelAnimationFrame(trafficLightSyncRaf);
+  trafficLightSyncRaf = requestAnimationFrame(() => {
+    trafficLightSyncRaf = 0;
+    void syncTrafficLightsToToolbar();
+  });
+}
+
+async function syncTrafficLightsToToolbar() {
+  if (!shouldReserveTrafficLightInset.value) return;
+  const toolbarRect = toolbarEl.value?.getBoundingClientRect();
+  const targetEl = newConnectionLabelEl.value;
+  const targetRect = targetEl?.getBoundingClientRect();
+  if (!toolbarRect || !targetRect) return;
+  const targetCenterY = targetRect.top - toolbarRect.top + targetRect.height / 2;
+  try {
+    const layout = await invoke<MacosTrafficLightLayout>("set_macos_traffic_light_position", {
+      x: MAC_TRAFFIC_LIGHT_X,
+      y: targetCenterY,
+      scale: settingsStore.editorSettings.uiScale,
+    });
+    measuredTrafficLightInset.value = Math.ceil(layout.reserved_inset / settingsStore.editorSettings.uiScale);
+  } catch (error) {
+    console.warn("[DBX] Failed to sync macOS traffic light position", { targetCenterY, error });
+  }
+}
+
+function handleWindowResize() {
+  scheduleToolbarLayout();
+}
+
+watch(collapsibleRightItemDefs, () => scheduleToolbarLayout(), { flush: "post" });
+watch(
+  () => settingsStore.editorSettings.uiScale,
+  () => {
+    measuredTrafficLightInset.value = null;
+    scheduleToolbarLayout();
+    window.setTimeout(scheduleTrafficLightSync, 120);
+  },
+);
+watch(shouldReserveTrafficLightInset, () => scheduleToolbarLayout());
 
 // ──────────── Resize observer ────────────
 
 let resizeObserver: ResizeObserver | null = null;
 
 onMounted(() => {
-  resizeObserver = new ResizeObserver(() => {
-    checkToolbarWidth();
-    checkRightOverflow();
-  });
+  resizeObserver = new ResizeObserver(scheduleToolbarLayout);
   if (toolbarEl.value) resizeObserver.observe(toolbarEl.value);
-  window.addEventListener("resize", () => {
-    checkToolbarWidth();
-    checkRightOverflow();
-  });
+  if (rightWrapper.value) resizeObserver.observe(rightWrapper.value);
+  window.addEventListener("resize", handleWindowResize);
+  scheduleToolbarLayout();
 });
 
 onBeforeUnmount(() => {
+  if (toolbarLayoutRaf) cancelAnimationFrame(toolbarLayoutRaf);
+  if (trafficLightSyncRaf) cancelAnimationFrame(trafficLightSyncRaf);
   resizeObserver?.disconnect();
-  window.removeEventListener("resize", checkToolbarWidth);
+  window.removeEventListener("resize", handleWindowResize);
 });
 
 // ──────────── Left-side "More" items ────────────
@@ -322,39 +451,57 @@ const collapsedItems = computed(() => {
   return items;
 });
 
+function runMoreItem(value: string) {
+  const item = moreItems.value.find((i) => i.value === value);
+  item?.action();
+}
+
+function runCollapsedItem(value: string) {
+  const item = collapsedItems.value.find((i) => i.value === value);
+  item?.action();
+}
+
 // Per-item overflow visibility helper
 function isRightItemVisible(key: string) {
   return !overflowedRightKeys.value.has(key);
 }
 
-// Track checking updates state for the overflow menu disabled state
-const checkingUpdates = computed(() => props.checkingUpdates);
+const toolbarTextButtonClass = "h-8 px-2 text-xs gap-1 leading-none";
+const toolbarTextLabelClass = "inline-flex translate-y-px items-center leading-none";
+const toolbarDropdownTriggerClass = `inline-flex h-8 items-center gap-1 rounded-[6px] px-2 text-xs font-medium leading-none hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors [&>span:first-child]:translate-y-px`;
+const toolbarStyle = computed(() => {
+  if (!shouldReserveTrafficLightInset.value) return undefined;
+  return {
+    paddingLeft: `${measuredTrafficLightInset.value ?? parseInt(macTrafficLightInsetPaddingForScale(settingsStore.editorSettings.uiScale), 10)}px`,
+  };
+});
 </script>
 
 <template>
-  <div ref="toolbarEl" class="h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :class="{ 'pl-17.5': shouldReserveMacTrafficLightInset(isMac, isFullscreen, isDesktop) }" data-tauri-drag-region @dblclick="onToolbarDblClick">
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-connection')">
-      <DatabaseZap class="h-3.5 w-3.5" />
-      {{ t("toolbar.newConnection") }}
+  <div ref="toolbarEl" class="app-toolbar h-10 flex items-center gap-1 px-2 border-b bg-muted/30 shrink-0 overflow-hidden" :style="toolbarStyle" data-tauri-drag-region @dblclick="onToolbarDblClick">
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-connection')">
+      <span class="inline-flex items-center gap-1">
+        <DatabaseZap class="h-3.5 w-3.5" />
+        <span ref="newConnectionLabelEl" :class="toolbarTextLabelClass">{{ t("toolbar.newConnection") }}</span>
+      </span>
     </Button>
 
-    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('new-query')" :disabled="!hasConnections">
+    <Button variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('new-query')" :disabled="!hasConnections">
       <FilePlus2 class="h-3.5 w-3.5" />
-      {{ t("toolbar.newQuery") }}
+      <span :class="toolbarTextLabelClass">{{ t("toolbar.newQuery") }}</span>
     </Button>
 
     <template v-if="!toolbarCollapsed">
-      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" @click="emit('open-transfer')" :disabled="!hasConnections">
+      <Button v-if="toolbarItems.dataTransfer" variant="ghost" size="sm" :class="toolbarTextButtonClass" @click="emit('open-transfer')" :disabled="!hasConnections">
         <ArrowLeftRight class="h-3.5 w-3.5" />
-        {{ t("transfer.dataTransfer") }}
+        <span :class="toolbarTextLabelClass">{{ t("transfer.dataTransfer") }}</span>
       </Button>
 
-      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" class="h-8 px-2 text-xs gap-1" :class="{ 'bg-accent': showDriverStore }" @click="emit('open-driver-store')">
+      <Button v-if="toolbarItems.driverManager" variant="ghost" size="sm" :class="[toolbarTextButtonClass, { 'bg-accent': showDriverStore }]" @click="emit('open-driver-store')">
         <Package class="h-3.5 w-3.5" />
-        {{ t("toolbar.driverManager") }}
-        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-medium leading-none text-white" :aria-label="t('toolbar.updatableDriverCount')">
-          {{ agentDriverUpdateCount > 99 ? "99+" : agentDriverUpdateCount }}
-        </span>
+        <span :class="toolbarTextLabelClass">{{ t("toolbar.driverManager") }}</span>
+        <!-- 小圆点仅提示"有可更新驱动"，具体数量交给对话框内标签页红点展示，避免工具栏长期挂红数字。 -->
+        <span v-if="agentDriverUpdateCount > 0" class="ml-0.5 inline-block h-2 w-2 rounded-full bg-red-500" :aria-label="t('toolbar.updatableDriverCount')" :title="t('toolbar.updatableDriverCount')" />
       </Button>
 
       <LightDropdown
@@ -363,17 +510,12 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         :items="moreItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = moreItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runMoreItem"
       />
     </template>
 
@@ -384,24 +526,19 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         :items="collapsedItems"
         :aria-label="t('common.more')"
         :trigger-label="t('common.more')"
-        trigger-class="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:hover:bg-muted/50 transition-colors"
+        :trigger-class="toolbarDropdownTriggerClass"
         :show-trigger-label="true"
         :show-chevron="true"
         check-position="none"
         align="start"
-        @update:model-value="
-          (value) => {
-            const item = collapsedItems.find((i) => i.value === value);
-            item?.action();
-          }
-        "
+        @update:model-value="runCollapsedItem"
       />
     </template>
 
     <div class="flex-1" data-tauri-drag-region />
 
     <!-- Right-side items wrapped in overflow-aware container -->
-    <div ref="rightWrapper" class="flex items-center gap-1 overflow-hidden">
+    <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
       <template v-if="toolbarItems.checkUpdates">
         <Tooltip>
           <TooltipTrigger as-child>
@@ -428,6 +565,15 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         <TooltipContent>{{ t("sqlLibrary.title") }}</TooltipContent>
       </Tooltip>
 
+      <Tooltip v-if="toolbarItems.sqlFileTree">
+        <TooltipTrigger as-child>
+          <Button v-show="isRightItemVisible('sqlFileTree')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showSqlFilePanel }" @click="emit('toggle-sql-file-panel')">
+            <FolderTree class="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("sqlFileTree.title") }}</TooltipContent>
+      </Tooltip>
+
       <Tooltip v-if="toolbarItems.history">
         <TooltipTrigger as-child>
           <Button v-show="isRightItemVisible('history')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showHistory }" @click="emit('toggle-history')">
@@ -448,22 +594,9 @@ const checkingUpdates = computed(() => props.checkingUpdates);
 
       <Tooltip v-if="toolbarItems.theme">
         <TooltipTrigger as-child>
-          <span v-show="isRightItemVisible('theme')" class="inline-flex shrink-0">
-            <LightDropdown
-              :model-value="themeMode"
-              :items="themeItems"
-              :aria-label="t('toolbar.theme')"
-              :trigger-icon="themeTriggerIcon"
-              trigger-class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-accent-foreground"
-              trigger-icon-class="h-4 w-4"
-              item-icon-class="h-4 w-4"
-              :show-trigger-label="false"
-              :show-chevron="false"
-              check-position="right"
-              align="end"
-              @update:model-value="(value) => emit('set-theme-mode', value as AppThemeMode)"
-            />
-          </span>
+          <Button v-show="isRightItemVisible('theme')" variant="ghost" size="icon" class="h-8 w-8 shrink-0" :aria-label="t('toolbar.theme')" @click="cycleThemeMode">
+            <component :is="themeTriggerIcon" class="h-4 w-4" />
+          </Button>
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.theme") }}</TooltipContent>
       </Tooltip>
@@ -485,7 +618,7 @@ const checkingUpdates = computed(() => props.checkingUpdates);
 
     <Tooltip>
       <TooltipTrigger as-child>
-        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" @click="emit('open-settings')">
+        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showSettingsPage }" @click="emit('open-settings')">
           <Settings class="h-4 w-4" />
         </Button>
       </TooltipTrigger>

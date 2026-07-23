@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import { buildDataGridCellDetail, buildDataGridColumnDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, buildDataGridRowDetail, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, type DataGridCellDetail } from "../../apps/desktop/src/lib/dataGridDetail.ts";
-import type { CellValue } from "../../apps/desktop/src/lib/cellValue.ts";
+import { buildDataGridCellDetail, buildDataGridColumnDetail, dataGridColumnDetailJson, dataGridColumnDetailTsv, buildDataGridRowDetail, dataGridRowDetailJson, dataGridRowDetailTsv, filterDataGridDetailFields, jsonDetailDisplayValue, type DataGridCellDetail } from "../../apps/desktop/src/lib/dataGrid/dataGridDetail.ts";
+import type { CellValue } from "../../apps/desktop/src/lib/dataGrid/cellValue.ts";
 
 test("buildDataGridCellDetail returns null for an invalid column", () => {
   const detail = buildDataGridCellDetail({
@@ -65,6 +65,61 @@ test("buildDataGridCellDetail reports image preview URLs", () => {
   });
 
   assert.equal(detail?.imagePreviewUrl, "https://example.com/avatar.png");
+});
+
+test("buildDataGridCellDetail reports binary image preview URLs", () => {
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ["0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["avatar"],
+    columnIndex: 0,
+    typeByColumn: new Map([["avatar", "longblob"]]),
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.match(detail?.imagePreviewUrl ?? "", /^data:image\/png;base64,/);
+});
+
+test("buildDataGridCellDetail uses result column types for query results", () => {
+  const detail = buildDataGridCellDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: [30001, "0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["id", "image_data"],
+    columnIndex: 1,
+    resultColumnTypes: ["bigint", "longblob"],
+    displayValue: (value) => String(value),
+    isEditable: false,
+  });
+
+  assert.equal(detail?.type, "longblob");
+  assert.match(detail?.imagePreviewUrl ?? "", /^data:image\/png;base64,/);
+});
+
+test("aggregate details defer binary image preview generation", () => {
+  const rowDetail = buildDataGridRowDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ["0x89504e470d0a1a0a0000000d49484452"],
+    columns: ["avatar"],
+    columnIndexes: [0],
+    resultColumnTypes: ["longblob"],
+    displayValue: (value) => String(value),
+  });
+  const columnDetail = buildDataGridColumnDetail({
+    rows: [{ rowIndex: 0, rowId: 1, row: ["0x89504e470d0a1a0a0000000d49484452"] }],
+    columns: ["avatar"],
+    columnIndex: 0,
+    resultColumnTypes: ["longblob"],
+    displayValue: (value) => String(value),
+  });
+
+  assert.equal(rowDetail.fields[0]?.type, "longblob");
+  assert.equal(rowDetail.fields[0]?.imagePreviewUrl, null);
+  assert.equal(columnDetail?.fields[0]?.type, "longblob");
+  assert.equal(columnDetail?.fields[0]?.imagePreviewUrl, null);
 });
 
 test("buildDataGridCellDetail limits rendered previews for huge text values", () => {
@@ -147,9 +202,34 @@ test("dataGridRowDetailJson and dataGridRowDetailTsv format copy payloads", () =
   });
 
   assert.equal(dataGridRowDetailJson(detail), '{\n  "id": 1,\n  "name": "Ada",\n  "nickname": null\n}');
+  assert.equal(dataGridRowDetailJson(detail, { id: 1, profile: { city: "Shanghai" } }), '{\n  "id": 1,\n  "profile": {\n    "city": "Shanghai"\n  }\n}');
   assert.equal(dataGridRowDetailTsv(detail), "1\tAda\tNULL");
 });
 
+test("dataGridRowDetailJson uses the original MongoDB document for nested values", () => {
+  const document = {
+    _id: { $oid: "507f1f77bcf86cd799439011" },
+    profile: { createdAt: { $date: "2025-01-02T03:04:05.000Z" }, labels: ["vip"] },
+  };
+  const detail = buildDataGridRowDetail({
+    rowIndex: 0,
+    rowId: 1,
+    row: ['{"$oid":"507f1f77bcf86cd799439011"}', '{"createdAt":{"$date":"2025-01-02T03:04:05.000Z"},"labels":["vip"]}'],
+    columns: ["_id", "profile"],
+    columnIndexes: [0, 1],
+    displayValue: (value) => String(value),
+  });
+
+  assert.equal(dataGridRowDetailJson(detail, document), JSON.stringify(document, null, 2));
+  assert.doesNotMatch(dataGridRowDetailJson(detail, document), /\\"\\$oid\\"/);
+});
+
+test("jsonDetailDisplayValue expands JSON stored in MongoDB string fields", () => {
+  assert.deepEqual(
+    jsonDetailDisplayValue({ imparts: '{"insImpart":[{"impartId":"40-936","impartAnswer":"N,,"}]}' }),
+    { imparts: { insImpart: [{ impartId: "40-936", impartAnswer: "N,," }] } },
+  );
+});
 test("buildDataGridColumnDetail maps a whole column across rows", () => {
   const typeByColumn = new Map([["name", "varchar"]]);
   const commentByColumn = new Map([["name", "display name"]]);

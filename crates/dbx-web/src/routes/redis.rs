@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
@@ -14,7 +15,7 @@ async fn ensure_writable(
     action: &str,
 ) -> Result<(), AppError> {
     if let Some(name) = dbx_core::query::connection_readonly_name(app, connection_id).await {
-        return Err(AppError(format!(
+        return Err(AppError::from(format!(
             "Read-only mode: connection '{}' has read-only protection enabled. {} blocked.",
             name, action
         )));
@@ -48,6 +49,7 @@ pub struct RedisScanBatchRequest {
     pub count: usize,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    pub include_types: Option<bool>,
 }
 
 fn default_max_iterations() -> usize {
@@ -72,6 +74,18 @@ pub struct RedisKeyRequest {
     pub connection_id: String,
     pub db: u32,
     pub key_raw: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisLoadMoreRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub key_type: String,
+    pub cursor: u64,
+    pub count: usize,
+    pub filter: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,13 +195,28 @@ pub struct RedisPubSubPublishRequest {
     pub message: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowlogGetRequest {
+    pub connection_id: String,
+    pub count: usize,
+    pub node_host: Option<String>,
+    pub node_port: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterNodesRequest {
+    pub connection_id: String,
+}
+
 pub async fn list_databases(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisConnectionRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let result =
-        dbx_core::redis_ops::redis_list_databases_core(&state.app, &req.connection_id).await.map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+        dbx_core::redis_ops::redis_list_databases_core(&state.app, &req.connection_id).await.map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn scan_keys(
@@ -203,8 +232,8 @@ pub async fn scan_keys(
         req.count,
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn scan_keys_batch(
@@ -219,10 +248,11 @@ pub async fn scan_keys_batch(
         &req.pattern,
         req.count,
         req.max_iterations,
+        req.include_types.unwrap_or(true),
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn scan_values(
@@ -240,8 +270,8 @@ pub async fn scan_values(
         req.count,
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn get_value(
@@ -250,8 +280,27 @@ pub async fn get_value(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let result = dbx_core::redis_ops::redis_get_value_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
         .await
-        .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn load_more(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisLoadMoreRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_load_more_in_db_core(
+        &state.app,
+        &req.connection_id,
+        req.db,
+        &req.key_raw,
+        &req.key_type,
+        req.cursor,
+        req.count,
+        req.filter.as_deref(),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn set_string(
@@ -268,7 +317,7 @@ pub async fn set_string(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -279,7 +328,7 @@ pub async fn delete_key(
     ensure_writable(&state.app, &req.connection_id, "Delete key").await?;
     dbx_core::redis_ops::redis_delete_key_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -299,7 +348,7 @@ pub async fn hash_set(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -310,7 +359,7 @@ pub async fn hash_del(
     ensure_writable(&state.app, &req.connection_id, "HDEL").await?;
     dbx_core::redis_ops::redis_hash_del_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.field)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -329,7 +378,7 @@ pub async fn list_push(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -342,7 +391,7 @@ pub async fn list_set(
     let value = req.value.as_deref().unwrap_or("");
     dbx_core::redis_ops::redis_list_set_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, index, value)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -354,7 +403,7 @@ pub async fn list_remove(
     let index = req.index.unwrap_or(0);
     dbx_core::redis_ops::redis_list_remove_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, index)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -372,7 +421,7 @@ pub async fn set_add(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -383,7 +432,7 @@ pub async fn set_remove(
     ensure_writable(&state.app, &req.connection_id, "SREM").await?;
     dbx_core::redis_ops::redis_set_remove_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.member)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -398,7 +447,7 @@ pub async fn zadd(State(state): State<Arc<WebState>>, Json(req): Json<RedisZaddR
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -416,7 +465,7 @@ pub async fn stream_add(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -433,7 +482,7 @@ pub async fn json_set(
         req.ttl,
     )
     .await
-    .map_err(AppError)?;
+    .map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -443,7 +492,7 @@ pub async fn check_json_module(
 ) -> Result<Json<bool>, AppError> {
     let result = dbx_core::redis_ops::redis_check_json_module_in_db_core(&state.app, &req.connection_id, req.db)
         .await
-        .map_err(AppError)?;
+        .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -455,7 +504,7 @@ pub async fn delete_keys(
     let result =
         dbx_core::redis_ops::redis_delete_keys_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raws)
             .await
-            .map_err(AppError)?;
+            .map_err(AppError::from)?;
     Ok(Json(result))
 }
 
@@ -464,21 +513,48 @@ pub async fn flush_db(
     Json(req): Json<RedisDbRequest>,
 ) -> Result<Json<()>, AppError> {
     ensure_writable(&state.app, &req.connection_id, "FLUSHDB").await?;
-    dbx_core::redis_ops::redis_flush_db_core(&state.app, &req.connection_id, req.db).await.map_err(AppError)?;
+    dbx_core::redis_ops::redis_flush_db_core(&state.app, &req.connection_id, req.db).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
 pub async fn execute_command(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     Json(req): Json<RedisCommandRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let argv = dbx_core::db::redis_driver::parse_command_argv(&req.command)
+        .map_err(|error| AppError::from(format!("Invalid Redis command: {error}")))?;
+    let cmd_name = argv[0].to_ascii_uppercase();
+    let safety = dbx_core::db::redis_driver::classify_command(&cmd_name);
+    let is_mcp_request = super::mcp_policy::is_mcp_request(&headers);
+    let centrally_approved_high_risk =
+        is_mcp_request && safety == dbx_core::db::redis_driver::RedisCommandSafety::Blocked;
+    if safety != dbx_core::db::redis_driver::RedisCommandSafety::Allowed {
+        if centrally_approved_high_risk {
+            super::mcp_policy::ensure_dangerous_write(
+                &state,
+                &headers,
+                &req.connection_id,
+                &req.db.to_string(),
+                &format!("Redis command '{cmd_name}'"),
+            )
+            .await?;
+        } else {
+            super::mcp_policy::ensure_write(
+                &state,
+                &headers,
+                &req.connection_id,
+                &req.db.to_string(),
+                &format!("Redis command '{cmd_name}'"),
+            )
+            .await?;
+        }
+    }
     // In read-only mode, only allow safe read commands
     if let Some(name) = dbx_core::query::connection_readonly_name(&state.app, &req.connection_id).await {
-        let cmd_name = req.command.split_whitespace().next().unwrap_or("");
-        if dbx_core::db::redis_driver::classify_command(cmd_name)
-            != dbx_core::db::redis_driver::RedisCommandSafety::Allowed
-        {
-            return Err(AppError(format!(
+        if safety != dbx_core::db::redis_driver::RedisCommandSafety::Allowed {
+            return Err(AppError::from(format!(
                 "Read-only mode: connection '{}' has read-only protection enabled. Command '{}' blocked.",
                 name, cmd_name
             )));
@@ -489,11 +565,11 @@ pub async fn execute_command(
         &req.connection_id,
         req.db,
         &req.command,
-        req.skip_safety_check.unwrap_or(false),
+        if is_mcp_request { centrally_approved_high_risk } else { req.skip_safety_check.unwrap_or(false) },
     )
     .await
-    .map_err(AppError)?;
-    Ok(Json(serde_json::to_value(result).map_err(|e| AppError(e.to_string()))?))
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
 pub async fn publish_message(
@@ -504,6 +580,32 @@ pub async fn publish_message(
     let count =
         dbx_core::redis_ops::redis_publish_core(&state.app, &req.connection_id, req.db, &req.channel, &req.message)
             .await
-            .map_err(AppError)?;
+            .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "subscribers": count })))
+}
+
+pub async fn slowlog_get(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<SlowlogGetRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_slowlog_get_core(
+        &state.app,
+        &req.connection_id,
+        req.count,
+        req.node_host,
+        req.node_port,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn cluster_master_nodes(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ClusterNodesRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = dbx_core::redis_ops::redis_cluster_master_nodes_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }

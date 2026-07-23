@@ -2,8 +2,10 @@ use crate::agent_events::AgentEvent;
 use crate::ai::{AiMessage, AiModelInfo};
 use crate::token_usage::TokenUsage;
 use serde_json::Value;
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
@@ -13,6 +15,8 @@ pub struct CliAgentRunOptions {
     pub connection_name: String,
     pub database: String,
     pub agent_mode: bool,
+    pub allow_writes: bool,
+    pub allow_dangerous: bool,
     pub mcp_server_command: Option<CliAgentCommandSpec>,
 }
 
@@ -25,10 +29,14 @@ pub struct CliAgentCommandSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliAgentJsonlDialect {
     CodexExec,
+    ClaudeCodePrint,
 }
 
 pub struct CliAgentProcessSpec {
     pub command: CliAgentCommandSpec,
+    pub env: Vec<(String, String)>,
+    pub current_dir: Option<PathBuf>,
+    pub stdin: Option<String>,
     pub dialect: CliAgentJsonlDialect,
     pub classify_spawn_error: fn(&str) -> String,
     pub classify_run_error: fn(&str) -> String,
@@ -47,13 +55,15 @@ pub fn dbx_mcp_enabled_tools(agent_mode: bool) -> Vec<&'static str> {
     let mut tools = vec!["dbx_list_connections", "dbx_list_tables", "dbx_describe_table", "dbx_get_schema_context"];
     if agent_mode {
         tools.push("dbx_execute_query");
+        tools.push("dbx_execute_redis_command");
     }
     tools
 }
 
 pub fn dbx_mcp_scope_env(options: &CliAgentRunOptions) -> Vec<(&'static str, String)> {
     vec![
-        ("DBX_MCP_ALLOW_WRITES", "0".to_string()),
+        ("DBX_MCP_ALLOW_WRITES", if options.allow_writes { "1" } else { "0" }.to_string()),
+        ("DBX_MCP_ALLOW_DANGEROUS_SQL", if options.allow_dangerous { "1" } else { "0" }.to_string()),
         ("DBX_MCP_SCOPE_CONNECTION_ID", options.connection_id.clone()),
         ("DBX_MCP_SCOPE_CONNECTION_NAME", options.connection_name.clone()),
         ("DBX_MCP_SCOPE_DATABASE", options.database.clone()),
@@ -67,10 +77,20 @@ pub fn append_config_overrides(args: &mut Vec<String>, overrides: impl IntoItera
     }
 }
 
-pub fn build_cli_agent_prompt(provider_label: &str, system_prompt: &str, messages: &[AiMessage]) -> String {
+pub fn build_cli_agent_prompt(
+    provider_label: &str,
+    system_prompt: &str,
+    messages: &[AiMessage],
+    allow_write_sql: bool,
+) -> String {
+    let database_access = if allow_write_sql {
+        "The user explicitly confirmed the proposed database change. DBX MCP tools may execute write and DDL SQL for this run only."
+    } else {
+        "Use the DBX MCP tools when you need live database schema or read-only query results."
+    };
     let mut sections = vec![
         format!("You are running inside DBX Desktop as the {provider_label} CLI provider."),
-        "Use the DBX MCP tools when you need live database schema or read-only query results.".to_string(),
+        database_access.to_string(),
         "Do not modify files or run shell commands. The DBX MCP server is the only intended tool surface.".to_string(),
         String::new(),
         "## System instructions".to_string(),
@@ -92,7 +112,11 @@ pub fn build_cli_agent_prompt(provider_label: &str, system_prompt: &str, message
 }
 
 pub fn model_infos(ids: &[&str]) -> Vec<AiModelInfo> {
-    ids.iter().map(|id| AiModelInfo { id: (*id).to_string(), display_name: None }).collect()
+    ids.iter().map(|id| AiModelInfo::new(*id, None)).collect()
+}
+
+pub fn cli_command(program: impl AsRef<OsStr>) -> Command {
+    crate::process::new_tokio_command(program)
 }
 
 pub async fn list_json_models_or_default(
@@ -100,7 +124,7 @@ pub async fn list_json_models_or_default(
     args: impl IntoIterator<Item = String>,
     default_models: &[&str],
 ) -> Result<Vec<AiModelInfo>, String> {
-    let output = Command::new(program).args(args).output().await;
+    let output = cli_command(program).args(args).output().await;
 
     let Ok(output) = output else {
         return Ok(model_infos(default_models));
@@ -122,8 +146,8 @@ pub async fn list_json_models_or_default(
     if models.is_empty() {
         Ok(model_infos(default_models))
     } else {
-        let mut result = vec![AiModelInfo { id: "default".to_string(), display_name: None }];
-        result.extend(models.into_iter().map(|id| AiModelInfo { id, display_name: None }));
+        let mut result = vec![AiModelInfo::new("default", None)];
+        result.extend(models.into_iter().map(|id| AiModelInfo::new(id, None)));
         Ok(result)
     }
 }
@@ -169,6 +193,7 @@ pub fn parse_cli_jsonl_event(line: &str, dialect: CliAgentJsonlDialect) -> Optio
 fn parse_cli_jsonl_line(line: &str, dialect: CliAgentJsonlDialect) -> ParsedCliAgentEvent {
     match dialect {
         CliAgentJsonlDialect::CodexExec => parse_codex_jsonl_line(line),
+        CliAgentJsonlDialect::ClaudeCodePrint => parse_claude_code_jsonl_line(line),
     }
 }
 
@@ -284,6 +309,7 @@ fn cli_item_id(item: &Value) -> String {
 fn cli_tool_name(item: &Value) -> String {
     item.get("tool_name")
         .and_then(Value::as_str)
+        .or_else(|| item.get("tool").and_then(Value::as_str))
         .or_else(|| item.get("name").and_then(Value::as_str))
         .or_else(|| item.get("server_tool_name").and_then(Value::as_str))
         .unwrap_or("cli_tool")
@@ -299,7 +325,16 @@ fn cli_tool_args(item: &Value) -> Value {
 }
 
 fn cli_tool_result(item: &Value) -> Value {
-    item.get("result").or_else(|| item.get("output")).or_else(|| item.get("content")).cloned().unwrap_or(Value::Null)
+    non_null_field(item, "result")
+        .or_else(|| non_null_field(item, "output"))
+        .or_else(|| non_null_field(item, "content"))
+        .or_else(|| non_null_field(item, "error"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn non_null_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.get(key).filter(|field| !field.is_null())
 }
 
 fn cli_text(item: &Value) -> Option<String> {
@@ -320,17 +355,165 @@ fn codex_error_message(value: &Value) -> String {
         .to_string()
 }
 
+fn parse_claude_code_jsonl_line(line: &str) -> ParsedCliAgentEvent {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return ParsedCliAgentEvent::default();
+    };
+
+    match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "assistant" => parse_claude_code_assistant(&value),
+        "user" => parse_claude_code_user(&value),
+        "result" => parse_claude_code_result(&value),
+        "error" => {
+            let message = claude_code_error_message(&value);
+            ParsedCliAgentEvent {
+                error: Some(message.clone()),
+                events: vec![AgentEvent::Error { message }],
+                ..Default::default()
+            }
+        }
+        _ => ParsedCliAgentEvent::default(),
+    }
+}
+
+fn parse_claude_code_assistant(value: &Value) -> ParsedCliAgentEvent {
+    let content = value.get("message").and_then(|message| message.get("content")).or_else(|| value.get("content"));
+    let Some(content) = content else {
+        return ParsedCliAgentEvent::default();
+    };
+
+    let mut events = Vec::new();
+    let mut final_text = String::new();
+    for block in claude_content_blocks(content) {
+        match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                    final_text.push_str(text);
+                    events.push(AgentEvent::TextDelta { delta: text.to_string() });
+                }
+            }
+            "thinking" => {
+                if let Some(text) = block.get("thinking").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+                    events.push(AgentEvent::ReasoningDelta { delta: text.to_string() });
+                }
+            }
+            "tool_use" => {
+                events.push(AgentEvent::ToolCallStart {
+                    tool_call_id: block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("claude-code-tool-call")
+                        .to_string(),
+                    tool_name: block.get("name").and_then(Value::as_str).unwrap_or("claude_code_tool").to_string(),
+                    args: block.get("input").cloned().unwrap_or_else(|| Value::Object(Default::default())),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    ParsedCliAgentEvent { final_text: (!final_text.is_empty()).then_some(final_text), events, ..Default::default() }
+}
+
+fn parse_claude_code_user(value: &Value) -> ParsedCliAgentEvent {
+    let content = value.get("message").and_then(|message| message.get("content")).or_else(|| value.get("content"));
+    let Some(content) = content else {
+        return ParsedCliAgentEvent::default();
+    };
+
+    let mut events = Vec::new();
+    for block in claude_content_blocks(content) {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        events.push(AgentEvent::ToolCallEnd {
+            tool_call_id: block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .or_else(|| block.get("id").and_then(Value::as_str))
+                .unwrap_or("claude-code-tool-call")
+                .to_string(),
+            tool_name: "mcp_tool".to_string(),
+            result: block.get("content").cloned().unwrap_or(Value::Null),
+            is_error: block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+        });
+    }
+
+    ParsedCliAgentEvent { events, ..Default::default() }
+}
+
+fn parse_claude_code_result(value: &Value) -> ParsedCliAgentEvent {
+    let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("success");
+    if subtype != "success" {
+        let message = claude_code_error_message(value);
+        return ParsedCliAgentEvent {
+            error: Some(message.clone()),
+            events: vec![AgentEvent::Error { message }],
+            ..Default::default()
+        };
+    }
+
+    let usage = value.get("usage").and_then(|usage| {
+        let input =
+            usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0)
+                as u32;
+        let output =
+            usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0)
+                as u32;
+        (input > 0 || output > 0).then_some(TokenUsage { input_tokens: input, output_tokens: output })
+    });
+
+    ParsedCliAgentEvent {
+        events: vec![AgentEvent::AgentEnd {
+            input_tokens: usage.as_ref().and_then(|u| (u.input_tokens > 0).then_some(u.input_tokens)),
+            output_tokens: usage.as_ref().and_then(|u| (u.output_tokens > 0).then_some(u.output_tokens)),
+        }],
+        ..Default::default()
+    }
+}
+
+fn claude_content_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Array(blocks) => blocks.clone(),
+        Value::String(text) => vec![serde_json::json!({ "type": "text", "text": text })],
+        Value::Object(_) => vec![content.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn claude_code_error_message(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("error").and_then(|error| error.get("message")).and_then(Value::as_str))
+        .or_else(|| value.get("result").and_then(Value::as_str))
+        .unwrap_or("Claude Code CLI failed")
+        .to_string()
+}
+
 pub async fn run_cli_jsonl_agent(
     spec: CliAgentProcessSpec,
     cancelled: &Notify,
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<String, String> {
-    let mut child = Command::new(&spec.command.program)
-        .args(&spec.command.args)
+    let mut command = cli_command(&spec.command.program);
+    command.args(&spec.command.args).envs(spec.env.iter().map(|(key, value)| (key.as_str(), value.as_str())));
+    if let Some(current_dir) = &spec.current_dir {
+        command.current_dir(current_dir);
+    }
+    let mut child = command
+        .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| (spec.classify_spawn_error)(&e.to_string()))?;
+
+    if let Some(input) = spec.stdin {
+        let mut stdin = child.stdin.take().ok_or_else(|| "CLI agent stdin not available".to_string())?;
+        stdin.write_all(input.as_bytes()).await.map_err(|e| format!("Failed to write CLI agent stdin: {e}"))?;
+        stdin.shutdown().await.map_err(|e| format!("Failed to close CLI agent stdin: {e}"))?;
+    }
 
     let stdout = child.stdout.take().ok_or_else(|| "Failed to capture CLI agent stdout".to_string())?;
     let stderr = child.stderr.take().ok_or_else(|| "Failed to capture CLI agent stderr".to_string())?;
@@ -426,6 +609,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn jsonl_agent_applies_env_to_child() {
+        let spec = CliAgentProcessSpec {
+            command: CliAgentCommandSpec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s\n' \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"$DBX_TEST_ENV\\\"}}\" \"{\\\"type\\\":\\\"turn.completed\\\"}\"".to_string(),
+                ],
+            },
+            env: vec![("DBX_TEST_ENV".to_string(), "from-env".to_string())],
+            current_dir: None,
+            stdin: None,
+            dialect: CliAgentJsonlDialect::CodexExec,
+            classify_spawn_error,
+            classify_run_error,
+        };
+
+        let result = run_cli_jsonl_agent(spec, &Notify::new(), |_| {}).await.unwrap();
+
+        assert_eq!(result, "from-env");
+    }
+
+    #[tokio::test]
+    async fn jsonl_agent_writes_stdin_to_child() {
+        let spec = CliAgentProcessSpec {
+            command: CliAgentCommandSpec {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "input=$(cat); printf '%s\n' \"{\\\"type\\\":\\\"item.completed\\\",\\\"item\\\":{\\\"type\\\":\\\"agent_message\\\",\\\"text\\\":\\\"$input\\\"}}\" \"{\\\"type\\\":\\\"turn.completed\\\"}\"".to_string(),
+                ],
+            },
+            env: Vec::new(),
+            current_dir: None,
+            stdin: Some("prompt from stdin".to_string()),
+            dialect: CliAgentJsonlDialect::CodexExec,
+            classify_spawn_error,
+            classify_run_error,
+        };
+
+        let result = run_cli_jsonl_agent(spec, &Notify::new(), |_| {}).await.unwrap();
+
+        assert_eq!(result, "prompt from stdin");
+    }
+
+    #[tokio::test]
     async fn jsonl_error_kills_and_waits_for_child() {
         let pid_file = std::env::temp_dir().join(format!(
             "dbx-cli-agent-error-{}-{}",
@@ -439,6 +668,9 @@ mod tests {
 
         let spec = CliAgentProcessSpec {
             command: CliAgentCommandSpec { program: "sh".to_string(), args: vec!["-c".to_string(), script] },
+            env: Vec::new(),
+            current_dir: None,
+            stdin: None,
             dialect: CliAgentJsonlDialect::CodexExec,
             classify_spawn_error,
             classify_run_error,

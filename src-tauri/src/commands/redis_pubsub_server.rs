@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::{net::Ipv4Addr, net::TcpListener};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -10,6 +11,20 @@ use serde::Deserialize;
 
 use dbx_core::connection::AppState;
 
+const DEFAULT_PUBSUB_PORT: u16 = 4224;
+
+pub struct PubSubServerPort(Option<u16>);
+
+impl PubSubServerPort {
+    fn new(port: Option<u16>) -> Self {
+        Self(port)
+    }
+
+    fn get(&self) -> Result<u16, String> {
+        self.0.ok_or_else(|| "Redis PubSub server is unavailable".to_string())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PubSubWsParams {
@@ -18,6 +33,31 @@ struct PubSubWsParams {
 
 pub fn build_pubsub_router(state: Arc<AppState>) -> Router {
     Router::new().route("/api/redis/pubsub/ws", get(ws_handler)).with_state(state)
+}
+
+fn pubsub_server_port() -> u16 {
+    std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PUBSUB_PORT)
+}
+
+#[tauri::command]
+pub fn redis_pubsub_server_port(port: tauri::State<'_, PubSubServerPort>) -> Result<u16, String> {
+    port.get()
+}
+
+fn bind_pubsub_listener(preferred_port: u16) -> Result<TcpListener, String> {
+    let preferred_addr = (Ipv4Addr::LOCALHOST, preferred_port);
+    match TcpListener::bind(preferred_addr) {
+        Ok(listener) => Ok(listener),
+        Err(preferred_error) if preferred_port != 0 => {
+            log::warn!(
+                "Failed to bind PubSub server on {preferred_addr:?}: {preferred_error}; using an available port instead"
+            );
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|fallback_error| {
+                format!("Failed to bind PubSub server on an available port: {fallback_error}")
+            })
+        }
+        Err(error) => Err(format!("Failed to bind PubSub server on {preferred_addr:?}: {error}")),
+    }
 }
 
 async fn ws_handler(
@@ -133,13 +173,57 @@ async fn handle_command(sink: &mut redis::aio::PubSubSink, text: &str) -> Result
 
 /// Start the embedded web server for PubSub WebSocket support.
 /// Runs on a background task using the shared AppState.
-pub fn start_pubsub_server(state: Arc<AppState>) {
+pub fn start_pubsub_server(state: Arc<AppState>) -> PubSubServerPort {
     let router = build_pubsub_router(state);
+    let listener = match bind_pubsub_listener(pubsub_server_port()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log::warn!("{error}");
+            return PubSubServerPort::new(None);
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            log::warn!("Failed to read PubSub server address: {error}");
+            return PubSubServerPort::new(None);
+        }
+    };
+    if let Err(error) = listener.set_nonblocking(true) {
+        log::warn!("Failed to configure PubSub server listener: {error}");
+        return PubSubServerPort::new(None);
+    }
+
     tauri::async_runtime::spawn(async move {
-        let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind PubSub server");
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::warn!("Failed to start PubSub server on {addr}: {error}");
+                return;
+            }
+        };
         log::info!("PubSub WebSocket server listening on {addr}");
-        axum::serve(listener, router).await.expect("PubSub server error");
+        if let Err(error) = axum::serve(listener, router).await {
+            log::warn!("PubSub server stopped with error: {error}");
+        }
     });
+
+    PubSubServerPort::new(Some(addr.port()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_pubsub_listener;
+    use std::net::{Ipv4Addr, TcpListener};
+
+    #[test]
+    fn falls_back_to_an_available_local_port_when_the_preferred_port_is_in_use() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let preferred_port = occupied.local_addr().unwrap().port();
+
+        let listener = bind_pubsub_listener(preferred_port).unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(listener.local_addr().unwrap().port(), preferred_port);
+    }
 }
