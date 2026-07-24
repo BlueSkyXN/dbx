@@ -12,7 +12,7 @@ on:
           - all
           - ubuntu-24.04-x64
           - macos-15-arm64
-          - windows-2025-x64
+          - windows-2022-x64
           - macos-15-intel
       updater_artifacts:
         description: Create Tauri updater artifacts (requires signing secrets)
@@ -55,14 +55,16 @@ jobs:
             macos-intel|macos-15-intel)
               matrix='{"include":[{"id":"macos-15-intel","name":"macOS 15 Intel","os":"macos-15-intel","rust-target":"x86_64-apple-darwin"}]}'
               ;;
-            windows-x64|windows-2025-x64)
-              matrix='{"include":[{"id":"windows-2025-x64","name":"Windows 2025 x64","os":"windows-2025","rust-target":"x86_64-pc-windows-msvc"}]}'
+            # bundled DuckDB 1.3.2 does not compile with the Visual Studio 18
+            # toolchain currently selected by windows-2025.
+            windows-x64|windows-2022-x64|windows-2025-x64)
+              matrix='{"include":[{"id":"windows-2022-x64","name":"Windows 2022 x64","os":"windows-2022","rust-target":"x86_64-pc-windows-msvc"}]}'
               ;;
             linux-x64|ubuntu-24.04-x64)
               matrix='{"include":[{"id":"ubuntu-24.04-x64","name":"Ubuntu 24.04 x64","os":"ubuntu-24.04","rust-target":"x86_64-unknown-linux-gnu"}]}'
               ;;
             all)
-              matrix='{"include":[{"id":"ubuntu-24.04-x64","name":"Ubuntu 24.04 x64","os":"ubuntu-24.04","rust-target":"x86_64-unknown-linux-gnu"},{"id":"macos-15-arm64","name":"macOS 15 arm64","os":"macos-15","rust-target":"aarch64-apple-darwin"},{"id":"windows-2025-x64","name":"Windows 2025 x64","os":"windows-2025","rust-target":"x86_64-pc-windows-msvc"}]}'
+              matrix='{"include":[{"id":"ubuntu-24.04-x64","name":"Ubuntu 24.04 x64","os":"ubuntu-24.04","rust-target":"x86_64-unknown-linux-gnu"},{"id":"macos-15-arm64","name":"macOS 15 arm64","os":"macos-15","rust-target":"aarch64-apple-darwin"},{"id":"windows-2022-x64","name":"Windows 2022 x64","os":"windows-2022","rust-target":"x86_64-pc-windows-msvc"}]}'
               ;;
             *)
               echo "Unsupported platform: $selected"
