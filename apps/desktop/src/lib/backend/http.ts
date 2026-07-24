@@ -799,14 +799,7 @@ export async function beginManualTransaction(_connectionId: string, _database: s
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
-export async function executeInManualTransaction(
-  _txnSessionId: string,
-  _sql: string,
-  _database: string,
-  _schema?: string,
-  _executionId?: string,
-  _maxRows?: number,
-): Promise<QueryResult[]> {
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _executionId?: string, _maxRows?: number): Promise<QueryResult[]> {
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
