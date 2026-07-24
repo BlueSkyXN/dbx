@@ -231,21 +231,40 @@ pub async fn begin_manual_transaction(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_in_manual_transaction(
     state: State<'_, Arc<AppState>>,
     txn_session_id: String,
     sql: String,
     database: String,
     schema: Option<String>,
+    execution_id: Option<String>,
     max_rows: Option<usize>,
 ) -> Result<Vec<db::QueryResult>, String> {
-    dbx_core::query::execute_in_manual_transaction(
+    let execution_id = execution_id.filter(|id| !id.trim().is_empty());
+    let connection_id = {
+        let sessions = state.transaction_sessions.read().await;
+        sessions
+            .get(&txn_session_id)
+            .map(|session| session.connection_id.clone())
+            .ok_or("Transaction session not found or expired; it may have been auto-rolled back due to inactivity")?
+    };
+    let registered_query = execution_id.as_ref().map(|id| {
+        state
+            .running_queries
+            .register_task(id.clone(), RunningTaskMetadata::query(connection_id, database.clone(), None))
+    });
+    let cancel_token = registered_query.as_ref().map(|query| query.token());
+
+    dbx_core::query::execute_in_manual_transaction_with_cancel(
         &state,
         &txn_session_id,
         &sql,
         &database,
         schema.as_deref(),
         max_rows,
+        execution_id.as_deref(),
+        cancel_token,
     )
     .await
 }

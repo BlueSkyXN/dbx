@@ -4142,8 +4142,13 @@ where
         import_parse_options.encoding = Some(encoding);
     }
 
+    let extension =
+        Path::new(&request.file_path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    let is_streaming_xlsx_import = source_format == TableImportSourceFormat::Excel
+        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"));
     let mut create_table_sample: Option<ParsedImportFile> = None;
     let mut created_column_types: Option<Vec<(String, String)>> = None;
+    let mut xlsx_worksheet_validated = false;
     if request.create_table {
         if matches!(request.mode, TableImportMode::Truncate) {
             return Err(emit_import_error(
@@ -4195,6 +4200,22 @@ where
                 return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         };
+        if is_streaming_xlsx_import {
+            let target_column_types =
+                plan.columns.iter().map(|column| (column.name.clone(), column.data_type.clone())).collect::<Vec<_>>();
+            let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
+            if let Err(error) = validate_xlsx_worksheet_for_import(
+                request.file_path.clone(),
+                import_parse_options.clone(),
+                Some(parsed.columns.clone()),
+                text_source_columns,
+            )
+            .await
+            {
+                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
+            }
+            xlsx_worksheet_validated = true;
+        }
         // The table must be created before streaming rows so existing import batching
         // can reuse the same INSERT path and database-specific value escaping.
         if let Err(error) =
@@ -4482,11 +4503,7 @@ where
         return Ok(import_summary(&request.import_id, rows_imported, rows_imported, started_at));
     }
 
-    let extension =
-        Path::new(&request.file_path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    if source_format == TableImportSourceFormat::Excel
-        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"))
-    {
+    if is_streaming_xlsx_import {
         let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
         progress_callback(import_progress_with_details(
             &request.import_id,
@@ -4531,15 +4548,17 @@ where
         }
         let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
         // No truncate, INSERT, or COPY may run until the selected worksheet parses to EOF.
-        if let Err(error) = validate_xlsx_worksheet_for_import(
-            request.file_path.clone(),
-            request.parse_options.clone(),
-            expected_columns.clone(),
-            text_source_columns.clone(),
-        )
-        .await
-        {
-            return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+        if !xlsx_worksheet_validated {
+            if let Err(error) = validate_xlsx_worksheet_for_import(
+                request.file_path.clone(),
+                request.parse_options.clone(),
+                expected_columns.clone(),
+                text_source_columns.clone(),
+            )
+            .await
+            {
+                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+            }
         }
         // Full-sheet validation can take long enough for the user to cancel. Recheck before
         // starting the producer or executing a non-transactional truncate.

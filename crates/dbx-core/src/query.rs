@@ -3139,6 +3139,22 @@ pub async fn execute_in_manual_transaction(
     _schema: Option<&str>,
     max_rows: Option<usize>,
 ) -> Result<Vec<db::QueryResult>, String> {
+    execute_in_manual_transaction_with_cancel(state, txn_session_id, sql, _database, _schema, max_rows, None, None)
+        .await
+}
+
+/// Execute SQL within an existing manual transaction session with cancellation.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_in_manual_transaction_with_cancel(
+    state: &AppState,
+    txn_session_id: &str,
+    sql: &str,
+    _database: &str,
+    _schema: Option<&str>,
+    max_rows: Option<usize>,
+    execution_id: Option<&str>,
+    cancel_token: Option<CancellationToken>,
+) -> Result<Vec<db::QueryResult>, String> {
     const TXN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     // Resolve statements and validate before taking the per-session connection
@@ -3200,14 +3216,61 @@ pub async fn execute_in_manual_transaction(
     };
     let row_limit = max_rows.unwrap_or(MAX_ROWS).max(1);
     let mut results = Vec::with_capacity(statements.len());
+    let postgres_cancel_context = state.get_postgres_cancel_context(&pool_key).await;
 
     let mut conn = connection.lock().await;
     for (i, statement) in statements.iter().enumerate() {
-        let result = match &mut *conn {
-            TxnConnection::Postgres(conn) => {
-                execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
+        let result = if is_canceled(&cancel_token) {
+            Err(canceled_error())
+        } else {
+            match &mut *conn {
+                TxnConnection::Postgres(conn) => {
+                    if let Some(execution_id) = execution_id {
+                        let pg_cancel_token = conn.cancel_token();
+                        let cancel_context = postgres_cancel_context.clone();
+                        state.running_queries.register_interrupt(execution_id, move || {
+                            let pg_cancel_token = pg_cancel_token.clone();
+                            let cancel_context = cancel_context.clone();
+                            tokio::spawn(async move {
+                                db::postgres::cancel_postgres_query(
+                                    pg_cancel_token,
+                                    cancel_context.as_ref(),
+                                    Duration::from_secs(5),
+                                )
+                                .await;
+                            });
+                        });
+                    }
+                    wait_for_query_opt(
+                        cancel_token.clone(),
+                        None,
+                        execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit),
+                    )
+                    .await
+                }
+                TxnConnection::Mysql(conn) => {
+                    if let Some(execution_id) = execution_id {
+                        let connection_id = conn.id();
+                        let kill_opts = conn.opts().clone();
+                        state.running_queries.register_interrupt(execution_id, move || {
+                            let kill_opts = kill_opts.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = db::mysql::kill_query_with_opts(kill_opts, connection_id).await {
+                                    log::warn!(
+                                        "Failed to cancel MySQL manual transaction query {connection_id}: {error}"
+                                    );
+                                }
+                            });
+                        });
+                    }
+                    wait_for_query_opt(
+                        cancel_token.clone(),
+                        None,
+                        execute_manual_txn_mysql_statement(conn, statement, row_limit),
+                    )
+                    .await
+                }
             }
-            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
         };
         match result {
             Ok(query_result) => results.push(query_result),

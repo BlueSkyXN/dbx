@@ -950,8 +950,15 @@ export async function beginManualTransaction(connectionId: string, database: str
   return invoke("begin_manual_transaction", { connectionId, database, schema });
 }
 
-export async function executeInManualTransaction(txnSessionId: string, sql: string, database: string, schema?: string, maxRows?: number): Promise<QueryResult[]> {
-  return invoke("execute_in_manual_transaction", { txnSessionId, sql, database, schema, maxRows });
+export async function executeInManualTransaction(
+  txnSessionId: string,
+  sql: string,
+  database: string,
+  schema?: string,
+  executionId?: string,
+  maxRows?: number,
+): Promise<QueryResult[]> {
+  return invoke("execute_in_manual_transaction", { txnSessionId, sql, database, schema, executionId, maxRows });
 }
 
 export async function commitManualTransaction(txnSessionId: string): Promise<QueryResult> {

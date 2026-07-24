@@ -624,7 +624,7 @@ impl DbxMcpServer {
         connection: &dbx_core::models::connection::ConnectionConfig,
     ) -> Result<String, CallToolResult> {
         let requested = requested.map(|database| database.trim().to_string()).filter(|database| !database.is_empty());
-        if let Some(scoped) = self.scope.database.as_deref() {
+        let database = if let Some(scoped) = self.scope.database.as_deref() {
             if let Some(requested) = requested.as_deref() {
                 if requested != scoped {
                     return Err(tool_error(
@@ -633,9 +633,12 @@ impl DbxMcpServer {
                     ));
                 }
             }
-            return Ok(scoped.to_string());
-        }
-        Ok(requested.or_else(|| connection.database.clone()).unwrap_or_default())
+            scoped.to_string()
+        } else {
+            requested.or_else(|| connection.database.clone()).unwrap_or_default()
+        };
+        ensure_visible_database(connection, &database)?;
+        Ok(database)
     }
 
     // CallToolResult is the rmcp wire response type; keeping it unboxed avoids conversions at every tool boundary.
@@ -645,7 +648,7 @@ impl DbxMcpServer {
         requested: Option<u32>,
         connection: &dbx_core::models::connection::ConnectionConfig,
     ) -> Result<u32, CallToolResult> {
-        if let Some(scoped) = self.scope.database.as_deref() {
+        let database = if let Some(scoped) = self.scope.database.as_deref() {
             let scoped_database = parse_redis_database(scoped).ok_or_else(|| {
                 tool_error(
                     "INVALID_DATABASE_SCOPE",
@@ -660,9 +663,12 @@ impl DbxMcpServer {
                     ));
                 }
             }
-            return Ok(scoped_database);
-        }
-        Ok(requested.or_else(|| redis_database(connection)).unwrap_or(0))
+            scoped_database
+        } else {
+            requested.or_else(|| redis_database(connection)).unwrap_or(0)
+        };
+        ensure_visible_database(connection, &database.to_string())?;
+        Ok(database)
     }
 
     async fn resolve_connection(&self, selector: &ConnectionSelector) -> Result<ResolvedConnection, CallToolResult> {
@@ -784,6 +790,22 @@ fn policy_allows_connection(
     connection: &dbx_core::models::connection::ConnectionConfig,
 ) -> bool {
     policy.allowed_connection_ids.as_ref().is_none_or(|allowed| allowed.iter().any(|id| id == &connection.id))
+}
+
+// Keep MCP database selection aligned with the desktop visible-database filter:
+// any configured list, including an empty one, is an exact connection-local allowlist.
+#[allow(clippy::result_large_err)]
+fn ensure_visible_database(
+    connection: &dbx_core::models::connection::ConnectionConfig,
+    database: &str,
+) -> Result<(), CallToolResult> {
+    if connection.visible_databases.as_ref().is_some_and(|visible| !visible.iter().any(|allowed| allowed == database)) {
+        return Err(tool_error(
+            "DATABASE_OUT_OF_SCOPE",
+            format!("Database \"{database}\" is not in the visible databases list for this connection."),
+        ));
+    }
+    Ok(())
 }
 
 fn mcp_permissions(
@@ -1170,6 +1192,38 @@ mod tests {
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_execute_and_show"));
+    }
+
+    #[test]
+    fn visible_databases_are_enforced_for_sql_and_redis_database_selection() {
+        let mut postgres = connection("postgres", "postgres", "postgres", "configured");
+        postgres.visible_databases = Some(vec!["analytics".to_string()]);
+        let server = DbxMcpServer::with_runtime_options(
+            Arc::new(FakeBackend { connections: vec![postgres.clone()] }),
+            McpScope::default(),
+            false,
+        );
+
+        assert_eq!(server.resolve_database(Some("analytics".to_string()), &postgres).unwrap(), "analytics");
+        let error = server.resolve_database(Some("production".to_string()), &postgres).unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
+        let error = server.resolve_database(None, &postgres).unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
+
+        postgres.visible_databases = Some(vec![]);
+        let error = server.resolve_database(Some("analytics".to_string()), &postgres).unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
+        postgres.visible_databases = None;
+        assert_eq!(server.resolve_database(Some("production".to_string()), &postgres).unwrap(), "production");
+
+        let mut redis = connection("redis", "redis", "redis", "0");
+        redis.visible_databases = Some(vec!["2".to_string()]);
+        assert_eq!(server.resolve_redis_database(Some(2), &redis).unwrap(), 2);
+        let error = server.resolve_redis_database(Some(3), &redis).unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
+        redis.visible_databases = Some(vec![]);
+        let error = server.resolve_redis_database(Some(2), &redis).unwrap_err();
+        assert!(result_text(&error).contains("DATABASE_OUT_OF_SCOPE"));
     }
 
     #[test]

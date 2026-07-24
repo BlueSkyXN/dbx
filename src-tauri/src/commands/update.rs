@@ -133,7 +133,10 @@ impl UpdateDownloadSource {
     fn rewrite_download_url(&self, url: &str) -> Result<Option<String>, String> {
         let Some(target_prefix) = self.mirror_download_prefix() else { return Ok(None) };
 
-        if url.starts_with(target_prefix) {
+        // CNB falls back to the controlled R2 latest endpoint when its tagged
+        // latest.json is unavailable. Preserve that URL instead of treating it
+        // as an arbitrary untrusted source.
+        if url.starts_with(target_prefix) || url.starts_with(R2_LATEST_RELEASE_DOWNLOAD_PREFIX) {
             return Ok(None);
         }
 
@@ -484,6 +487,14 @@ mod tests {
     fn accepts_existing_cnb_asset_url() {
         let download_url = UpdateDownloadSource::Cnb
             .rewrite_download_url("https://cnb.cool/dbxio.com/dbx/-/releases/download/v0.5.39/DBX_0.5.39_aarch64.dmg")
+            .unwrap();
+        assert_eq!(download_url, None);
+    }
+
+    #[test]
+    fn accepts_r2_asset_from_cnb_latest_endpoint_fallback() {
+        let download_url = UpdateDownloadSource::Cnb
+            .rewrite_download_url("https://dl.dbxio.com/releases/latest/DBX_0.5.39_aarch64.dmg")
             .unwrap();
         assert_eq!(download_url, None);
     }

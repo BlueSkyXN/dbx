@@ -3028,7 +3028,7 @@ pub async fn checkout_postgres_client(
     result
 }
 
-async fn cancel_postgres_query(
+pub(crate) async fn cancel_postgres_query(
     pg_cancel_token: tokio_postgres::CancelToken,
     cancel_context: Option<&PostgresCancelContext>,
     cancel_timeout: Duration,
