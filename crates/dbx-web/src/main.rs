@@ -433,9 +433,11 @@ async fn main() {
         .route("/redis/set-add", post(routes::redis::set_add))
         .route("/redis/set-remove", post(routes::redis::set_remove))
         .route("/redis/zadd", post(routes::redis::zadd))
+        .route("/redis/zrem", post(routes::redis::zrem))
         .route("/redis/stream-add", post(routes::redis::stream_add))
         .route("/redis/json-set", post(routes::redis::json_set))
         .route("/redis/check-json-module", post(routes::redis::check_json_module))
+        .route("/redis/set-ttl", post(routes::redis::set_ttl))
         .route("/redis/delete-keys", post(routes::redis::delete_keys))
         .route("/redis/flush-db", post(routes::redis::flush_db))
         .route("/redis/execute-command", post(routes::redis::execute_command))
@@ -749,5 +751,14 @@ mod tests {
             web_agent_dir_from_env(&data_dir, Some("/custom/agents".to_string())),
             std::path::PathBuf::from("/custom/agents")
         );
+    }
+
+    #[test]
+    fn redis_write_routes_expose_the_desktop_http_contract() {
+        let source = include_str!("main.rs");
+        let source = source.split("\n#[cfg(test)]").next().expect("Web route source before tests");
+
+        assert!(source.contains(".route(\"/redis/zrem\", post(routes::redis::zrem))"));
+        assert!(source.contains(".route(\"/redis/set-ttl\", post(routes::redis::set_ttl))"));
     }
 }
