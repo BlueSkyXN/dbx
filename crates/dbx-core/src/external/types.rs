@@ -67,19 +67,14 @@ pub struct ExternalRowUpdate {
 }
 
 /// Cache state tracking for external source snapshots.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum CacheState {
+    #[default]
     Empty,
     Fresh,
     Stale,
     Loading,
     Error(String),
-}
-
-impl Default for CacheState {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 /// Configuration specific to CSV file sources.

@@ -19,20 +19,6 @@ on:
         required: true
         default: false
         type: boolean
-  push:
-    branches:
-      - main
-    paths:
-      - .github/workflows/cloud-build.yml
-      - Cargo.lock
-      - Cargo.toml
-      - package.json
-      - pnpm-lock.yaml
-      - src/**
-      - src-tauri/**
-      - crates/**
-      - vite.config.ts
-      - tsconfig*.json
 
 permissions:
   contents: read
@@ -109,13 +95,12 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
           run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.13.0
           cache: pnpm
 
       - name: Install frontend dependencies
@@ -125,6 +110,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
+
+      - name: Prefer Strawberry Perl for OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $strawberryPerl = 'C:\Strawberry\perl\bin'
+          if (-not (Test-Path "$strawberryPerl\perl.exe")) {
+            throw "Strawberry Perl was not found at $strawberryPerl."
+          }
+          & "$strawberryPerl\perl.exe" -MLocale::Maketext::Simple -e 'print "Strawberry Perl ready"'
+          $strawberryPerl | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Cache Cargo registry and git dependencies
         uses: swatinem/rust-cache@v2
@@ -182,6 +178,11 @@ jobs:
       - name: Build Tauri app
         shell: bash
         run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export PATH="/c/Strawberry/perl/bin:$PATH"
+            perl -MLocale::Maketext::Simple -e 'print "Strawberry Perl ready"'
+          fi
+
           build_args=(--ci --no-sign --target "${{ matrix.rust-target }}")
 
           if [[ "${{ github.event_name }}" != "workflow_dispatch" || "${{ inputs.updater_artifacts }}" != "true" ]]; then

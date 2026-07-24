@@ -1,9 +1,7 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,6 +12,17 @@ env:
   CNB_REGISTRY: "docker.cnb.cool"
 
 jobs:
+  nix-packaging:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Build Nix desktop package
+        run: nix build .#dbx-desktop --no-link --print-build-logs
+
   bump-jdbc-plugin-version:
     runs-on: ubuntu-latest
     outputs:
@@ -88,6 +97,11 @@ jobs:
             arch: arm64
 
     runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      # Keep releases working until the shared S3 secrets are configured.
+      SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -103,9 +117,35 @@ jobs:
         run: pnpm install
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Configure S3 sccache
+        if: env.SCCACHE_GHA_ENABLED != 'true'
+        shell: bash
+        env:
+          CACHE_BUCKET: ${{ secrets.SCCACHE_S3_BUCKET }}
+          CACHE_ENDPOINT: ${{ secrets.SCCACHE_S3_ENDPOINT }}
+          CACHE_REGION: ${{ secrets.SCCACHE_S3_REGION }}
+          CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
+          CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+          CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+        run: |
+          {
+            echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
+            echo "SCCACHE_ENDPOINT=${CACHE_ENDPOINT}"
+            echo "SCCACHE_REGION=${CACHE_REGION}"
+            echo "SCCACHE_S3_KEY_PREFIX=${CACHE_KEY_PREFIX}"
+            echo "SCCACHE_S3_USE_SSL=true"
+            echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
+            echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
+          } >> "$GITHUB_ENV"
 
       - name: Compute Rust dependency hash
         id: deps-hash
@@ -127,6 +167,8 @@ jobs:
           workspaces: "./ -> target"
           shared-key: release-${{ matrix.target }}-${{ steps.deps-hash.outputs.hash }}
           add-rust-environment-hash-key: false
+          # Release tags cannot reuse target caches across refs; sccache handles compiler outputs.
+          cache-targets: false
           cache-on-failure: true
 
       - name: Install Apple certificate (macOS)
@@ -196,8 +238,15 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }}
 
+      - name: Show sccache stats
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
       - name: Upload Windows portable ZIP
         if: matrix.arch == 'x64' || matrix.arch == 'arm64'
+        timeout-minutes: 20
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -208,9 +257,15 @@ jobs:
           $portableDir = Join-Path $portableRoot "DBX_${version}_${arch}"
           $zipName = "DBX_${version}_${arch}-portable.zip"
           $exePath = "target/${{ matrix.target }}/release/dbx.exe"
+          $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
 
           if (!(Test-Path $exePath)) {
             Write-Error "Missing Windows executable: $exePath"
+            exit 1
+          }
+          if (!$appVersion -or $appVersion -ne $version) {
+            Write-Error "Release tag version $version does not match the built DBX package version $appVersion"
             exit 1
           }
 
@@ -220,8 +275,63 @@ jobs:
           Copy-Item "README.md" (Join-Path $portableDir "README.md") -Force
           Set-Content -Path (Join-Path $portableDir "portable.dbx") -Value "" -NoNewline
 
+          $portableExe = Join-Path $portableDir "DBX.exe"
+          $manifest = [ordered]@{
+            schema_version = 1
+            version = $appVersion
+            arch = $arch
+            executable = "DBX.exe"
+            executable_sha256 = (Get-FileHash -LiteralPath $portableExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          } | ConvertTo-Json
+          Set-Content -Path (Join-Path $portableDir "portable-update.json") -Value $manifest -Encoding utf8NoBOM
+
           Compress-Archive -Path (Join-Path $portableDir "*") -DestinationPath $zipName -Force
-          gh release upload "${env:GITHUB_REF_NAME}" $zipName --repo "${env:GITHUB_REPOSITORY}" --clobber
+          # Tauri prompts interactively when the password is omitted, so pass an explicit
+          # empty value for the existing passwordless updater key used by DBX releases.
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            pnpm tauri signer sign "--password=" $zipName
+          } else {
+            pnpm tauri signer sign $zipName
+          }
+
+          $signatureName = "${zipName}.sig"
+          if (!(Test-Path $signatureName)) {
+            Write-Error "Missing portable update signature: $signatureName"
+            exit 1
+          }
+
+          gh release upload "${env:GITHUB_REF_NAME}" $zipName $signatureName --repo "${env:GITHUB_REPOSITORY}" --clobber
+
+      - name: Upload Windows WebView2 offline installer
+        if: matrix.arch == 'x64' || matrix.arch == 'arm64'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $arch = "${{ matrix.arch }}"
+          $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
+          $offlineName = "DBX_${version}_${arch}-webview2-offline-setup.exe"
+          $before = @{}
+
+          if (Test-Path $bundleDir) {
+            Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
+          }
+
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json
+
+          $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
+            Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+
+          if (!$installer) {
+            Write-Error "Missing WebView2 offline installer in ${bundleDir}"
+            exit 1
+          }
+
+          Copy-Item $installer.FullName $offlineName -Force
+          gh release upload "${env:GITHUB_REF_NAME}" $offlineName --repo "${env:GITHUB_REPOSITORY}" --clobber
 
   cleanup-release-signatures:
     needs: build
@@ -236,7 +346,7 @@ jobs:
             gh release view "${GITHUB_REF_NAME}" \
               --repo "${GITHUB_REPOSITORY}" \
               --json assets \
-              --jq '.assets[].name | select(endswith(".sig"))'
+              --jq '.assets[].name | select(endswith(".sig") and (endswith("-portable.zip.sig") | not))'
           )
 
           if [ "${#SIG_ASSETS[@]}" -eq 0 ]; then
@@ -311,7 +421,8 @@ jobs:
             --clobber
 
   publish:
-    needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin]
+    # Keep the release as a draft until every platform and the Nix package pass.
+    needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin, nix-packaging]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
@@ -324,25 +435,34 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
-      - name: Sync release assets to CNB
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download GitHub release assets
         env:
           TAG_NAME: ${{ github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_USERNAME: ${{ github.repository_owner }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CNB_USERNAME: cnb
-          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --clobber
 
-          wget -q https://cnb.cool/znb/mpgrm/-/releases/download/v0.1.0/mpgrm_linux_amd64.tar.gz
-          tar -xf mpgrm_linux_amd64.tar.gz
-          chmod +x mpgrm
-
-          ./mpgrm releases sync \
-            --repo "https://github.com/${GITHUB_REPOSITORY}.git" \
-            --target-repo "https://cnb.cool/${CNB_REPOSITORY}.git" \
-            --tags "${TAG_NAME}"
+      - name: Sync release assets to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_UPLOAD_CONCURRENCY: "3"
+        run: |
+          node .github/scripts/sync-cnb-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --assets-dir "$RUNNER_TEMP/release-assets"
 
   docker:
     runs-on: ubuntu-latest

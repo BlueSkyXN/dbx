@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { AlertCircle, Loader2, Search, Square, Table2 } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
@@ -9,10 +9,10 @@ import { Dialog, DialogFooter, DialogHeader, DialogScrollContent, DialogTitle } 
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useConnectionStore } from "@/stores/connectionStore";
-import * as api from "@/lib/api";
-import { buildDatabaseSearchSql, buildSearchResultWhere, findMatchedSearchColumns } from "@/lib/databaseSearch";
+import * as api from "@/lib/backend/api";
+import { buildDatabaseSearchSql, buildSearchResultWhere, findMatchedSearchColumns } from "@/lib/database/databaseSearch";
 import type { DatabaseType, TableInfo } from "@/types/database";
-import { isSchemaAware } from "@/lib/databaseCapabilities";
+import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 
 const props = defineProps<{
   open: boolean;
@@ -29,6 +29,7 @@ const emit = defineEmits<{
       database: string;
       schema?: string;
       tableName: string;
+      tableType?: string;
       whereInput?: string;
     },
   ];
@@ -45,6 +46,7 @@ type SearchResultItem = {
   id: string;
   schema?: string;
   tableName: string;
+  tableType?: string;
   matchedColumns: string[];
   preview: string;
   whereInput: string;
@@ -223,6 +225,7 @@ async function searchTable(task: SearchTableTask, databaseType: DatabaseType, cu
         id: `${tableLabel}:${rowIndex}:${results.value.length}`,
         schema: task.schema,
         tableName: task.table.name,
+        tableType: task.table.table_type,
         matchedColumns,
         preview: rowPreview(result.columns, row, matchedColumns),
         whereInput,
@@ -257,6 +260,7 @@ function openResult(item: SearchResultItem) {
     database: props.prefillDatabase,
     schema: item.schema,
     tableName: item.tableName,
+    tableType: item.tableType,
     whereInput: item.whereInput,
   });
 }
@@ -264,8 +268,8 @@ function openResult(item: SearchResultItem) {
 
 <template>
   <Dialog v-model:open="dialogOpen">
-    <DialogScrollContent class="max-w-4xl gap-0 p-0">
-      <DialogHeader class="border-b px-5 py-4">
+    <DialogScrollContent class="flex max-h-[calc(var(--dbx-viewport-height)-6rem)] min-h-0 max-w-4xl flex-col overflow-hidden gap-0 p-0">
+      <DialogHeader class="shrink-0 border-b px-5 py-4">
         <DialogTitle class="flex items-center gap-2">
           <Search class="h-5 w-5" />
           {{ t("databaseSearch.title") }}
@@ -276,7 +280,8 @@ function openResult(item: SearchResultItem) {
         </div>
       </DialogHeader>
 
-      <div class="space-y-4 px-5 py-4">
+      <!-- Keep the actions reachable while the search form and results share the available viewport. -->
+      <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
         <div class="grid gap-3 md:grid-cols-[1fr_9rem_auto]">
           <div class="space-y-1.5">
             <Label class="text-xs">{{ t("databaseSearch.keyword") }}</Label>
@@ -320,7 +325,7 @@ function openResult(item: SearchResultItem) {
             <Badge variant="outline">{{ results.length }}</Badge>
           </div>
           <div v-if="results.length" class="max-h-[360px] space-y-2 overflow-auto pr-1">
-            <button v-for="item in results" :key="item.id" class="flex w-full items-start gap-3 rounded-md border bg-background px-3 py-2 text-left transition-colors hover:bg-muted/40" @click="openResult(item)">
+            <button v-for="item in results" :key="item.id" class="flex w-full items-start gap-3 rounded-md border bg-background px-3 py-2 text-left hover:bg-muted/40" @click="openResult(item)">
               <Table2 class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
               <div class="min-w-0 flex-1">
                 <div class="flex min-w-0 flex-wrap items-center gap-2">
@@ -350,7 +355,7 @@ function openResult(item: SearchResultItem) {
         </div>
       </div>
 
-      <DialogFooter class="border-t px-5 py-3">
+      <DialogFooter class="shrink-0 border-t px-5 py-3">
         <Button variant="outline" @click="dialogOpen = false">{{ t("common.close") }}</Button>
       </DialogFooter>
     </DialogScrollContent>
