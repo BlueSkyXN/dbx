@@ -78,6 +78,15 @@ pub struct RedisKeyRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RedisSetTtlRequest {
+    pub connection_id: String,
+    pub db: u32,
+    pub key_raw: String,
+    pub ttl: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RedisLoadMoreRequest {
     pub connection_id: String,
     pub db: u32,
@@ -451,6 +460,14 @@ pub async fn zadd(State(state): State<Arc<WebState>>, Json(req): Json<RedisZaddR
     Ok(Json(()))
 }
 
+pub async fn zrem(State(state): State<Arc<WebState>>, Json(req): Json<RedisSetRequest>) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "ZREM").await?;
+    dbx_core::redis_ops::redis_zrem_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, &req.member)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(()))
+}
+
 pub async fn stream_add(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RedisStreamAddRequest>,
@@ -494,6 +511,17 @@ pub async fn check_json_module(
         .await
         .map_err(AppError::from)?;
     Ok(Json(result))
+}
+
+pub async fn set_ttl(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RedisSetTtlRequest>,
+) -> Result<Json<()>, AppError> {
+    ensure_writable(&state.app, &req.connection_id, "EXPIRE").await?;
+    dbx_core::redis_ops::redis_set_ttl_in_db_core(&state.app, &req.connection_id, req.db, &req.key_raw, req.ttl)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(()))
 }
 
 pub async fn delete_keys(
@@ -608,4 +636,24 @@ pub async fn cluster_master_nodes(
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redis_write_route_contracts_use_read_only_guard_and_core_helpers() {
+        let source = include_str!("redis.rs");
+        let source = source.split("\n#[cfg(test)]").next().expect("Redis route source before tests");
+        let zrem_start = source.find("pub async fn zrem").expect("zrem handler");
+        let zrem_end = source.find("pub async fn stream_add").expect("stream_add handler");
+        let zrem = &source[zrem_start..zrem_end];
+        let set_ttl_start = source.find("pub async fn set_ttl").expect("set_ttl handler");
+        let set_ttl_end = source.find("pub async fn delete_keys").expect("delete_keys handler");
+        let set_ttl = &source[set_ttl_start..set_ttl_end];
+
+        assert!(zrem.contains("ensure_writable(&state.app, &req.connection_id, \"ZREM\").await?;"));
+        assert!(zrem.contains("redis_zrem_in_db_core"));
+        assert!(set_ttl.contains("ensure_writable(&state.app, &req.connection_id, \"EXPIRE\").await?;"));
+        assert!(set_ttl.contains("redis_set_ttl_in_db_core"));
+    }
 }
