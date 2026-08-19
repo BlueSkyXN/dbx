@@ -204,6 +204,16 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "duckdb":
       return "duckdb:///absolute/path/to/database.duckdb";
 
+    case "csvfile":
+      return "csv:///absolute/path/to/data.csv";
+
+    case "xlsxfile":
+      return "xlsx:///absolute/path/to/workbook.xlsx";
+
+    case "feishu_sheets":
+    case "feishu_bitable":
+      return "https://open.feishu.cn";
+
     case "access":
       return "jdbc:ucanaccess:///absolute/path/to/database.accdb";
 

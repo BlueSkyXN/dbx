@@ -33,6 +33,8 @@ import type {
   RuleInfo,
   OwnerInfo,
   QueryResult,
+  ExternalWriteResult,
+  ExternalRowUpdate,
   SqlReferenceAnalysis,
   DatabaseType,
   InstalledPlugin,
@@ -4374,6 +4376,26 @@ export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
 
 export async function refreshConnections(): Promise<void> {
   // Web mode doesn't maintain persistent connection pools - no-op
+}
+
+export async function refreshExternalConnection(connectionId: string): Promise<void> {
+  return post("/api/connection/refresh-external", { connectionId });
+}
+
+export async function appendExternalRows(connectionId: string, tableName: string, rows: unknown[][]): Promise<ExternalWriteResult> {
+  return post("/api/connection/append-external-rows", { connectionId, tableName, rows });
+}
+
+export async function updateExternalRows(connectionId: string, tableName: string, updates: ExternalRowUpdate[]): Promise<ExternalWriteResult> {
+  return post("/api/connection/update-external-rows", { connectionId, tableName, updates });
+}
+
+export async function deleteExternalRows(connectionId: string, tableName: string, rowIds: string[]): Promise<ExternalWriteResult> {
+  return post("/api/connection/delete-external-rows", { connectionId, tableName, rowIds });
+}
+
+export async function writeExternalRange(connectionId: string, tableName: string, range: string, rows: unknown[][]): Promise<ExternalWriteResult> {
+  return post("/api/connection/write-external-range", { connectionId, tableName, range, rows });
 }
 
 export * from "@/lib/backend/mq-http";

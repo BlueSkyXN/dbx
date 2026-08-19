@@ -143,6 +143,7 @@ import { defaultQueryResultArchiveFileName } from "@/lib/query/queryResultArchiv
 import { saveQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { isTableDataEditable } from "@/lib/table/tableEditing";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
+import { externalRecordIdColumn, isFeishuBitableTableEditable, isFeishuSheetsGridEditable } from "@/lib/table/externalTableEditing";
 import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
 import { formatShortcut } from "@/lib/editor/shortcutRegistry";
 import type { CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
@@ -152,13 +153,14 @@ import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elastics
 import * as api from "@/lib/backend/api";
 import { applyMongoGridChangesToDocument, applyMongoGridChangesToDocumentBaseline, buildMongoUpdateDocument, formatMongoShellLiteral, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import type { SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
+import type { CellValue } from "@/lib/dataGrid/cellValue";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { isDataGridToolbarCompact, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
 import { useTabScroll } from "@/composables/useTabScroll";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
-import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport } from "@/types/database";
+import type { QueryTab, ConnectionConfig, TableInfoTab, TreeNode, VectorCollectionMeta, ObjectBrowserViewport, ExternalRowUpdate } from "@/types/database";
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -316,7 +318,6 @@ const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
-const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeResultExecutionTarget = computed(() => queryStore.activeResultExecutionTarget(props.activeTab.id));
 const activeResultConnection = computed(() => (activeResultExecutionTarget.value ? connectionStore.getConfig(activeResultExecutionTarget.value.connectionId) : props.activeConnection));
@@ -325,6 +326,78 @@ const activeResultDatabase = computed(() => activeResultExecutionTarget.value?.d
 const activeResultSchema = computed(() => activeResultExecutionTarget.value?.schema ?? props.activeTab.schema);
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(activeResultConnection.value));
 const activeVectorConnection = computed(() => connectionStore.getConfig(props.activeTab.connectionId) ?? props.activeConnection);
+const queryResultEditable = computed(() => !!props.activeTab.queryAnalysis && isFeishuSheetsGridEditable(activeEffectiveDatabaseType.value) && activeEffectiveDatabaseType.value !== "feishu_bitable");
+const feishuBitableRecordIdColumn = computed(() => (activeEffectiveDatabaseType.value === "feishu_bitable" && props.activeTab.result ? externalRecordIdColumn(activeDataTabTableMeta.value?.primaryKeys, props.activeTab.result.columns) : undefined));
+const dataTabSourceColumns = computed(() => {
+  const resultColumns = props.activeTab.result?.columns;
+  if (!resultColumns || activeEffectiveDatabaseType.value !== "feishu_bitable") return undefined;
+  const recordIdColumn = feishuBitableRecordIdColumn.value;
+  return resultColumns.map((column) => (recordIdColumn && column === recordIdColumn ? undefined : column));
+});
+const dataTabEditable = computed(() => {
+  if (
+    props.activeTab.result &&
+    isFeishuBitableTableEditable({
+      databaseType: activeEffectiveDatabaseType.value,
+      context: "table-data",
+      connectionId: props.activeTab.connectionId,
+      tableMeta: activeDataTabTableMeta.value,
+      resultColumns: props.activeTab.result.columns,
+    })
+  ) {
+    return !props.activeTab.tableMetaPending;
+  }
+  return !props.activeTab.tableMetaPending && isTableDataEditable(activeEffectiveDatabaseType.value, activeDataTabTableMeta.value?.primaryKeys ?? [], activeDataTabTableMeta.value?.tableType);
+});
+const externalTableSaveHandler = computed<CustomSaveHandler | undefined>(() => {
+  const result = props.activeTab.result;
+  const tableMeta = activeDataTabTableMeta.value;
+  const connectionId = props.activeTab.connectionId;
+  const recordIdColumn = feishuBitableRecordIdColumn.value;
+  if (
+    !result ||
+    !recordIdColumn ||
+    !isFeishuBitableTableEditable({
+      databaseType: activeEffectiveDatabaseType.value,
+      context: "table-data",
+      connectionId,
+      tableMeta,
+      resultColumns: result.columns,
+    })
+  ) {
+    return undefined;
+  }
+
+  return {
+    async save(changes) {
+      if (!connectionId || !tableMeta) throw new Error("Missing Feishu Bitable table context");
+      const recordIdIndex = changes.columns.indexOf(recordIdColumn);
+      if (recordIdIndex < 0) throw new Error("Feishu Bitable edits require the DBX record ID column");
+      const updates: ExternalRowUpdate[] = [];
+      for (const [rowIndex, rowChanges] of changes.dirtyRows.entries()) {
+        const row = changes.rows[rowIndex];
+        const rowId = String(row?.[recordIdIndex] ?? "").trim();
+        if (!rowId) continue;
+        const fields: Record<string, unknown> = {};
+        for (const [columnIndex, value] of rowChanges.entries()) {
+          const columnName = changes.columns[columnIndex];
+          if (!columnName || columnName === recordIdColumn) continue;
+          fields[columnName] = value;
+        }
+        if (Object.keys(fields).length > 0) updates.push({ rowId, fields });
+      }
+      const rowIds = [...changes.deletedRows].map((rowIndex) => String(changes.rows[rowIndex]?.[recordIdIndex] ?? "").trim()).filter(Boolean);
+      const writableColumnIndexes = changes.columns
+        .map((columnName, index) => ({ columnName, index }))
+        .filter(({ columnName }) => columnName !== recordIdColumn)
+        .map(({ index }) => index);
+      const rowsToAppend = changes.newRows.map((row) => writableColumnIndexes.map((index) => row[index] ?? null) as CellValue[]);
+      if (updates.length > 0) await api.updateExternalRows(connectionId, tableMeta.tableName, updates);
+      if (rowIds.length > 0) await api.deleteExternalRows(connectionId, tableMeta.tableName, rowIds);
+      if (rowsToAppend.length > 0) await api.appendExternalRows(connectionId, tableMeta.tableName, rowsToAppend);
+    },
+  };
+});
 const activeDataTabExecutionDatabase = computed(() => dataTabExecutionDatabase(props.activeConnection, props.activeTab.database, activeDataTabTableMeta.value?.catalog));
 const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
 const productionWatermarkText = computed(() => (locale.value.startsWith("zh") ? "生产环境" : "PROD"));
@@ -1755,7 +1828,7 @@ defineExpose({
                 :sql="activeResultSql"
                 :export-sql="activeResultExportSql"
                 :loading="activeTab.isExecuting"
-                :editable="!!activeTab.queryAnalysis || !!mongoQueryResultSaveHandler"
+                :editable="queryResultEditable || !!mongoQueryResultSaveHandler"
                 :source-columns="activeTab.querySourceColumns"
                 :readonly-column-indexes="groupedQueryReadonlyColumnIndexes(activeTab)"
                 :result-column-comments="activeTab.resultColumnComments"
@@ -2139,7 +2212,9 @@ defineExpose({
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="!activeTab.tableMetaPending && isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType)"
+          :editable="dataTabEditable"
+          :source-columns="dataTabSourceColumns"
+          :custom-save-handler="externalTableSaveHandler"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
           :database-type="activeEffectiveDatabaseType"

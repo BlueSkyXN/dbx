@@ -1793,6 +1793,43 @@ async fn do_execute_typed(
         PoolKind::DuckDbWorker(_) => {
             return Err("DuckDB worker support is not compiled in this build".into());
         }
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::ExternalTabular(pool) => {
+            if !crate::sql::starts_with_duckdb_result_sql_keyword(sql) {
+                return Err("External data sources are read-only. Only result-returning queries are supported.".into());
+            }
+            let pool = pool.clone();
+            if let Some(ref execution_id) = options.execution_id {
+                let cancel_worker = pool.worker();
+                state.running_queries.register_interrupt(execution_id, move || {
+                    let cancel_worker = cancel_worker.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = cancel_worker.cancel().await {
+                            log::warn!("Failed to cancel external cache query: {error}");
+                        }
+                    });
+                });
+            }
+            let sql = sql.to_string();
+            let database = database.map(str::to_string);
+            let max_rows = options.max_rows;
+            drop(connections);
+            match pool.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    let is_control_error = error.message == QUERY_CANCELED
+                        || is_dbx_query_timeout_error(&error.message.to_ascii_lowercase());
+                    if !is_control_error {
+                        typed_duckdb_error = Some(error.clone());
+                    }
+                    Err(error.message)
+                }
+            }
+        }
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        PoolKind::ExternalTabular(_) => {
+            return Err("External tabular source support requires the DuckDB sidecar driver".into());
+        }
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
@@ -3881,6 +3918,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Consul(_)
         | PoolKind::HBase(_)
         | PoolKind::DuckDbWorker(_)
+        | PoolKind::ExternalTabular(_)
         | PoolKind::Redis(_)
         | PoolKind::MongoDb(_)
         | PoolKind::DynamoDb(_)
@@ -4150,6 +4188,7 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
             #[cfg(feature = "mq-admin")]
             PoolKind::Mqtt(_) => TxPath::None,
             PoolKind::DuckDbWorker(_)
+            | PoolKind::ExternalTabular(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
             | PoolKind::DynamoDb(_)
