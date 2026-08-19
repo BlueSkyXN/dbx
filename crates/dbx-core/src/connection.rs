@@ -22,6 +22,7 @@ use crate::db::agent_driver::{AgentCallError, AgentMethod};
 use crate::db::http_tunnel::HttpTunnelManager;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
+use crate::external;
 use crate::models::connection::{
     database_info_from_protocol_value, parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host,
     ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, TransportLayerConfig,
@@ -59,6 +60,17 @@ mod duckdb_types {
 
 use duckdb_types::DuckDbWorkerHandle;
 
+mod external_tabular_types {
+    #[cfg(feature = "duckdb-sidecar")]
+    use std::sync::Arc;
+    #[cfg(feature = "duckdb-sidecar")]
+    pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub type ExternalTabularHandle = ();
+}
+
+use external_tabular_types::ExternalTabularHandle;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MysqlMode {
     Normal,
@@ -89,6 +101,7 @@ pub enum PoolKind {
     CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
     Redis(db::redis_driver::RedisConnection),
     DuckDbWorker(DuckDbWorkerHandle),
+    ExternalTabular(ExternalTabularHandle),
     MongoDb(mongodb::Client),
     DynamoDb(db::dynamodb_driver::DynamoDbClient),
     ClickHouse(db::clickhouse_driver::ChClient),
@@ -129,6 +142,7 @@ impl PoolKind {
             Self::Turso(client) => Some(Self::Turso(client.clone())),
             Self::CloudflareD1(client) => Some(Self::CloudflareD1(client.clone())),
             Self::DuckDbWorker(client) => Some(Self::DuckDbWorker(client.clone())),
+            Self::ExternalTabular(client) => Some(Self::ExternalTabular(client.clone())),
             Self::MongoDb(client) => Some(Self::MongoDb(client.clone())),
             Self::ClickHouse(client) => Some(Self::ClickHouse(client.clone())),
             Self::SqlServer(client) => Some(Self::SqlServer(client.clone())),
@@ -652,7 +666,8 @@ pub fn database_connection_config_with_catalog(
                 | DatabaseType::MongoDb
                 | DatabaseType::OceanbaseOracle
                 | DatabaseType::CloudflareD1
-        ) {
+        ) && !db_config.db_type.is_external_tabular()
+        {
             db_config.database = Some(db.to_string());
         }
     }
@@ -1283,6 +1298,45 @@ impl AppState {
         let pool = self.create_duckdb_pool(config).await?;
         close_pool_kind(pool).await?;
         Ok(())
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn create_external_tabular_pool(&self, config: &ConnectionConfig) -> Result<PoolKind, String> {
+        let file_path = expand_tilde(&config.host);
+        let external_config = external::ExternalConfig::parse(&config.db_type, config.external_config.as_ref())?;
+        let source: Arc<dyn external::ExternalTabularSource> = match external_config {
+            external::ExternalConfig::Csv(csv_config) => {
+                Arc::new(external::CsvSource::new(PathBuf::from(file_path), csv_config))
+            }
+            external::ExternalConfig::Xlsx(xlsx_config) => {
+                Arc::new(external::XlsxSource::new(PathBuf::from(file_path), xlsx_config))
+            }
+            external::ExternalConfig::FeishuSheets(feishu_config) => Arc::new(external::FeishuSheetsSource::new(
+                &config.host,
+                &config.username,
+                &config.password,
+                feishu_config,
+            )),
+            external::ExternalConfig::FeishuBitable(feishu_config) => Arc::new(external::FeishuBitableSource::new(
+                &config.host,
+                &config.username,
+                &config.password,
+                feishu_config,
+            )),
+        };
+
+        let mut cache_config = config.clone();
+        cache_config.host = ":memory:".to_string();
+        cache_config.database = None;
+        cache_config.attached_databases.clear();
+        cache_config.init_script = None;
+        let worker = match self.create_duckdb_pool(&cache_config).await? {
+            PoolKind::DuckDbWorker(worker) => worker,
+            _ => return Err("Failed to create isolated DuckDB cache worker".to_string()),
+        };
+        let pool = external::ExternalPool::new(source, worker);
+        pool.refresh_cache().await?;
+        Ok(PoolKind::ExternalTabular(Arc::new(pool)))
     }
 
     pub async fn test_external_driver(&self, driver_id: &str, config: &ConnectionConfig) -> Result<String, String> {
@@ -2072,6 +2126,18 @@ impl AppState {
             DatabaseType::DuckDb => {
                 return Err("DuckDB support is not compiled in this build.".to_string());
             }
+            #[cfg(feature = "duckdb-sidecar")]
+            DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => self.create_external_tabular_pool(&db_config).await?,
+            #[cfg(not(feature = "duckdb-sidecar"))]
+            DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable => {
+                return Err("External tabular source support requires the DuckDB sidecar driver.".to_string());
+            }
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&db_config) {
                     log::info!("Using configured MongoDB legacy driver for connection_id={connection_id}");
@@ -2672,8 +2738,8 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        let transport_layers = self.resolved_transport_layers(config).await?;
-        if transport_layers.is_empty() {
+        let transport_layers = config.effective_transport_layers();
+        if transport_layers.is_empty() || config.db_type.is_external_tabular() {
             return Ok((config.host.clone(), config.port));
         }
         if config.uses_oracle_tns() {
@@ -3418,6 +3484,7 @@ impl AppState {
                 }
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDbWorker(_)
+                | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
                 | PoolKind::Nacos
@@ -4335,6 +4402,7 @@ impl AppState {
                 }
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDbWorker(_)
+                | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
                 | PoolKind::Nacos
@@ -4553,6 +4621,117 @@ impl AppState {
     async fn uses_forwarded_transport(&self, connection_id: &str) -> bool {
         let configs = self.configs.read().await;
         configs.get(connection_id).is_some_and(|config| config.has_effective_transport_layers())
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn refresh_external_pool(&self, connection_id: &str) -> Result<(), String> {
+        let pool = {
+            let connections = self.connections.read().await;
+            match connections.get(connection_id) {
+                Some(PoolKind::ExternalTabular(pool)) => pool.clone(),
+                Some(_) => return Err("Connection is not an external tabular source".to_string()),
+                None => return Err("Connection is not connected".to_string()),
+            }
+        };
+
+        pool.refresh_cache().await
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    async fn external_pool_for_connection(&self, connection_id: &str) -> Result<ExternalTabularHandle, String> {
+        let connections = self.connections.read().await;
+        match connections.get(connection_id) {
+            Some(PoolKind::ExternalTabular(pool)) => Ok(pool.clone()),
+            Some(_) => Err("Connection is not an external tabular source".to_string()),
+            None => Err("Connection is not connected".to_string()),
+        }
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn append_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.append_rows(table_name, rows).await
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn update_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        updates: Vec<external::ExternalRowUpdate>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.update_rows(table_name, updates).await
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn delete_external_rows(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        row_ids: Vec<String>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.delete_rows(table_name, row_ids).await
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    pub async fn write_external_range(
+        &self,
+        connection_id: &str,
+        table_name: &str,
+        range: &str,
+        rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        self.external_pool_for_connection(connection_id).await?.write_range(table_name, range, rows).await
+    }
+
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub async fn refresh_external_pool(&self, _connection_id: &str) -> Result<(), String> {
+        Err("External file source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub async fn append_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub async fn update_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _updates: Vec<external::ExternalRowUpdate>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub async fn delete_external_rows(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _row_ids: Vec<String>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
+    }
+
+    #[cfg(not(feature = "duckdb-sidecar"))]
+    pub async fn write_external_range(
+        &self,
+        _connection_id: &str,
+        _table_name: &str,
+        _range: &str,
+        _rows: Vec<Vec<serde_json::Value>>,
+    ) -> Result<external::ExternalWriteResult, String> {
+        Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 }
 
@@ -5014,6 +5193,10 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
         #[cfg(not(feature = "duckdb-sidecar"))]
         PoolKind::DuckDbWorker(_) => PoolKind::DuckDbWorker(()),
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::ExternalTabular(pool) => PoolKind::ExternalTabular(pool.clone()),
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        PoolKind::ExternalTabular(_) => PoolKind::ExternalTabular(()),
         PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
         PoolKind::DynamoDb(client) => PoolKind::DynamoDb(client.clone()),
         PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
@@ -5057,6 +5240,12 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
         }
         #[cfg(not(feature = "duckdb-sidecar"))]
         PoolKind::DuckDbWorker(_) => {}
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::ExternalTabular(pool) => {
+            pool.worker().shutdown().await;
+        }
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        PoolKind::ExternalTabular(_) => {}
         PoolKind::MongoDb(client) => {
             drop(client);
         }
@@ -5192,7 +5381,7 @@ fn is_connection_slot_exhausted_error(error: &str) -> bool {
 }
 
 fn shares_database_pool_with_connection(db_type: &DatabaseType) -> bool {
-    matches!(db_type, DatabaseType::Oracle)
+    matches!(db_type, DatabaseType::Oracle) || db_type.is_external_tabular()
 }
 
 #[cfg(test)]
@@ -8778,5 +8967,76 @@ for line in sys.stdin:
             .unwrap_or_else(|err| panic!("failed to drop KWDB test schema: {err}"));
         pool.close();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_tabular_database_scope_reuses_connection_pool_key() {
+        assert_eq!(super::base_pool_key_for(Some(DatabaseType::CsvFile), "csv", Some("main"), false), "csv");
+        assert_eq!(super::base_pool_key_for(Some(DatabaseType::XlsxFile), "xlsx", Some("main"), false), "xlsx");
+        assert_eq!(super::base_pool_key_for(Some(DatabaseType::FeishuSheets), "sheets", Some("main"), false), "sheets");
+        assert_eq!(
+            super::base_pool_key_for(Some(DatabaseType::FeishuBitable), "bitable", Some("main"), false),
+            "bitable"
+        );
+        assert_eq!(super::base_pool_key_for(Some(DatabaseType::Mysql), "mysql", Some("main"), false), "mysql:main");
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    #[tokio::test]
+    async fn external_csv_pool_is_reused_and_refresh_reloads_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx_external_csv_pool_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv_path = dir.join("people.csv");
+        let db_path = dir.join("state.sqlite");
+        std::fs::write(&csv_path, "name\nAda\n").unwrap();
+
+        let storage = Storage::open(&db_path).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = mysql_config(None);
+        config.id = "csv".to_string();
+        config.name = "CSV".to_string();
+        config.db_type = DatabaseType::CsvFile;
+        config.driver_profile = Some("csvfile".to_string());
+        config.driver_label = Some("CSV".to_string());
+        config.host = csv_path.to_string_lossy().to_string();
+        config.port = 0;
+        config.username.clear();
+        config.password.clear();
+        config.database = None;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let key = state.get_or_create_pool("csv", Some("main")).await.unwrap();
+        assert_eq!(key, "csv");
+        let key_again = state.get_or_create_pool("csv", Some("main")).await.unwrap();
+        assert_eq!(key_again, "csv");
+
+        {
+            let connections = state.connections.read().await;
+            assert_eq!(connections.len(), 1);
+            assert!(matches!(connections.get("csv"), Some(PoolKind::ExternalTabular(_))));
+        }
+
+        let result =
+            query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None).await.unwrap();
+        assert_eq!(result.rows[0][0], serde_json::Value::String("Ada".to_string()));
+
+        std::fs::write(&csv_path, "name\nGrace\n").unwrap();
+        state.refresh_external_pool("csv").await.unwrap();
+
+        let refreshed =
+            query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None).await.unwrap();
+        assert_eq!(refreshed.rows[0][0], serde_json::Value::String("Grace".to_string()));
+
+        let write_err =
+            query::execute_sql_statement(&state, "csv", "main", "UPDATE people SET name = 'Lin'", None, None)
+                .await
+                .unwrap_err();
+        assert!(write_err.contains("read-only"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -24,6 +24,7 @@ pub const NACOS_AUTH_PASSWORD_KEY: &str = "nacos.auth.password";
 pub const NACOS_RNACOS_CONSOLE_PASSWORD_KEY: &str = "nacos.auth.rnacos_console_password";
 pub const MQTT_AUTH_SECRET_PREFIX: &str = "mqtt.auth.";
 pub const MQTT_AUTH_PASSWORD_KEY: &str = "mqtt.auth.password";
+pub const FEISHU_ACCESS_TOKEN_KEY: &str = "feishu_access_token";
 
 pub trait ConnectionSecretStore {
     fn set_secret(&self, connection_id: &str, key: &str, secret: &str) -> Result<(), String>;
@@ -112,6 +113,7 @@ pub fn save_connections_to_file(
         persist_mq_auth_secrets(store, config)?;
         persist_mq_token_signing_secret(store, config)?;
         persist_mqtt_auth_secrets(store, config)?;
+        persist_optional_secret(store, &config.id, FEISHU_ACCESS_TOKEN_KEY, feishu_access_token(config).as_deref())?;
 
         // New configs persist transport-layer secrets only. Remove legacy transport secret slots after the
         // migrated layer values have been written so old configs do not keep two sources of truth.
@@ -135,6 +137,7 @@ pub fn load_connections_from_file(
     let mut configs = read_connections(path)?;
     let mut needs_rewrite = false;
     for config in &mut configs {
+        let legacy_feishu_token = feishu_access_token(config);
         if config.password.is_empty() {
             if let Some(secret) = store.get_secret(&config.id, MAIN_PASSWORD_KEY)? {
                 config.password = secret;
@@ -181,6 +184,18 @@ pub fn load_connections_from_file(
         hydrate_mq_auth_secrets(store, config, &mut needs_rewrite)?;
         hydrate_mq_token_signing_secret(store, config, &mut needs_rewrite)?;
         hydrate_mqtt_auth_secrets(store, config, &mut needs_rewrite)?;
+        let stored_feishu_token = store.get_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
+        if legacy_feishu_token.is_some() {
+            needs_rewrite = true;
+        }
+        match (stored_feishu_token, legacy_feishu_token) {
+            (Some(token), _) => set_feishu_access_token(config, token),
+            (None, Some(token)) => {
+                store.set_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY, &token)?;
+                set_feishu_access_token(config, token);
+            }
+            (None, None) => {}
+        }
     }
 
     if needs_rewrite {
@@ -360,6 +375,7 @@ fn delete_removed_connection_secrets(
         delete_secret_prefix(store, &config.id, MQ_AUTH_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQ_TOKEN_SIGNING_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
+        store.delete_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
     }
     Ok(())
 }
@@ -636,11 +652,49 @@ fn mqtt_auth_object_mut(
 ) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
     value?.get_mut("auth")?.as_object_mut()
 }
-
 fn scrub_json_secret(auth: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
     if auth.contains_key(field) {
         auth.insert(field.to_string(), serde_json::Value::String(String::new()));
     }
+}
+
+fn is_feishu_connection(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::FeishuSheets | DatabaseType::FeishuBitable)
+}
+
+fn feishu_access_token(config: &ConnectionConfig) -> Option<String> {
+    if !is_feishu_connection(&config.db_type) {
+        return None;
+    }
+    config
+        .external_config
+        .as_ref()
+        .and_then(|value| value.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn scrub_feishu_access_token(config: &mut ConnectionConfig) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    if let Some(serde_json::Value::Object(object)) = config.external_config.as_mut() {
+        object.remove("access_token");
+    }
+}
+
+fn set_feishu_access_token(config: &mut ConnectionConfig, token: String) {
+    if !is_feishu_connection(&config.db_type) {
+        return;
+    }
+    let mut object = match config.external_config.take() {
+        Some(serde_json::Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert("access_token".to_string(), serde_json::Value::String(token));
+    config.external_config = Some(serde_json::Value::Object(object));
 }
 
 fn mq_auth_kind(auth: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
@@ -745,6 +799,7 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
             scrub_mq_auth_secrets(&mut config);
             scrub_mq_token_signing_secret(&mut config);
             scrub_mqtt_auth_secrets(&mut config);
+            scrub_feishu_access_token(&mut config);
             config
         })
         .collect()
@@ -757,9 +812,9 @@ pub fn secret_account(connection_id: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_connections_from_file, save_connections_to_file, ConnectionSecretStore, CONNECTION_STRING_KEY,
-        INIT_SCRIPT_KEY, MAIN_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
-        MQ_TOKEN_SIGNING_KEY, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
+        feishu_access_token, load_connections_from_file, save_connections_to_file, ConnectionSecretStore,
+        CONNECTION_STRING_KEY, FEISHU_ACCESS_TOKEN_KEY, INIT_SCRIPT_KEY, MAIN_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY,
+        MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
     };
     use crate::models::connection::{
         ConnectionConfig, DatabaseType, HttpTunnelConfig, SshTunnelConfig, TransportLayerConfig,
@@ -880,6 +935,21 @@ mod tests {
             production_databases: vec![],
             database_info: None,
         }
+    }
+
+    fn feishu_connection(id: &str, token: &str) -> ConnectionConfig {
+        let mut config = connection(id, "", "");
+        config.db_type = DatabaseType::FeishuBitable;
+        config.driver_profile = Some("feishu_bitable".to_string());
+        config.driver_label = Some("Feishu Bitable".to_string());
+        config.host = "https://open.feishu.cn".to_string();
+        config.port = 0;
+        config.database = None;
+        config.external_config = Some(serde_json::json!({
+            "access_token": token,
+            "app_token": "app_test"
+        }));
+        config
     }
 
     fn ssh_hop(id: &str, password: &str, passphrase: &str) -> SshTunnelConfig {
@@ -1096,6 +1166,41 @@ mod tests {
 
         let loaded = load_connections_from_file(&path, &store).unwrap();
         assert_eq!(loaded[0].init_script.as_deref(), Some("CREATE SECRET (TYPE quack, TOKEN 'token-value');"));
+    }
+
+    #[test]
+    fn save_connections_moves_feishu_access_token_to_secret_store_and_restores_it() {
+        let path = temp_connections_file("feishu-token");
+        let store = MemorySecretStore::default();
+        let config = feishu_connection("feishu", "tenant-token");
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(store.get_existing("feishu", FEISHU_ACCESS_TOKEN_KEY).as_deref(), Some("tenant-token"));
+        let persisted = read_configs(&path);
+        let persisted_json = serde_json::to_string(&persisted[0].external_config).unwrap();
+        assert!(!persisted_json.contains("tenant-token"));
+        assert!(!persisted_json.contains("access_token"));
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("tenant-token"));
+    }
+
+    #[test]
+    fn load_connections_migrates_legacy_feishu_access_token_and_rewrites_sanitized_file() {
+        let path = temp_connections_file("legacy-feishu-token");
+        let store = MemorySecretStore::default();
+        let legacy = vec![feishu_connection("legacy", "legacy-token")];
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+
+        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("legacy-token"));
+        assert_eq!(store.get_existing("legacy", FEISHU_ACCESS_TOKEN_KEY).as_deref(), Some("legacy-token"));
+        let persisted = read_configs(&path);
+        let persisted_json = serde_json::to_string(&persisted[0].external_config).unwrap();
+        assert!(!persisted_json.contains("legacy-token"));
+        assert!(!persisted_json.contains("access_token"));
     }
 
     #[test]

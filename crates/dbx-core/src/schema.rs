@@ -746,6 +746,8 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         PoolKind::HBase(client) => db::hbase_driver::list_namespaces(client).await,
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => client.list_databases().await,
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::ExternalTabular(pool) => pool.worker().list_databases().await,
         PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_databases(client).await,
         _ => Ok(vec![]),
     }
@@ -981,6 +983,12 @@ async fn list_schemas_once(
                 .await
                 .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref()))
         }
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::ExternalTabular(pool) => pool
+            .worker()
+            .list_schemas(database.to_string())
+            .await
+            .map(|schemas| filter_visible_schema_names(schemas, visible_schema_filter.as_deref())),
         _ => Ok(vec![]),
     }
 }
@@ -2020,6 +2028,17 @@ async fn list_tables_once(
         }
         #[cfg(feature = "duckdb-sidecar")]
         if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
+            let database = database.to_string();
+            let schema = schema.to_string();
+            drop(connections);
+            return client
+                .list_tables(database, schema)
+                .await
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter));
+        }
+        #[cfg(feature = "duckdb-sidecar")]
+        if let Some(pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
+            let client = pool.worker();
             let database = database.to_string();
             let schema = schema.to_string();
             drop(connections);
@@ -4983,6 +5002,11 @@ pub async fn completion_assistant_search_core(
                 drop(connections);
                 return client.completion_assistant(request.clone()).await;
             }
+            if let Some(pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
+                let client = pool.worker();
+                drop(connections);
+                return client.completion_assistant(request.clone()).await;
+            }
         }
 
         {
@@ -5982,6 +6006,15 @@ async fn get_columns_core_for_session_inner(
                 drop(connections);
                 return client.list_columns(database, schema, table).await;
             }
+            #[cfg(feature = "duckdb-sidecar")]
+            if let Some(pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
+                let client = pool.worker();
+                let database = database.to_string();
+                let schema = schema.to_string();
+                let table = table.to_string();
+                drop(connections);
+                return client.list_columns(database, schema, table).await;
+            }
             if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
                 drop(connections);
                 return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
@@ -6933,6 +6966,12 @@ async fn get_table_ddl_once(
         #[cfg(feature = "duckdb-sidecar")]
         if let Some(client) = extract_pool!(&connections, &pool_key, DuckDbWorker) {
             let client = client.clone();
+            drop(connections);
+            return client.get_table_ddl(database.to_string(), schema.to_string(), table.to_string()).await;
+        }
+        #[cfg(feature = "duckdb-sidecar")]
+        if let Some(pool) = extract_pool!(&connections, &pool_key, ExternalTabular) {
+            let client = pool.worker();
             drop(connections);
             return client.get_table_ddl(database.to_string(), schema.to_string(), table.to_string()).await;
         }
@@ -7986,6 +8025,16 @@ async fn get_object_source_once(
                 #[cfg(feature = "duckdb-sidecar")]
                 PoolKind::DuckDbWorker(client) => {
                     let client = client.clone();
+                    let database = database.to_string();
+                    let schema = schema.to_string();
+                    let name = name.to_string();
+                    let object_type = object_type.clone();
+                    drop(connections);
+                    client.get_object_source(database, schema, name, object_type).await?
+                }
+                #[cfg(feature = "duckdb-sidecar")]
+                PoolKind::ExternalTabular(pool) => {
+                    let client = pool.worker();
                     let database = database.to_string();
                     let schema = schema.to_string();
                     let name = name.to_string();

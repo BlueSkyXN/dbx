@@ -14,6 +14,10 @@ pub fn is_single_connection_pool(db_type: &DatabaseType) -> bool {
         db_type,
         DatabaseType::Sqlite
             | DatabaseType::DuckDb
+            | DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable
             | DatabaseType::Rqlite
             | DatabaseType::Turso
             | DatabaseType::CloudflareD1
@@ -54,6 +58,10 @@ pub fn skips_tcp_probe(db_type: &DatabaseType) -> bool {
         db_type,
         DatabaseType::Sqlite
             | DatabaseType::DuckDb
+            | DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable
             | DatabaseType::Turso
             | DatabaseType::CloudflareD1
             | DatabaseType::Jdbc
@@ -68,7 +76,15 @@ pub fn skips_tcp_probe(db_type: &DatabaseType) -> bool {
 /// manager" affordance. Whether the H2 connection is actually in file mode must
 /// be determined separately by parsing the JDBC URL.
 pub fn is_local_file_db_type(db_type: &DatabaseType) -> bool {
-    matches!(db_type, DatabaseType::Sqlite | DatabaseType::DuckDb | DatabaseType::Access | DatabaseType::H2)
+    matches!(
+        db_type,
+        DatabaseType::Sqlite
+            | DatabaseType::DuckDb
+            | DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::Access
+            | DatabaseType::H2
+    )
 }
 
 #[cfg(test)]
@@ -79,6 +95,8 @@ mod tests {
     fn local_file_db_types_match_expected_set() {
         assert!(is_local_file_db_type(&DatabaseType::Sqlite));
         assert!(is_local_file_db_type(&DatabaseType::DuckDb));
+        assert!(is_local_file_db_type(&DatabaseType::CsvFile));
+        assert!(is_local_file_db_type(&DatabaseType::XlsxFile));
         assert!(is_local_file_db_type(&DatabaseType::Access));
         assert!(is_local_file_db_type(&DatabaseType::H2));
     }

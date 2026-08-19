@@ -884,14 +884,17 @@ fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, _icon_theme: DesktopIco
 pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &DesktopSettings) -> tauri::Result<()> {
     apply_debug_log_level(desktop_settings.debug_logging_enabled);
     apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;
-    if should_setup_desktop_tray(std::env::consts::OS, desktop_settings.show_tray_icon, linux_appindicator_available())
-    {
-        if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
-            tray.set_visible(desktop_settings.show_tray_icon)?;
+    if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
+        tray.set_visible(desktop_settings.show_tray_icon)?;
+        if desktop_settings.show_tray_icon {
             apply_desktop_tray_icon_theme(app, desktop_settings.icon_theme)?;
-        } else if desktop_settings.show_tray_icon {
-            setup_desktop_tray(app, desktop_settings.icon_theme)?;
         }
+    } else if should_setup_desktop_tray(
+        std::env::consts::OS,
+        desktop_settings.show_tray_icon,
+        linux_appindicator_available(),
+    ) {
+        setup_desktop_tray(app, desktop_settings.icon_theme)?;
     }
     Ok(())
 }
@@ -969,6 +972,39 @@ mod tests {
         assert!(!should_setup_desktop_tray("windows", false, true));
         assert!(!should_setup_desktop_tray("macos", false, true));
         assert!(!should_setup_desktop_tray("linux", false, true));
+    }
+
+    #[test]
+    fn desktop_settings_contract_updates_existing_tray_visibility_and_keeps_app_theme() {
+        let source = include_str!("lib.rs");
+        let implementation = source
+            .split("pub(crate) fn apply_desktop_settings")
+            .nth(1)
+            .and_then(|source| source.split("\n}\n\n#[cfg(test)]").next())
+            .expect("apply_desktop_settings implementation");
+
+        assert!(implementation.contains("if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {"));
+        assert!(implementation.contains("tray.set_visible(desktop_settings.show_tray_icon)?;"));
+        assert!(implementation.contains("if desktop_settings.show_tray_icon {"));
+        assert!(implementation.contains("apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;"));
+        assert!(implementation.contains("apply_desktop_tray_icon_theme(app, desktop_settings.icon_theme)?;"));
+        assert!(implementation.contains("setup_desktop_tray(app, desktop_settings.icon_theme)?;"));
+        assert!(
+            implementation.find("apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;")
+                < implementation.find("if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {")
+        );
+    }
+
+    #[test]
+    fn tauri_handler_contract_exposes_fk_dependency_sorting() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split(".invoke_handler(tauri::generate_handler![")
+            .nth(1)
+            .and_then(|source| source.split("\n        ])\n        .build").next())
+            .expect("Tauri command handler");
+
+        assert!(handler.contains("commands::transfer::sort_tables_by_fk_dependency,"));
     }
 
     #[test]
@@ -1615,6 +1651,11 @@ pub fn run() {
             commands::connection::connection_identifier_quote,
             commands::connection::connection_database_info,
             commands::connection::save_connection_database_info,
+            commands::connection::refresh_external_connection,
+            commands::connection::append_external_rows,
+            commands::connection::update_external_rows,
+            commands::connection::delete_external_rows,
+            commands::connection::write_external_range,
             commands::connection::save_connections,
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
@@ -2233,6 +2274,7 @@ pub fn run() {
             commands::transfer::start_transfer,
             commands::transfer::preview_transfer_ownership,
             commands::transfer::cancel_transfer,
+            commands::transfer::sort_tables_by_fk_dependency,
             commands::database_export::begin_database_backup_snapshot,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,

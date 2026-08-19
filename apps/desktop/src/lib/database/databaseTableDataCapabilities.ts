@@ -177,6 +177,45 @@ const DATABASE_CAPABILITY_OVERRIDES: Partial<Record<DatabaseType, Partial<Databa
       transaction: false,
     },
   },
+  csvfile: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+      readonly: true,
+    },
+  },
+  xlsxfile: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+      readonly: true,
+    },
+  },
+  feishu_sheets: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+      readonly: true,
+    },
+  },
+  feishu_bitable: {
+    tableData: {
+      insert: false,
+      updateRequiresPrimaryKey: true,
+      deleteRequiresPrimaryKey: true,
+      requiresTransactionalTableForExistingRows: false,
+      transaction: false,
+    },
+  },
   tdengine: {
     tableData: {
       insert: true,

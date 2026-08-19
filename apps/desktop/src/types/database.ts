@@ -11,6 +11,10 @@ export type DatabaseType =
   | "cloudflare-d1"
   | "redis"
   | "duckdb"
+  | "csvfile"
+  | "xlsxfile"
+  | "feishu_sheets"
+  | "feishu_bitable"
   | "clickhouse"
   | "sqlserver"
   | "mongodb"
@@ -781,6 +785,16 @@ export interface SpatialColumn {
 export interface QueryResultSourceColumnRef {
   sourceKey: string;
   sourceColumn: string;
+}
+
+export interface ExternalWriteResult {
+  affected_rows: number;
+  raw: unknown;
+}
+
+export interface ExternalRowUpdate {
+  rowId: string;
+  fields: Record<string, unknown>;
 }
 
 export interface QueryResultRun {

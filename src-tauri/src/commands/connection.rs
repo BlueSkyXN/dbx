@@ -1112,6 +1112,39 @@ async fn test_connection_with_info_inner(
             }
             #[cfg(not(feature = "duckdb-sidecar"))]
             DatabaseType::DuckDb => Err("DuckDB support is not compiled in this build".to_string()),
+            db_type @ (DatabaseType::CsvFile
+            | DatabaseType::XlsxFile
+            | DatabaseType::FeishuSheets
+            | DatabaseType::FeishuBitable) => {
+                use dbx_core::external;
+                let file_path = expand_tilde(&config.host);
+                let ext_config = external::ExternalConfig::parse(&db_type, config.external_config.as_ref())?;
+                let source: Box<dyn external::ExternalTabularSource> = match ext_config {
+                    external::ExternalConfig::Csv(csv_config) => {
+                        Box::new(external::CsvSource::new(std::path::PathBuf::from(&file_path), csv_config))
+                    }
+                    external::ExternalConfig::Xlsx(xlsx_config) => {
+                        Box::new(external::XlsxSource::new(std::path::PathBuf::from(&file_path), xlsx_config))
+                    }
+                    external::ExternalConfig::FeishuSheets(feishu_config) => {
+                        Box::new(external::FeishuSheetsSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
+                    }
+                    external::ExternalConfig::FeishuBitable(feishu_config) => {
+                        Box::new(external::FeishuBitableSource::new(
+                            &config.host,
+                            &config.username,
+                            &config.password,
+                            feishu_config,
+                        ))
+                    }
+                };
+                source.test_connection().await
+            }
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&config) {
                     let am = &state.agent_manager;
@@ -1492,6 +1525,14 @@ pub async fn connect_db(
         DatabaseType::DuckDb => state.create_duckdb_pool(&db_config).await?,
         #[cfg(not(feature = "duckdb-sidecar"))]
         DatabaseType::DuckDb => return Err("DuckDB support is not compiled in this build".to_string()),
+        #[cfg(feature = "duckdb-sidecar")]
+        DatabaseType::CsvFile | DatabaseType::XlsxFile | DatabaseType::FeishuSheets | DatabaseType::FeishuBitable => {
+            state.create_external_tabular_pool(&db_config).await?
+        }
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        DatabaseType::CsvFile | DatabaseType::XlsxFile | DatabaseType::FeishuSheets | DatabaseType::FeishuBitable => {
+            return Err("External tabular source support requires the DuckDB sidecar driver".to_string());
+        }
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client =
@@ -1940,4 +1981,50 @@ pub async fn ensure_connection_writable(
         ));
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn refresh_external_connection(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
+    state.refresh_external_pool(&connection_id).await
+}
+
+#[tauri::command]
+pub async fn append_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.append_external_rows(&connection_id, &table_name, rows).await
+}
+
+#[tauri::command]
+pub async fn update_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    updates: Vec<dbx_core::external::ExternalRowUpdate>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.update_external_rows(&connection_id, &table_name, updates).await
+}
+
+#[tauri::command]
+pub async fn delete_external_rows(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    row_ids: Vec<String>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.delete_external_rows(&connection_id, &table_name, row_ids).await
+}
+
+#[tauri::command]
+pub async fn write_external_range(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    table_name: String,
+    range: String,
+    rows: Vec<Vec<serde_json::Value>>,
+) -> Result<dbx_core::external::ExternalWriteResult, String> {
+    state.write_external_range(&connection_id, &table_name, &range, rows).await
 }

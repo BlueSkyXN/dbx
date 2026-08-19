@@ -61,6 +61,10 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["turso", TABLE_VIEW_OBJECTS],
   ["cloudflare-d1", TABLE_VIEW_OBJECTS],
   ["duckdb", TABLE_VIEW_OBJECTS],
+  ["csvfile", TABLE_VIEW_OBJECTS],
+  ["xlsxfile", TABLE_VIEW_OBJECTS],
+  ["feishu_sheets", TABLE_VIEW_OBJECTS],
+  ["feishu_bitable", TABLE_VIEW_OBJECTS],
   ["clickhouse", TABLE_VIEW_OBJECTS],
   // Doris: backend listing path still uses the generic SHOW TABLES path (see
   // `list_tables_once` for `PoolKind::Mysql` in crates/dbx-core/src/schema.rs)

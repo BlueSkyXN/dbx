@@ -202,6 +202,7 @@ import { dataGridColumnLayoutScopeKey, TABLE_DATA_GRID_COLUMN_ORDER_CHANGED_EVEN
 import { summarizeSelection } from "@/lib/dataGrid/gridSelection";
 import { captureDataGridSelection, restoreDataGridSelection, type CaptureDataGridSelectionOptions, type PersistedDataGridSelection } from "@/lib/dataGrid/dataGridSelectionPersistence";
 import { dataGridFrameCoversRow, dataGridSelectionEdgeMask, dataGridSelectionFrameKindAtCell, dataGridSelectionUsesOuterFrame, resolveDataGridSelectionFrames } from "@/lib/dataGrid/dataGridSelectionFrames";
+import { externalRecordIdColumn } from "@/lib/table/externalTableEditing";
 import {
   createDataGridCellContextMenuItems,
   createDataGridColumnContextMenuItems,
@@ -2239,7 +2240,12 @@ const previewActions = computed(() => {
   if (!props.result) return [];
   return getApplicablePreviewActions(props.result);
 });
+const feishuBitableRecordIdColumn = computed(() => (props.databaseType === "feishu_bitable" ? externalRecordIdColumn(props.tableMeta?.primaryKeys, props.result.columns) : undefined));
+function isFeishuBitableRecordIdColumn(columnIndex: number): boolean {
+  return !!feishuBitableRecordIdColumn.value && props.result.columns[columnIndex] === feishuBitableRecordIdColumn.value;
+}
 const firstVisibleColumnIndex = computed(() => visibleColumnIndexes.value[0] ?? 0);
+const firstEditableVisibleColumnIndex = computed(() => visibleColumnIndexes.value.find((index) => !isFeishuBitableRecordIdColumn(index)) ?? firstVisibleColumnIndex.value);
 function actualColumnIndex(visibleColumnIndex: number): number {
   return visibleColumnIndexes.value[visibleColumnIndex] ?? visibleColumnIndex;
 }
@@ -3427,7 +3433,7 @@ const editor = useDataGridEditor({
   rowStatusFilter,
   dataGridQuickEntryEnabled: computed(() => settingsStore.editorSettings.dataGridQuickEntry),
   confirmDangerousRowDeletion: computed(() => settingsStore.editorSettings.confirmDangerousSqlExecution),
-  initialEditColumn: firstVisibleColumnIndex,
+  initialEditColumn: firstEditableVisibleColumnIndex,
   getRowItem,
   pageSize,
   currentPage,
@@ -3606,6 +3612,7 @@ function canEditRowItem(item: RowItem | undefined): boolean {
 }
 
 function canEditCellItem(item: RowItem | undefined, columnIndex: number): boolean {
+  if (isFeishuBitableRecordIdColumn(columnIndex)) return false;
   if (!canEditRowItem(item) || !canEditColumn(columnIndex)) return false;
   if (isSavingNewRow(item)) return false;
   const column = props.result.columns[columnIndex] ?? "";

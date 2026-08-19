@@ -5,7 +5,7 @@ import { parseGaussdbHosts, serializeGaussdbHosts } from "@/lib/connection/gauss
 type ConnectionPresentationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "host" | "port" | "database">;
 type ConnectionNamePresentationConfig = ConnectionPresentationConfig & Pick<ConnectionConfig, "name">;
 
-const LOCAL_DATABASE_TYPES = new Set(["sqlite", "duckdb", "access"]);
+const LOCAL_DATABASE_TYPES = new Set(["sqlite", "duckdb", "csvfile", "xlsxfile", "access"]);
 const REDACTED_HOST_SEGMENT = "***";
 const REDACTED_PORT = "****";
 
@@ -191,6 +191,16 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
 
     case "duckdb":
       return "duckdb:///absolute/path/to/database.duckdb";
+
+    case "csvfile":
+      return "csv:///absolute/path/to/data.csv";
+
+    case "xlsxfile":
+      return "xlsx:///absolute/path/to/workbook.xlsx";
+
+    case "feishu_sheets":
+    case "feishu_bitable":
+      return "https://open.feishu.cn";
 
     case "access":
       return "jdbc:ucanaccess:///absolute/path/to/database.accdb";
