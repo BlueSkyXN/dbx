@@ -754,6 +754,16 @@ export interface QueryResultSourceColumnRef {
   sourceColumn: string;
 }
 
+export interface ExternalWriteResult {
+  affected_rows: number;
+  raw: unknown;
+}
+
+export interface ExternalRowUpdate {
+  rowId: string;
+  fields: Record<string, unknown>;
+}
+
 export interface QueryResultRun {
   id: string;
   title: string;

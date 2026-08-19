@@ -38,6 +38,8 @@ mod tests {
     fn local_file_db_types_match_expected_set() {
         assert!(is_local_file_db_type(&DatabaseType::Sqlite));
         assert!(is_local_file_db_type(&DatabaseType::DuckDb));
+        assert!(is_local_file_db_type(&DatabaseType::CsvFile));
+        assert!(is_local_file_db_type(&DatabaseType::XlsxFile));
         assert!(is_local_file_db_type(&DatabaseType::Access));
         assert!(is_local_file_db_type(&DatabaseType::H2));
     }

@@ -620,6 +620,61 @@ pub async fn close_database_connection(
     state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError::from)
 }
 
+pub async fn refresh_external_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<RefreshExternalRequest>,
+) -> Result<Json<()>, AppError> {
+    state.app.refresh_external_pool(&body.connection_id).await.map(Json).map_err(AppError::from)
+}
+
+pub async fn append_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<AppendExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .append_external_rows(&body.connection_id, &body.table_name, body.rows)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+pub async fn update_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<UpdateExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .update_external_rows(&body.connection_id, &body.table_name, body.updates)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+pub async fn delete_external_rows(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<DeleteExternalRowsRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .delete_external_rows(&body.connection_id, &body.table_name, body.row_ids)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+pub async fn write_external_range(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<WriteExternalRangeRequest>,
+) -> Result<Json<dbx_core::external::ExternalWriteResult>, AppError> {
+    state
+        .app
+        .write_external_range(&body.connection_id, &body.table_name, &body.range, body.rows)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
 pub async fn save_connections(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
