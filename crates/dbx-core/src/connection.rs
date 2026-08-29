@@ -9808,22 +9808,27 @@ for line in sys.stdin:
         })
         .await;
 
-        let result =
-            query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None).await.unwrap();
-        assert_eq!(result.rows[0][0], serde_json::Value::String("Ada".to_string()));
-
-        std::fs::write(&csv_path, "name\nGrace\n").unwrap();
-        state.refresh_external_pool("csv").await.unwrap();
-
-        let refreshed =
-            query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None).await.unwrap();
-        assert_eq!(refreshed.rows[0][0], serde_json::Value::String("Grace".to_string()));
-
-        let write_err =
-            query::execute_sql_statement(&state, "csv", "main", "UPDATE people SET name = 'Lin'", None, None)
+        crate::session_credentials::with_credential_owner(Some("token-a".to_string()), async {
+            let result = query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
                 .await
-                .unwrap_err();
-        assert!(write_err.contains("read-only"));
+                .unwrap();
+            assert_eq!(result.rows[0][0], serde_json::Value::String("Ada".to_string()));
+
+            std::fs::write(&csv_path, "name\nGrace\n").unwrap();
+            state.refresh_external_pool("csv").await.unwrap();
+
+            let refreshed = query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
+                .await
+                .unwrap();
+            assert_eq!(refreshed.rows[0][0], serde_json::Value::String("Grace".to_string()));
+
+            let write_err =
+                query::execute_sql_statement(&state, "csv", "main", "UPDATE people SET name = 'Lin'", None, None)
+                    .await
+                    .unwrap_err();
+            assert!(write_err.contains("read-only"));
+        })
+        .await;
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1816,7 +1816,9 @@ async fn do_execute_typed(
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
             drop(connections);
-            match pool.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+            // Keep the external cache future off this already-large query dispatcher stack.
+            let execution = Box::pin(pool.execute_typed(database, sql, max_rows, cancel_token, query_timeout));
+            match execution.await {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     let is_control_error = error.message == QUERY_CANCELED
