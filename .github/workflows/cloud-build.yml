@@ -85,7 +85,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -95,12 +95,13 @@ jobs:
           df -h
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
+          version: 10.27.0
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22.13.0
           cache: pnpm
@@ -109,7 +110,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.rust-target }}
 
@@ -131,27 +132,11 @@ jobs:
           shared-key: cloud-build-${{ matrix.rust-target }}
           cache-on-failure: true
 
-      - name: Install macOS system dependencies
-        if: runner.os == 'macOS'
-        run: brew install unixodbc libtool
-
-      - name: Bundle macOS ODBC libraries
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          odbc_lib="$(brew --prefix unixodbc)/lib/libodbc.2.dylib"
-          ltdl_lib="$(brew --prefix libtool)/lib/libltdl.7.dylib"
-          cp "$odbc_lib" src-tauri/libodbc.2.dylib
-          cp "$ltdl_lib" src-tauri/libltdl.7.dylib
-          install_name_tool -id "@rpath/libodbc.2.dylib" src-tauri/libodbc.2.dylib
-          install_name_tool -id "@rpath/libltdl.7.dylib" src-tauri/libltdl.7.dylib
-          install_name_tool -change "$ltdl_lib" "@rpath/libltdl.7.dylib" src-tauri/libodbc.2.dylib
-
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev unixodbc-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev
 
       - name: Prepare Tauri updater signing key
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.updater_artifacts }}
