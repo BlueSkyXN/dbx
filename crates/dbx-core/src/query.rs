@@ -2646,7 +2646,10 @@ pub async fn execute_sql_statement_with_options_typed(
     }
 
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
-    let result = do_execute_typed(
+    // Keep the large cross-driver dispatcher future behind a heap boundary.
+    // This also keeps cancellation from recursively dropping its full state
+    // on callers with the runtime's default worker-thread stack.
+    let result = Box::pin(do_execute_typed(
         state,
         &pool_key,
         mysql_dialect,
@@ -2655,7 +2658,7 @@ pub async fn execute_sql_statement_with_options_typed(
         schema,
         cancel_token.clone(),
         options.clone(),
-    )
+    ))
     .await;
 
     let with_sql_context = |result: Result<db::QueryResult, QueryExecutionError>| {
@@ -2671,8 +2674,17 @@ pub async fn execute_sql_statement_with_options_typed(
                 .await
                 .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
             with_sql_context(
-                do_execute_typed(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options)
-                    .await,
+                Box::pin(do_execute_typed(
+                    state,
+                    &new_key,
+                    mysql_dialect,
+                    Some(database),
+                    sql,
+                    schema,
+                    cancel_token,
+                    options,
+                ))
+                .await,
             )
         }
         Some(PoolErrorAction::Discard) => {
