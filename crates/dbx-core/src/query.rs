@@ -1816,7 +1816,9 @@ async fn do_execute_typed(
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
             drop(connections);
-            match pool.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+            // Keep the external cache future off this already-large query dispatcher stack.
+            let execution = Box::pin(pool.execute_typed(database, sql, max_rows, cancel_token, query_timeout));
+            match execution.await {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     let is_control_error = error.message == QUERY_CANCELED
@@ -2201,7 +2203,9 @@ async fn do_execute_typed(
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
+            // Plugin pagination and legacy fallback form another large async
+            // branch; boxing keeps it out of the dispatcher future state.
+            let execution = Box::pin(async move {
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = external_driver_fetch_query_page_params(
                         config.as_ref(),
@@ -2221,9 +2225,10 @@ async fn do_execute_typed(
                     )
                     .await
                 }
-            })
-            .await
-            .map(|result| truncate_result_with_max_rows(result, max_rows))
+            });
+            wait_for_query_opt(cancel_token, query_timeout, execution)
+                .await
+                .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
         PoolKind::HBase(_) => Err("SQL execution is not supported for HBase connections".to_string()),
         PoolKind::DynamoDb(client) => {
@@ -2641,7 +2646,10 @@ pub async fn execute_sql_statement_with_options_typed(
     }
 
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
-    let result = do_execute_typed(
+    // Keep the large cross-driver dispatcher future behind a heap boundary.
+    // This also keeps cancellation from recursively dropping its full state
+    // on callers with the runtime's default worker-thread stack.
+    let result = Box::pin(do_execute_typed(
         state,
         &pool_key,
         mysql_dialect,
@@ -2650,7 +2658,7 @@ pub async fn execute_sql_statement_with_options_typed(
         schema,
         cancel_token.clone(),
         options.clone(),
-    )
+    ))
     .await;
 
     let with_sql_context = |result: Result<db::QueryResult, QueryExecutionError>| {
@@ -2666,8 +2674,17 @@ pub async fn execute_sql_statement_with_options_typed(
                 .await
                 .map_err(|e| query_error_with_omitted_sql_context(&e, sql))?;
             with_sql_context(
-                do_execute_typed(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options)
-                    .await,
+                Box::pin(do_execute_typed(
+                    state,
+                    &new_key,
+                    mysql_dialect,
+                    Some(database),
+                    sql,
+                    schema,
+                    cancel_token,
+                    options,
+                ))
+                .await,
             )
         }
         Some(PoolErrorAction::Discard) => {

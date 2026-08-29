@@ -99,9 +99,7 @@ impl ExternalPool {
     }
 
     async fn prepare_read(&self) -> Result<(), String> {
-        if self.cache_refresh_required()? {
-            self.refresh_cache_if_stale().await
-        } else if self.source.refresh_before_query() {
+        if self.cache_refresh_required()? || self.source.refresh_before_query() {
             self.refresh_cache_if_stale().await
         } else {
             Ok(())

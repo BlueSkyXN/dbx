@@ -1296,12 +1296,10 @@ mod tests {
 
     #[test]
     fn bitable_update_field_cleanup_preserves_user_record_id_field() {
-        let fields = vec![BitableField {
-            field_name: "_record_id".to_string(),
-            is_primary: None,
-            field_type: None,
-            ui_type: None,
-        }];
+        let fields = vec![
+            BitableField { field_name: "_record_id".to_string(), is_primary: None, field_type: None, ui_type: None },
+            BitableField { field_name: "Name".to_string(), is_primary: None, field_type: None, ui_type: None },
+        ];
         let mut update_fields = Map::from_iter([
             ("__dbx_record_id__".to_string(), Value::String("rec_internal".to_string())),
             ("_record_id".to_string(), Value::String("user_value".to_string())),

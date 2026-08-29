@@ -1622,7 +1622,7 @@ mod tests {
             "spreadsheet_token": "shtcn_test"
         }));
 
-        save_connections(
+        let _ = save_connections(
             State(state.clone()),
             cookie_headers("token-a"),
             Json(SaveConnectionsRequest { configs: vec![config] }),

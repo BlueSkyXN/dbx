@@ -4,17 +4,95 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dbx_core::connection::{AppState, PoolKind};
 use dbx_core::db::duckdb_worker_process::DuckDbWorkerClient;
 use dbx_core::db::duckdb_worker_protocol::{
     DuckDbWorkerConnectParams, DuckDbWorkerExecuteParams, DuckDbWorkerMethod, DuckDbWorkerRequest, DuckDbWorkerResponse,
 };
+use dbx_core::models::connection::ConnectionConfig;
 use dbx_core::query_cancel::{RunningQueries, RunningTaskMetadata};
+use dbx_core::storage::Storage;
+use serde_json::json;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_csv_pool_reuses_cache_and_refreshes_snapshot() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let dir = temp_duckdb_path().with_extension("external-csv");
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("people.csv");
+    std::fs::write(&csv_path, "name\nAda\n").unwrap();
+
+    let storage = Storage::open(&dir.join("state.sqlite")).await.unwrap();
+    let state = AppState::new_with_plugin_and_agent_dir_and_app_version(
+        storage,
+        dir.join("plugins"),
+        dir.join("agents"),
+        "0.0.0-test",
+    );
+    let installed_driver = state.agent_manager.driver_native_path("duckdb");
+    std::fs::create_dir_all(installed_driver.parent().unwrap()).unwrap();
+    std::fs::copy(executable, &installed_driver).unwrap();
+
+    let config: ConnectionConfig = serde_json::from_value(json!({
+        "id": "csv",
+        "name": "CSV",
+        "db_type": "csvfile",
+        "driver_profile": "csvfile",
+        "driver_label": "CSV",
+        "host": csv_path,
+        "port": 0,
+        "username": "",
+        "password": "",
+        "database": null
+    }))
+    .unwrap();
+    state.configs.write().await.insert(config.id.clone(), config);
+
+    assert_eq!(state.get_or_create_pool("csv", Some("main")).await.unwrap(), "csv");
+    assert_eq!(state.get_or_create_pool("csv", Some("main")).await.unwrap(), "csv");
+    {
+        let connections = state.connections.read().await;
+        assert_eq!(connections.len(), 1);
+        assert!(matches!(connections.get("csv"), Some(PoolKind::ExternalTabular(_))));
+    }
+
+    let result = dbx_core::query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
+        .await
+        .unwrap();
+    assert_eq!(result.rows[0][0], serde_json::Value::String("Ada".to_string()));
+
+    std::fs::write(&csv_path, "name\nGrace\n").unwrap();
+    state.refresh_external_pool("csv").await.unwrap();
+    let refreshed =
+        dbx_core::query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None)
+            .await
+            .unwrap();
+    assert_eq!(refreshed.rows[0][0], serde_json::Value::String("Grace".to_string()));
+
+    let write_error =
+        dbx_core::query::execute_sql_statement(&state, "csv", "main", "UPDATE people SET name = 'Lin'", None, None)
+            .await
+            .unwrap_err();
+    assert!(write_error.contains("read-only"));
+
+    state.configs.write().await.get_mut("csv").unwrap().save_password = false;
+    state.session_credentials.record_pool_owner("csv", "token-a");
+    dbx_core::session_credentials::with_credential_owner(Some("token-b".to_string()), async {
+        let error = state.refresh_external_pool("csv").await.unwrap_err();
+        assert_eq!(error, "Connection is not connected for the current session");
+    })
+    .await;
+
+    assert!(state.remove_pool_by_key("csv").await);
+    std::fs::remove_dir_all(dir).unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_process_reads_view_source() {
@@ -508,10 +586,14 @@ async fn worker_shutdown_checkpoints_and_removes_wal() {
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(&wal_path);
 
-    let client =
-        DuckDbWorkerClient::open_with_executable(executable.clone(), db_path.to_string_lossy().to_string(), Vec::new(), None)
-            .await
-            .expect("worker process connects");
+    let client = DuckDbWorkerClient::open_with_executable(
+        executable.clone(),
+        db_path.to_string_lossy().to_string(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("worker process connects");
     client
         .execute(
             None,
