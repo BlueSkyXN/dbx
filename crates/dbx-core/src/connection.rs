@@ -271,6 +271,7 @@ macro_rules! agent_connection_pool_database_type {
 
 pub struct AppState {
     pub connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    pub external_tables: crate::external::ExternalTableRegistry,
     task_supervisor: TaskSupervisor,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     draining_pools: Arc<std::sync::Mutex<HashMap<String, watch::Sender<bool>>>>,
@@ -1218,6 +1219,7 @@ impl AppState {
         let data_dir = storage.data_dir().to_path_buf();
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            external_tables: crate::external::ExternalTableRegistry::new(),
             task_supervisor: TaskSupervisor::new(),
             pool_activity: Arc::new(RwLock::new(HashMap::new())),
             draining_pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2620,6 +2622,9 @@ impl AppState {
                     }
                 }
                 self.external_driver_pool("jdbc", &jdbc_config).await?
+            }
+            DatabaseType::Csv | DatabaseType::Xlsx | DatabaseType::FeishuSheets | DatabaseType::FeishuBase => {
+                return Err("External table connections are managed by the external table registry".to_string());
             }
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
