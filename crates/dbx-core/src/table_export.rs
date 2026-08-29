@@ -3039,15 +3039,17 @@ mod tests {
         .await;
 
         let export = Box::pin(run_external_driver_export(&fixture));
-        let cancel = async {
-            wait_for_external_driver_call(&fixture.calls, "executeQueryPage").await;
-            set_export_cancelled(&fixture.request.export_id).await;
+        let calls = fixture.calls.clone();
+        let export_id = fixture.request.export_id.clone();
+        let cancel = tokio::spawn(async move {
+            wait_for_external_driver_call(&calls, "executeQueryPage").await;
+            set_export_cancelled(&export_id).await;
             tokio::time::Instant::now()
-        };
-        let (result, cancel_requested_at) =
-            tokio::time::timeout(Duration::from_secs(7), async { tokio::join!(export, cancel) })
-                .await
-                .expect("blocked JDBC execute should be interrupted promptly");
+        });
+        let result = tokio::time::timeout(Duration::from_secs(7), export)
+            .await
+            .expect("blocked JDBC execute should be interrupted promptly");
+        let cancel_requested_at = cancel.await.expect("cancellation task should complete");
         let progress = result.expect("cancelled JDBC export should complete without an error");
 
         assert!(cancel_requested_at.elapsed() < Duration::from_secs(2));
@@ -3078,15 +3080,17 @@ mod tests {
         .await;
 
         let export = Box::pin(run_external_driver_export(&fixture));
-        let cancel = async {
-            wait_for_external_driver_call(&fixture.calls, "fetchQueryPage").await;
-            set_export_cancelled(&fixture.request.export_id).await;
+        let calls = fixture.calls.clone();
+        let export_id = fixture.request.export_id.clone();
+        let cancel = tokio::spawn(async move {
+            wait_for_external_driver_call(&calls, "fetchQueryPage").await;
+            set_export_cancelled(&export_id).await;
             tokio::time::Instant::now()
-        };
-        let (result, cancel_requested_at) =
-            tokio::time::timeout(Duration::from_secs(7), async { tokio::join!(export, cancel) })
-                .await
-                .expect("blocked JDBC fetch should be interrupted promptly");
+        });
+        let result = tokio::time::timeout(Duration::from_secs(7), export)
+            .await
+            .expect("blocked JDBC fetch should be interrupted promptly");
+        let cancel_requested_at = cancel.await.expect("cancellation task should complete");
         let progress = result.expect("cancelled JDBC export should complete without an error");
 
         assert!(cancel_requested_at.elapsed() < Duration::from_secs(2));

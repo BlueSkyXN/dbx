@@ -2203,7 +2203,9 @@ async fn do_execute_typed(
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
             drop(connections);
-            wait_for_query_opt(cancel_token, query_timeout, async move {
+            // Plugin pagination and legacy fallback form another large async
+            // branch; boxing keeps it out of the dispatcher future state.
+            let execution = Box::pin(async move {
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = external_driver_fetch_query_page_params(
                         config.as_ref(),
@@ -2223,9 +2225,10 @@ async fn do_execute_typed(
                     )
                     .await
                 }
-            })
-            .await
-            .map(|result| truncate_result_with_max_rows(result, max_rows))
+            });
+            wait_for_query_opt(cancel_token, query_timeout, execution)
+                .await
+                .map(|result| truncate_result_with_max_rows(result, max_rows))
         }
         PoolKind::HBase(_) => Err("SQL execution is not supported for HBase connections".to_string()),
         PoolKind::DynamoDb(client) => {
