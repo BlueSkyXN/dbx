@@ -2216,9 +2216,11 @@ mod tests {
     ) -> Result<Vec<TableExportProgress>, String> {
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = progress.clone();
-        let result = export_table_data_core(&fixture.state, &fixture.request, move |event| {
+        // Production exports run as spawned heap tasks. Keep the same boundary
+        // here instead of inlining the full export state into the test root.
+        let result = Box::pin(export_table_data_core(&fixture.state, &fixture.request, move |event| {
             captured.lock().unwrap().push(event);
-        })
+        }))
         .await;
         let events = progress.lock().unwrap().clone();
         result.map(|_| events)
