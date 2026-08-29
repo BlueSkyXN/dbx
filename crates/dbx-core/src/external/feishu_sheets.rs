@@ -177,7 +177,7 @@ impl FeishuSheetsAdapter {
         let fetched = if ranges.is_empty() { Vec::new() } else { self.fetch_ranges(&sheet_id, ranges).await? };
         let width = bounds.end_col.saturating_sub(bounds.start_col).saturating_add(1) as usize;
         let (header_cells, data_cells) = if self.config.has_header {
-            (fetched.first().map(|range| range.cells.first().cloned()).flatten(), fetched.get(1))
+            (fetched.first().and_then(|range| range.cells.first().cloned()), fetched.get(1))
         } else {
             (None, fetched.first())
         };

@@ -17,6 +17,8 @@ use super::{
 
 const SHEET_TABLE_PREFIX: &str = "sheet:";
 const MAX_PAGE_SIZE: usize = 2_000;
+type A1Cell = (u32, u32);
+type ParsedA1Range = (A1Cell, Option<A1Cell>);
 
 #[derive(Debug)]
 pub struct XlsxAdapter {
@@ -307,7 +309,7 @@ fn resolve_sheet_bounds(
     Ok(SheetBounds { start_row: used_start.0, start_col: used_start.1, end_row: used_end.0, end_col: used_end.1 })
 }
 
-fn parse_a1_range(value: &str) -> Result<((u32, u32), Option<(u32, u32)>), ExternalTableError> {
+fn parse_a1_range(value: &str) -> Result<ParsedA1Range, ExternalTableError> {
     let value = value.rsplit_once('!').map(|(_, range)| range).unwrap_or(value);
     let mut parts = value.split(':');
     let start = parse_a1_cell(parts.next().unwrap_or_default())?;
@@ -321,7 +323,7 @@ fn parse_a1_range(value: &str) -> Result<((u32, u32), Option<(u32, u32)>), Exter
     Ok((start, end))
 }
 
-fn parse_a1_cell(value: &str) -> Result<(u32, u32), ExternalTableError> {
+fn parse_a1_cell(value: &str) -> Result<A1Cell, ExternalTableError> {
     let value = value.trim().trim_matches('$');
     let split = value
         .find(|character: char| character.is_ascii_digit())
