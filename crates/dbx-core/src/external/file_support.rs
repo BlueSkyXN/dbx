@@ -63,7 +63,7 @@ pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<(
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_IGNORE_MERGE_ERRORS};
+        use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_MERGE_ERRORS};
 
         let destination_wide = destination.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
         let staged_wide = staged.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
@@ -72,7 +72,7 @@ pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<(
                 destination_wide.as_ptr(),
                 staged_wide.as_ptr(),
                 std::ptr::null(),
-                REPLACE_FILE_IGNORE_MERGE_ERRORS,
+                REPLACEFILE_IGNORE_MERGE_ERRORS,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
