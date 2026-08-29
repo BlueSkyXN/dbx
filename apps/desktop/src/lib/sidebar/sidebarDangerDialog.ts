@@ -4,7 +4,22 @@ export interface SidebarDangerDialogOption {
   checked: boolean;
   label: string;
   hint: string;
+  compact?: boolean;
+  danger?: boolean;
   onChange?: (checked: boolean) => void | Promise<void>;
+}
+
+export interface SidebarDangerDialogProgress {
+  completed: number;
+  total: number;
+}
+
+export interface SidebarDangerDialogTextInput {
+  value: string;
+  label: string;
+  placeholder?: string;
+  inputMode?: "text" | "numeric";
+  onInput?: (value: string) => void | Promise<void>;
 }
 
 export interface SidebarDangerDialogRequest {
@@ -17,6 +32,10 @@ export interface SidebarDangerDialogRequest {
   detailsText?: string;
   loading?: boolean;
   closeOnConfirm?: boolean;
+  progress?: SidebarDangerDialogProgress;
   option?: SidebarDangerDialogOption;
-  confirm: () => void | Promise<void>;
+  options?: SidebarDangerDialogOption[];
+  textInput?: SidebarDangerDialogTextInput;
+  cancelRunning?: () => void | Promise<void>;
+  confirm: () => void | boolean | Promise<void | boolean>;
 }

@@ -10,6 +10,11 @@ COPY packages/mongo-shell/ packages/mongo-shell/
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 COPY apps/desktop/ apps/desktop/
+# The vite connection-types plugin runs scripts/sync-connection-types.mjs during
+# `pnpm build`, which reads plugins/connection-types + plugins/dialects and
+# regenerates the manifest and generated TS types in place.
+COPY scripts/ scripts/
+COPY plugins/ plugins/
 COPY crates/dbx-core/assets/database-drivers.manifest.json crates/dbx-core/assets/database-drivers.manifest.json
 RUN pnpm build
 
@@ -31,9 +36,16 @@ RUN dpkg --add-architecture arm64 \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/dbx-core/Cargo.toml crates/dbx-core/
 COPY crates/dbx-web/Cargo.toml crates/dbx-web/
+COPY crates/dbx-mcp/Cargo.toml crates/dbx-mcp/
+COPY crates/dbx-cli/Cargo.toml crates/dbx-cli/
 COPY src-tauri/Cargo.toml src-tauri/
+# Copy every vendored crate: root Cargo.toml [patch.crates-io] points at
+# vendor/{ctor,rumqttc,dirs-sys,pageant,wry}; omitting any breaks the offline build.
+COPY vendor/ vendor/
 RUN mkdir -p crates/dbx-core/src && echo '' > crates/dbx-core/src/lib.rs \
     && mkdir -p crates/dbx-web/src && echo 'fn main() {}' > crates/dbx-web/src/main.rs \
+    && mkdir -p crates/dbx-mcp/src && echo '' > crates/dbx-mcp/src/lib.rs && echo 'fn main() {}' > crates/dbx-mcp/src/main.rs \
+    && mkdir -p crates/dbx-cli/src && echo 'fn main() {}' > crates/dbx-cli/src/main.rs \
     && mkdir -p src-tauri/src && echo 'fn main() {}' > src-tauri/src/main.rs && echo 'pub fn run() {}' > src-tauri/src/lib.rs
 
 COPY src-tauri/build.rs src-tauri/
@@ -52,6 +64,11 @@ RUN case "$TARGETARCH" in \
 
 # Copy real sources and rebuild (only application code recompiles)
 COPY crates/ crates/
+# dbx-core's build.rs embeds plugins/dialects (SQL dialects) and
+# plugins/connection-types (database manifest + DatabaseType enum);
+# either directory missing makes the build script panic.
+COPY plugins/dialects/ plugins/dialects/
+COPY plugins/connection-types/ plugins/connection-types/
 
 # Docker COPY preserves original file timestamps, which may be older than the
 # dummy-source binary compiled above. Touch all .rs files so cargo detects the
@@ -80,10 +97,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     libfreetype6 \
     libssl3 \
+    openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=backend /out/${TARGETPLATFORM}/dbx-web /usr/local/bin/
 COPY --from=frontend /app/dist /app/static
 ENV DBX_STATIC_DIR=/app/static
 ENV DBX_DATA_DIR=/app/data
+ENV DBX_JAVA_BIN=/usr/bin/java
 EXPOSE 4224
 CMD ["dbx-web"]

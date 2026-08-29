@@ -1,7 +1,8 @@
-#![cfg(feature = "duckdb-bundled")]
+#![cfg(feature = "duckdb-sidecar")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -14,20 +15,25 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db;
 use crate::db::duckdb_worker_protocol::{
-    DuckDbWorkerConnectParams, DuckDbWorkerError, DuckDbWorkerExecuteParams, DuckDbWorkerMethod,
-    DuckDbWorkerObjectSourceParams, DuckDbWorkerRequest, DuckDbWorkerResponse,
+    DuckDbWorkerColumnParams, DuckDbWorkerConnectParams, DuckDbWorkerError, DuckDbWorkerExecuteParams,
+    DuckDbWorkerMethod, DuckDbWorkerObjectSourceParams, DuckDbWorkerRequest, DuckDbWorkerResponse,
 };
 use crate::models::connection::AttachedDatabaseConfig;
 use crate::storage::{normalize_duckdb_worker_max_processes, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 
 /// Error code the worker reports when a query error left the DuckDB connection poisoned
 /// (see the duckdb-rs Parser Error bug). The client kills the worker on this code so the
-/// next request starts a fresh one. Must match the code emitted in `duckdb_worker_runtime`.
+/// next request starts a fresh one. Must match the code emitted by the standalone driver runtime.
 const DUCKDB_WORKER_POISONED_CODE: &str = "duckdb_worker_poisoned";
 const DUCKDB_WORKER_REQUEST_TIMEOUT_CODE: &str = "duckdb_worker_request_timeout";
 const DEFAULT_WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_WORKER_KILL_WAIT: Duration = Duration::from_secs(3);
+/// Grace period for a shutdown-acked worker to exit by itself (session drop
+/// plus DuckDB shutdown checkpoint). Kept below the 3s pool close timeout in
+/// `connection.rs` so pool close cancellation cannot cut the checkpoint short.
+const WORKER_SHUTDOWN_EXIT_WAIT: Duration = Duration::from_millis(2500);
 const DEFAULT_WORKER_START_WAIT: Duration = Duration::from_secs(5);
+pub const DUCKDB_DRIVER_PATH_ENV: &str = "DBX_DUCKDB_DRIVER_PATH";
 type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
 struct PendingRequest {
@@ -48,6 +54,7 @@ struct DuckDbWorkerClientInner {
     process_limiter: Arc<Semaphore>,
     process_limit: usize,
     executable: PathBuf,
+    executable_args: Vec<OsString>,
     connect_params: DuckDbWorkerConnectParams,
     request_timeout: Duration,
     worker_start_timeout: Duration,
@@ -68,8 +75,16 @@ impl DuckDbWorkerClient {
         attached_databases: Vec<AttachedDatabaseConfig>,
         init_script: Option<String>,
     ) -> Result<Self, String> {
-        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        Self::open_with_executable(executable, path, attached_databases, init_script).await
+        let (executable, executable_args) = resolve_duckdb_driver_command()?;
+        Self::open_with_command_and_process_limit(
+            executable,
+            executable_args,
+            path,
+            attached_databases,
+            init_script,
+            DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
+        )
+        .await
     }
 
     pub async fn open_with_process_limit(
@@ -78,9 +93,16 @@ impl DuckDbWorkerClient {
         init_script: Option<String>,
         process_limit: usize,
     ) -> Result<Self, String> {
-        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        Self::open_with_executable_and_process_limit(executable, path, attached_databases, init_script, process_limit)
-            .await
+        let (executable, executable_args) = resolve_duckdb_driver_command()?;
+        Self::open_with_command_and_process_limit(
+            executable,
+            executable_args,
+            path,
+            attached_databases,
+            init_script,
+            process_limit,
+        )
+        .await
     }
 
     pub async fn open_with_executable(
@@ -106,8 +128,28 @@ impl DuckDbWorkerClient {
         init_script: Option<String>,
         process_limit: usize,
     ) -> Result<Self, String> {
+        Self::open_with_command_and_process_limit(
+            executable,
+            Vec::new(),
+            path,
+            attached_databases,
+            init_script,
+            process_limit,
+        )
+        .await
+    }
+
+    async fn open_with_command_and_process_limit(
+        executable: PathBuf,
+        executable_args: Vec<OsString>,
+        path: String,
+        attached_databases: Vec<AttachedDatabaseConfig>,
+        init_script: Option<String>,
+        process_limit: usize,
+    ) -> Result<Self, String> {
         let client = Self::new_unconnected_with_timeouts(
             executable,
+            executable_args,
             path,
             attached_databases,
             init_script,
@@ -122,6 +164,7 @@ impl DuckDbWorkerClient {
     #[doc(hidden)]
     pub fn new_unconnected_with_timeouts(
         executable: PathBuf,
+        executable_args: Vec<OsString>,
         path: String,
         attached_databases: Vec<AttachedDatabaseConfig>,
         init_script: Option<String>,
@@ -139,6 +182,7 @@ impl DuckDbWorkerClient {
                 process_limiter,
                 process_limit,
                 executable,
+                executable_args,
                 connect_params: DuckDbWorkerConnectParams { path, attached_databases, init_script },
                 request_timeout,
                 worker_start_timeout,
@@ -155,6 +199,17 @@ impl DuckDbWorkerClient {
         cancel_token: Option<CancellationToken>,
         query_timeout: Option<Duration>,
     ) -> Result<db::QueryResult, String> {
+        self.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await.map_err(|error| error.message)
+    }
+
+    pub async fn execute_typed(
+        &self,
+        database: Option<String>,
+        sql: String,
+        max_rows: Option<usize>,
+        cancel_token: Option<CancellationToken>,
+        query_timeout: Option<Duration>,
+    ) -> Result<db::QueryResult, DuckDbWorkerError> {
         let _query_guard = self.inner.query_lock.lock().await;
         let client = self.clone();
         // Cancellation and timeout restart the worker via cancel_or_kill below. An ordinary
@@ -166,7 +221,10 @@ impl DuckDbWorkerClient {
         // than letting the worker self-exit) avoids racing our own next request against a dying
         // worker, and OS-level kill never runs the destructor that would abort the process.
         let future = async move {
-            client.ensure_connected().await?;
+            client
+                .ensure_connected()
+                .await
+                .map_err(|message| DuckDbWorkerError::new("duckdb_worker_connect_failed", message))?;
             match client
                 .send_request_structured::<db::QueryResult>(
                     DuckDbWorkerMethod::Execute,
@@ -180,7 +238,7 @@ impl DuckDbWorkerClient {
                     if error.code == DUCKDB_WORKER_POISONED_CODE {
                         client.kill().await;
                     }
-                    Err(error.message)
+                    Err(error)
                 }
             }
         };
@@ -212,9 +270,9 @@ impl DuckDbWorkerClient {
         }
     }
 
-    async fn cancel_or_kill(&self, final_error: String) -> Result<db::QueryResult, String> {
+    async fn cancel_or_kill(&self, final_error: String) -> Result<db::QueryResult, DuckDbWorkerError> {
         let _ = self.cancel().await;
-        Err(final_error)
+        Err(DuckDbWorkerError::from(final_error))
     }
 
     pub async fn list_databases(&self) -> Result<Vec<db::DatabaseInfo>, String> {
@@ -244,6 +302,18 @@ impl DuckDbWorkerClient {
             serde_json::json!({ "database": database, "schema": schema, "table": table }),
         )
         .await
+    }
+
+    pub async fn get_table_ddl(&self, database: String, schema: String, table: String) -> Result<String, String> {
+        self.metadata_request(DuckDbWorkerMethod::GetTableDdl, DuckDbWorkerColumnParams { database, schema, table })
+            .await
+    }
+
+    pub async fn completion_assistant(
+        &self,
+        request: db::CompletionAssistantRequest,
+    ) -> Result<db::CompletionAssistantResponse, String> {
+        self.metadata_request(DuckDbWorkerMethod::CompletionAssistant, request).await
     }
 
     pub async fn get_object_source(
@@ -296,7 +366,61 @@ impl DuckDbWorkerClient {
                 Some(self.inner.request_timeout),
             )
             .await;
-        self.kill().await;
+        self.wait_for_exit_or_kill().await;
+    }
+
+    /// Lets a shutdown-acked worker exit on its own so its session drop runs
+    /// the DuckDB shutdown checkpoint that removes the database WAL; SIGKILL
+    /// stays the fallback for stuck workers. Killing immediately after the
+    /// ack would truncate that checkpoint and leave the WAL file behind.
+    /// The wait must fit inside the caller's pool close timeout so the
+    /// detached close task is not cancelled mid-checkpoint.
+    async fn wait_for_exit_or_kill(&self) {
+        let (child, generation) = {
+            let mut state = self.inner.state.lock().await;
+            let child = state.child.take();
+            let generation = state.generation;
+            state.stdin = None;
+            state.connected = false;
+            (child, generation)
+        };
+
+        let Some(mut child) = child else { return };
+        match tokio::time::timeout(WORKER_SHUTDOWN_EXIT_WAIT, child.wait()).await {
+            Ok(Ok(status)) => {
+                log::info!("[duckdb-worker:shutdown:exit] status={status}");
+                self.fail_pending_for_generation(
+                    generation,
+                    "duckdb_worker_killed",
+                    "DuckDB worker process was killed",
+                )
+                .await;
+                return;
+            }
+            Ok(Err(err)) => {
+                log::warn!("[duckdb-worker:shutdown:wait-failed] error={err}");
+                self.fail_pending_for_generation(
+                    generation,
+                    "duckdb_worker_killed",
+                    "DuckDB worker process was killed",
+                )
+                .await;
+                return;
+            }
+            Err(_) => {
+                log::warn!("[duckdb-worker:shutdown:wait-timeout] wait_ms={}", WORKER_SHUTDOWN_EXIT_WAIT.as_millis());
+            }
+        }
+
+        let _ = child.start_kill();
+        match tokio::time::timeout(DEFAULT_WORKER_KILL_WAIT, child.wait()).await {
+            Ok(Ok(status)) => log::info!("[duckdb-worker:kill:exit] status={status}"),
+            Ok(Err(err)) => log::warn!("[duckdb-worker:kill:wait-failed] error={err}"),
+            Err(_) => {
+                log::warn!("[duckdb-worker:kill:wait-timeout] wait_ms={}", DEFAULT_WORKER_KILL_WAIT.as_millis())
+            }
+        }
+        self.fail_pending_for_generation(generation, "duckdb_worker_killed", "DuckDB worker process was killed").await;
     }
 
     pub async fn kill(&self) {
@@ -413,9 +537,14 @@ impl DuckDbWorkerClient {
                 .map_err(|_| duckdb_worker_process_limit_error(self.inner.process_limit))?
                 .map_err(|_| "DuckDB worker process limiter is closed".to_string())?;
 
-        log::info!("[duckdb-worker:start] executable={}", self.inner.executable.display());
-        let mut child = crate::process::new_tokio_command(&self.inner.executable)
-            .arg("--duckdb-worker")
+        log::info!(
+            "[duckdb-worker:start] executable={} args={:?}",
+            self.inner.executable.display(),
+            self.inner.executable_args
+        );
+        let mut command = crate::process::new_tokio_command(&self.inner.executable);
+        command.args(&self.inner.executable_args);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -522,6 +651,25 @@ impl DuckDbWorkerClient {
             let _ = sender.send(DuckDbWorkerResponse::err(id, DuckDbWorkerError::new(code, message)));
         }
     }
+}
+
+fn resolve_duckdb_driver_command() -> Result<(PathBuf, Vec<OsString>), String> {
+    if let Some(executable) = std::env::var_os(DUCKDB_DRIVER_PATH_ENV).filter(|value| !value.is_empty()) {
+        let executable = PathBuf::from(executable);
+        ensure_duckdb_driver_exists(&executable)?;
+        return Ok((executable, Vec::new()));
+    }
+
+    Err(format!(
+        "DuckDB driver is not installed. Please install it from the Driver Manager or set {DUCKDB_DRIVER_PATH_ENV}."
+    ))
+}
+
+fn ensure_duckdb_driver_exists(executable: &Path) -> Result<(), String> {
+    if executable.is_file() {
+        return Ok(());
+    }
+    Err(format!("DuckDB driver configured by {DUCKDB_DRIVER_PATH_ENV} was not found: {}", executable.display()))
 }
 
 struct WorkerProcessLimiterState {

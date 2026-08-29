@@ -51,7 +51,7 @@ export class MetadataResultCache<T> {
   private readonly now: () => number;
 
   constructor(private readonly options: MetadataResultCacheOptions) {
-    this.now = options.now ?? Date.now;
+    this.now = options.now ?? (() => Date.now());
   }
 
   get(scope: MetadataScopeInput, options?: { allowStale?: boolean }): MetadataCacheHit<T> | undefined {
@@ -67,10 +67,10 @@ export class MetadataResultCache<T> {
     return { value: entry.value, cachedAt: entry.cachedAt, ageMs, stale };
   }
 
-  set(scope: MetadataScopeInput, value: T): void {
+  set(scope: MetadataScopeInput, value: T, options?: { cachedAt?: number }): void {
     const key = metadataScopeKey(scope);
     this.entries.delete(key);
-    this.entries.set(key, { scope: metadataScopeParts(scope), value, cachedAt: this.now() });
+    this.entries.set(key, { scope: metadataScopeParts(scope), value, cachedAt: options?.cachedAt ?? this.now() });
     this.evictOldest();
   }
 

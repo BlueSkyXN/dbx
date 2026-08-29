@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildSelectAllSql, isNewQueryPrefillSupported, resolveNewQueryInitialSql, resolveNewQueryTable, type ResolveNewQueryTableInput } from "@/lib/sql/newQueryContext";
+import { buildSelectAllSql, isNewQueryPrefillSupported, resolveNewQueryInitialSql, resolveNewQueryTable, resolveNewQueryTarget } from "@/lib/sql/newQueryContext";
+import type { ResolveNewQueryTableInput } from "@/lib/sql/newQueryContext";
 import type { QueryTab, TreeNode } from "@/types/database";
 
 function dataTab(overrides: Partial<Pick<QueryTab, "mode" | "connectionId" | "database" | "schema" | "tableMeta" | "structureTableName" | "title">> = {}): ResolveNewQueryTableInput["activeTab"] {
@@ -17,6 +18,95 @@ function dataTab(overrides: Partial<Pick<QueryTab, "mode" | "connectionId" | "da
 function tableNode(overrides: Partial<Pick<TreeNode, "type" | "connectionId" | "database" | "schema" | "catalog" | "tableName" | "label">> = {}): ResolveNewQueryTableInput["selectedTreeNode"] {
   return { type: "table", connectionId: "conn-1", database: "app_db", schema: "public", tableName: "orders", label: "orders", ...overrides };
 }
+
+describe("resolveNewQueryTarget", () => {
+  it("inherits an external catalog from the active object browser", () => {
+    expect(
+      resolveNewQueryTarget({
+        activeTab: {
+          connectionId: "conn-1",
+          database: "bi",
+          objectBrowser: { catalog: "paimon_catalog" },
+        },
+        connections: [{ id: "conn-1", host: "localhost", database: "", db_type: "starrocks" }],
+        preferredSource: "tab",
+      }),
+    ).toEqual({
+      connectionId: "conn-1",
+      database: "bi",
+      schema: undefined,
+      catalog: "paimon_catalog",
+      shouldRefreshDefaultDatabase: false,
+    });
+  });
+
+  it("inherits an external catalog from active table metadata", () => {
+    expect(
+      resolveNewQueryTarget({
+        activeTab: {
+          connectionId: "conn-1",
+          database: "bi",
+          tableMeta: {
+            catalog: "paimon_catalog",
+            tableName: "events",
+            columns: [],
+            primaryKeys: [],
+          },
+        },
+        connections: [{ id: "conn-1", host: "localhost", database: "", db_type: "starrocks" }],
+      })?.catalog,
+    ).toBe("paimon_catalog");
+  });
+
+  it("repairs a stale SQLite file path inherited from an active tab", () => {
+    expect(
+      resolveNewQueryTarget({
+        activeTab: {
+          connectionId: "conn-sqlite",
+          database: "/tmp/stale.sqlite",
+        },
+        connections: [{ id: "conn-sqlite", host: "/tmp/stale.sqlite", database: "/tmp/stale.sqlite", db_type: "sqlite" }],
+      }),
+    ).toEqual({
+      connectionId: "conn-sqlite",
+      database: "main",
+      schema: undefined,
+      catalog: undefined,
+      shouldRefreshDefaultDatabase: false,
+    });
+  });
+
+  it("preserves an attached SQLite database alias inherited from an active tab", () => {
+    expect(
+      resolveNewQueryTarget({
+        activeTab: {
+          connectionId: "conn-sqlite",
+          database: "analytics.db",
+        },
+        connections: [{ id: "conn-sqlite", host: "primary.db", database: undefined, db_type: "sqlite" }],
+      })?.database,
+    ).toBe("analytics.db");
+  });
+
+  it("uses the configured default schema when no explicit schema context exists", () => {
+    expect(
+      resolveNewQueryTarget({
+        activeConnectionId: "conn-1",
+        connections: [{ id: "conn-1", host: "localhost", database: "app", default_schema: "archive", db_type: "postgres" }],
+      }),
+    ).toMatchObject({ connectionId: "conn-1", database: "app", schema: "archive" });
+  });
+
+  it("keeps an explicitly selected schema ahead of the configured default", () => {
+    expect(
+      resolveNewQueryTarget({
+        selectedTreeNode: { connectionId: "conn-1", database: "app", schema: "reporting" },
+        connections: [{ id: "conn-1", host: "localhost", database: "app", default_schema: "archive", db_type: "postgres" }],
+        preferredSource: "sidebar",
+      })?.schema,
+    ).toBe("reporting");
+  });
+});
 
 describe("resolveNewQueryTable", () => {
   it("resolves the table from an active data tab", () => {
@@ -98,6 +188,10 @@ describe("resolveNewQueryTable", () => {
 });
 
 describe("buildSelectAllSql", () => {
+  it("builds a MetricsQL range query for VictoriaMetrics metrics", () => {
+    expect(buildSelectAllSql("victoriametrics", { tableName: "flag" })).toBe('{__name__="flag"}[1h]');
+  });
+
   it("quotes a MySQL table with backticks", () => {
     expect(buildSelectAllSql("mysql", { tableName: "users" })).toBe("SELECT * FROM `users`");
   });
@@ -106,8 +200,16 @@ describe("buildSelectAllSql", () => {
     expect(buildSelectAllSql("mysql", { schema: "mydb", tableName: "users" })).toBe("SELECT * FROM `users`");
   });
 
+  it("includes the MySQL database when requested", () => {
+    expect(buildSelectAllSql("mysql", { database: "mydb", tableName: "users" }, undefined, undefined, true)).toBe("SELECT * FROM `mydb`.`users`");
+  });
+
   it("qualifies and quotes a PostgreSQL table with its schema", () => {
     expect(buildSelectAllSql("postgres", { schema: "public", tableName: "users" })).toBe('SELECT * FROM "public"."users"');
+  });
+
+  it("preserves the Phoenix schema for new-query prefill", () => {
+    expect(buildSelectAllSql("jdbc", { schema: "APP", tableName: "USERS" }, '"', "phoenix")).toBe('SELECT * FROM "APP"."USERS"');
   });
 
   it("bracket-quotes a SQL Server table", () => {
@@ -118,6 +220,18 @@ describe("buildSelectAllSql", () => {
   it("escapes embedded quote characters", () => {
     expect(buildSelectAllSql("mysql", { tableName: "a`b" })).toBe("SELECT * FROM `a``b`");
     expect(buildSelectAllSql("postgres", { tableName: 'a"b' })).toBe('SELECT * FROM "a""b"');
+  });
+  it("qualifies a StarRocks external-catalog table with catalog and database", () => {
+    expect(buildSelectAllSql("starrocks", { catalog: "paimon_catalog", database: "bi", tableName: "events" })).toBe("SELECT * FROM `paimon_catalog`.`bi`.`events`");
+  });
+  it("uses the driver-reported identifier quote for Kingbase MySQL compat mode", () => {
+    expect(buildSelectAllSql("kingbase", { schema: "audit_schema", tableName: "events" }, "`")).toBe("SELECT * FROM `audit_schema`.`events`");
+  });
+  it("uses the driver-reported identifier quote for Kingbase PostgreSQL mode", () => {
+    expect(buildSelectAllSql("kingbase", { schema: "audit_schema", tableName: "events" }, '"')).toBe('SELECT * FROM "audit_schema"."events"');
+  });
+  it("falls back to double quotes for Kingbase when no identifier quote is reported", () => {
+    expect(buildSelectAllSql("kingbase", { schema: "audit_schema", tableName: "events" })).toBe('SELECT * FROM "audit_schema"."events"');
   });
 });
 
@@ -150,6 +264,20 @@ describe("resolveNewQueryInitialSql", () => {
         databaseType: "postgres",
       }),
     ).toBe('SELECT * FROM "public"."users"');
+  });
+
+  it("passes the Phoenix driver profile into the initial SQL builder", () => {
+    expect(
+      resolveNewQueryInitialSql({
+        activeTab: dataTab({ schema: "APP", tableMeta: { schema: "APP", tableName: "USERS", columns: [], primaryKeys: [] } }),
+        prefillEnabled: true,
+        targetConnectionId: "conn-1",
+        targetDatabase: "app_db",
+        databaseType: "jdbc",
+        driverProfile: "phoenix",
+        identifierQuote: '"',
+      }),
+    ).toBe('SELECT * FROM "APP"."USERS"');
   });
 
   it("leaves new queries empty when the setting is disabled", () => {

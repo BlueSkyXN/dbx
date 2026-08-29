@@ -2,11 +2,18 @@ use percent_encoding::percent_decode_str;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
+use sqlparser::ast::Statement;
+use sqlparser::dialect::SQLiteDialect;
+use sqlparser::parser::Parser;
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+// Keep the native SQLite3MC archive linked even though rusqlite owns the FFI calls.
+#[cfg(feature = "sqlite-multiple-ciphers")]
+extern crate libsqlite3_hotbundle;
 
 use super::file_validator::validate_file_path;
 use crate::sql::starts_with_executable_sql_keyword;
@@ -17,6 +24,9 @@ use crate::types::{
 };
 
 const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+// Probe the common modern and legacy sizes first, then the remaining supported powers of two.
+#[cfg(feature = "sqlite-multiple-ciphers")]
+const SQLITE_LEGACY_PAGE_SIZES: &[i64] = &[4096, 1024, 512, 2048, 8192, 16384, 32768, 65536];
 
 #[derive(Clone)]
 pub struct SqliteHandle {
@@ -69,7 +79,7 @@ pub fn validate_persistent_attachments(main_path: &str, cipher_key: &str, has_at
     }
     if !cipher_key.is_empty() {
         return Err(
-            "Persistent SQLite attachments are unavailable for SQLCipher connections because each attached database requires an explicit key."
+            "Persistent SQLite attachments are unavailable for encrypted connections because each attached database requires an explicit key."
                 .to_string(),
         );
     }
@@ -133,7 +143,7 @@ fn open_sqlite_handle(
 ) -> Result<SqliteHandle, String> {
     let is_memory = is_memory_database_path(path);
     let encrypted = cipher_key.as_deref().is_some_and(|key| !key.is_empty());
-    ensure_sqlcipher_available(encrypted)?;
+    ensure_sqlite_encryption_available(encrypted)?;
     if !is_memory && !create_if_missing {
         validate_file_path(path, is_network_path)?;
     }
@@ -145,12 +155,30 @@ fn open_sqlite_handle(
         validate_existing_sqlite_file(path)?;
     }
 
-    let sqlcipher_attempts: &[Option<i64>] = if encrypted { &[None, Some(3), Some(2), Some(1)] } else { &[None] };
+    let cipher_attempts = if !encrypted {
+        vec![SqliteCipherAttempt::Plain]
+    } else if create_if_missing {
+        vec![SqliteCipherAttempt::SqlCipher(4)]
+    } else {
+        let attempts = vec![
+            SqliteCipherAttempt::SqlCipher(4),
+            SqliteCipherAttempt::SqlCipher(3),
+            SqliteCipherAttempt::SqlCipher(2),
+            SqliteCipherAttempt::SqlCipher(1),
+        ];
+        #[cfg(feature = "sqlite-multiple-ciphers")]
+        let attempts = {
+            let mut attempts = attempts;
+            attempts.extend(SQLITE_LEGACY_PAGE_SIZES.iter().copied().map(SqliteCipherAttempt::Rc4Legacy));
+            attempts
+        };
+        attempts
+    };
     let mut unlock_error: Option<String> = None;
 
-    for compatibility in sqlcipher_attempts {
+    for attempt in cipher_attempts {
         let conn = open_sqlite_connection(path, create_if_missing)?;
-        if let Err(err) = apply_sqlcipher_key(&conn, cipher_key.as_deref(), *compatibility) {
+        if let Err(err) = apply_sqlite_cipher_key(&conn, cipher_key.as_deref(), attempt) {
             unlock_error = Some(err);
             continue;
         }
@@ -161,7 +189,16 @@ fn open_sqlite_handle(
         return Ok(SqliteHandle { conn: Arc::new(Mutex::new(conn)) });
     }
 
-    Err(unlock_error.unwrap_or_else(|| "SQLCipher database unlock failed.".to_string()))
+    Err(unlock_error.unwrap_or_else(|| "Encrypted SQLite database unlock failed.".to_string()))
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers")), allow(dead_code))]
+enum SqliteCipherAttempt {
+    Plain,
+    SqlCipher(i64),
+    #[cfg(feature = "sqlite-multiple-ciphers")]
+    Rc4Legacy(i64),
 }
 
 fn open_sqlite_connection(path: &str, create_if_missing: bool) -> Result<Connection, String> {
@@ -190,49 +227,85 @@ fn sqlite_cipher_key(cipher_key: &str) -> Option<String> {
     }
 }
 
-#[cfg(feature = "sqlite-sqlcipher")]
-fn ensure_sqlcipher_available(_encrypted: bool) -> Result<(), String> {
+#[cfg(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers"))]
+fn ensure_sqlite_encryption_available(_encrypted: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(feature = "sqlite-sqlcipher"))]
-fn ensure_sqlcipher_available(encrypted: bool) -> Result<(), String> {
+#[cfg(not(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers")))]
+fn ensure_sqlite_encryption_available(encrypted: bool) -> Result<(), String> {
     if encrypted {
-        Err("SQLCipher support is not compiled in this build. Rebuild with the sqlite-sqlcipher feature.".to_string())
+        Err("Encrypted SQLite support is not compiled in this build. Rebuild with the sqlite-sqlcipher or sqlite-multiple-ciphers feature."
+            .to_string())
     } else {
         Ok(())
     }
 }
 
-#[cfg(feature = "sqlite-sqlcipher")]
-fn apply_sqlcipher_key(conn: &Connection, cipher_key: Option<&str>, compatibility: Option<i64>) -> Result<(), String> {
+#[cfg(feature = "sqlite-multiple-ciphers")]
+fn apply_sqlite_cipher_key(
+    conn: &Connection,
+    cipher_key: Option<&str>,
+    attempt: SqliteCipherAttempt,
+) -> Result<(), String> {
     let Some(cipher_key) = cipher_key.filter(|key| !key.is_empty()) else {
         return Ok(());
     };
 
-    // SQLCipher requires the key before the first schema read; the verification
-    // query turns wrong keys into an immediate connection error.
-    conn.pragma_update(None, "key", cipher_key).map_err(|e| format!("SQLCipher key setup failed: {e}"))?;
-    if let Some(compatibility) = compatibility {
-        conn.pragma_update(None, "cipher_compatibility", compatibility)
-            .map_err(|e| format!("SQLCipher compatibility setup failed: {e}"))?;
+    match attempt {
+        SqliteCipherAttempt::Plain => {}
+        SqliteCipherAttempt::SqlCipher(compatibility) => {
+            conn.pragma_update(None, "cipher", "sqlcipher").map_err(|e| format!("SQLite cipher setup failed: {e}"))?;
+            conn.pragma_update(None, "legacy", compatibility)
+                .map_err(|e| format!("SQLCipher compatibility setup failed: {e}"))?;
+        }
+        SqliteCipherAttempt::Rc4Legacy(page_size) => {
+            conn.pragma_update(None, "cipher", "rc4").map_err(|e| format!("SQLite cipher setup failed: {e}"))?;
+            conn.pragma_update(None, "legacy", 1).map_err(|e| format!("RC4 compatibility setup failed: {e}"))?;
+            conn.pragma_update(None, "legacy_page_size", page_size)
+                .map_err(|e| format!("RC4 legacy page size setup failed: {e}"))?;
+        }
     }
-    verify_sqlcipher_key(conn)
-        .map_err(|e| format!("SQLCipher database unlock failed. Check the SQLite password/key and file type: {e}"))?;
+    conn.pragma_update(None, "key", cipher_key).map_err(|e| format!("SQLite encryption key setup failed: {e}"))?;
+    verify_sqlite_encryption_key(conn)
+        .map_err(|e| format!("Encrypted SQLite database unlock failed. Check the password/key and cipher: {e}"))?;
     Ok(())
 }
 
-#[cfg(not(feature = "sqlite-sqlcipher"))]
-fn apply_sqlcipher_key(
+#[cfg(all(feature = "sqlite-sqlcipher", not(feature = "sqlite-multiple-ciphers")))]
+fn apply_sqlite_cipher_key(
+    conn: &Connection,
+    cipher_key: Option<&str>,
+    attempt: SqliteCipherAttempt,
+) -> Result<(), String> {
+    let Some(cipher_key) = cipher_key.filter(|key| !key.is_empty()) else {
+        return Ok(());
+    };
+
+    let SqliteCipherAttempt::SqlCipher(compatibility) = attempt else {
+        return Ok(());
+    };
+    conn.pragma_update(None, "key", cipher_key).map_err(|e| format!("SQLite encryption key setup failed: {e}"))?;
+    if compatibility != 4 {
+        conn.pragma_update(None, "cipher_compatibility", compatibility)
+            .map_err(|e| format!("SQLCipher compatibility setup failed: {e}"))?;
+    }
+    verify_sqlite_encryption_key(conn)
+        .map_err(|e| format!("Encrypted SQLite database unlock failed. Check the password/key and cipher: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers")))]
+fn apply_sqlite_cipher_key(
     _conn: &Connection,
     _cipher_key: Option<&str>,
-    _compatibility: Option<i64>,
+    _attempt: SqliteCipherAttempt,
 ) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "sqlite-sqlcipher")]
-fn verify_sqlcipher_key(conn: &Connection) -> Result<(), rusqlite::Error> {
+#[cfg(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers"))]
+fn verify_sqlite_encryption_key(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
 }
 
@@ -536,6 +609,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sqlite_schema_name_repairs_file_paths_and_preserves_attached_aliases() {
+        for value in [
+            "",
+            ":memory:",
+            "/tmp/app.sqlite",
+            "./app.db",
+            "../app.db3",
+            "~/app.sqlite3",
+            "C:\\data\\app.db",
+            "file:/tmp/app.sqlite",
+            "sqlite:/tmp/app.sqlite",
+            "relative.sqlite?mode=ro",
+        ] {
+            assert_eq!(sqlite_schema_name(value), "main", "{value}");
+        }
+
+        assert_eq!(sqlite_schema_name("main"), "main");
+        assert_eq!(sqlite_schema_name("analytics"), "analytics");
+    }
+
+    #[test]
     fn persistent_attachments_require_a_file_backed_plaintext_main_database() {
         assert!(validate_persistent_attachments("/tmp/main.sqlite", "", false).is_ok());
         assert!(validate_persistent_attachments("/tmp/main.sqlite", "", true).is_ok());
@@ -544,7 +638,7 @@ mod tests {
         assert!(memory_error.contains("in-memory main database"), "{memory_error}");
 
         let cipher_error = validate_persistent_attachments("/tmp/main.sqlite", "secret", true).unwrap_err();
-        assert!(cipher_error.contains("SQLCipher"), "{cipher_error}");
+        assert!(cipher_error.contains("encrypted"), "{cipher_error}");
     }
 
     #[tokio::test]
@@ -558,6 +652,45 @@ mod tests {
         let result = execute_query(&pool, "SELECT name FROM memory_probe WHERE id = 1;").await.expect("select row");
 
         assert_eq!(result.rows[0][0], serde_json::json!("Ada"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_dml_returning_preserves_result_rows() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(&pool, "CREATE TABLE dml_returning (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .expect("create table");
+
+        let inserted = execute_query(&pool, "INSERT INTO dml_returning VALUES (1, 'alice')").await.expect("insert row");
+        let unmatched =
+            execute_query(&pool, "UPDATE dml_returning SET name = name WHERE id = 999").await.expect("update no rows");
+        assert_eq!(inserted.affected_rows, 1);
+        assert_eq!(unmatched.affected_rows, 0);
+
+        let insert_returning = execute_query(&pool, "INSERT INTO dml_returning VALUES (2, 'bob') RETURNING id, name")
+            .await
+            .expect("insert returning");
+        let update_returning =
+            execute_query(&pool, "UPDATE dml_returning SET name = 'bob-updated' WHERE id = 2 RETURNING id, name")
+                .await
+                .expect("update returning");
+        let delete_returning = execute_query(&pool, "DELETE FROM dml_returning WHERE id = 2 RETURNING id, name")
+            .await
+            .expect("delete returning");
+        let empty_returning =
+            execute_query(&pool, "UPDATE dml_returning SET name = name WHERE id = 999 RETURNING id, name")
+                .await
+                .expect("empty returning");
+
+        for result in [&insert_returning, &update_returning, &delete_returning] {
+            assert_eq!(result.columns, vec!["id", "name"]);
+            assert_eq!(result.rows.len(), 1);
+        }
+        assert_eq!(insert_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob")]);
+        assert_eq!(update_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob-updated")]);
+        assert_eq!(delete_returning.rows[0], vec![serde_json::json!(2), serde_json::json!("bob-updated")]);
+        assert_eq!(empty_returning.columns, vec!["id", "name"]);
+        assert!(empty_returning.rows.is_empty());
     }
 
     #[tokio::test]
@@ -632,7 +765,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(feature = "sqlite-sqlcipher")]
+    #[cfg(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers"))]
     #[tokio::test]
     async fn sqlcipher_key_creates_and_reopens_encrypted_database() {
         let path = std::env::temp_dir().join(format!("dbx-sqlcipher-{}.db", uuid::Uuid::new_v4()));
@@ -660,12 +793,12 @@ mod tests {
                 Ok(_) => panic!("wrong key must fail"),
                 Err(err) => err,
             };
-        assert!(wrong_key.contains("SQLCipher database unlock failed"));
+        assert!(wrong_key.contains("Encrypted SQLite database unlock failed"));
 
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(feature = "sqlite-sqlcipher")]
+    #[cfg(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers"))]
     #[tokio::test]
     async fn sqlcipher_key_opens_legacy_compatible_database() {
         let path = std::env::temp_dir().join(format!("dbx-sqlcipher-legacy-{}.db", uuid::Uuid::new_v4()));
@@ -675,7 +808,13 @@ mod tests {
             let conn =
                 Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
                     .expect("create legacy-compatible encrypted sqlite");
+            #[cfg(feature = "sqlite-multiple-ciphers")]
+            {
+                conn.pragma_update(None, "cipher", "sqlcipher").expect("select SQLCipher");
+                conn.pragma_update(None, "legacy", 3).expect("set SQLCipher compatibility");
+            }
             conn.pragma_update(None, "key", key).expect("set SQLCipher key");
+            #[cfg(all(feature = "sqlite-sqlcipher", not(feature = "sqlite-multiple-ciphers")))]
             conn.pragma_update(None, "cipher_compatibility", 3).expect("set SQLCipher compatibility");
             conn.execute_batch("CREATE TABLE t (name TEXT); INSERT INTO t VALUES ('legacy');")
                 .expect("write legacy-compatible encrypted sqlite");
@@ -691,7 +830,49 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[cfg(not(feature = "sqlite-sqlcipher"))]
+    #[cfg(feature = "sqlite-multiple-ciphers")]
+    #[tokio::test]
+    async fn encrypted_sqlite_key_opens_and_updates_1024_page_rc4_legacy_database() {
+        let path = std::env::temp_dir().join(format!("dbx-rc4-legacy-{}.db", uuid::Uuid::new_v4()));
+        let key = "123456";
+        let page_size = 1024;
+
+        {
+            let conn =
+                Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
+                    .expect("create RC4-compatible encrypted sqlite");
+            conn.pragma_update(None, "cipher", "rc4").expect("select RC4");
+            conn.pragma_update(None, "legacy", 1).expect("set RC4 legacy mode");
+            conn.pragma_update(None, "legacy_page_size", page_size).expect("set RC4 legacy page size");
+            conn.pragma_update(None, "key", key).expect("set RC4 key");
+            conn.execute_batch("CREATE TABLE t (name TEXT); INSERT INTO t VALUES ('navicat-compatible');")
+                .expect("write RC4-compatible encrypted sqlite");
+        }
+
+        {
+            let reopened = connect_path_with_cipher_key_and_extensions(path.to_str().unwrap(), key, Vec::new())
+                .await
+                .expect("open RC4-compatible encrypted sqlite");
+            let result = execute_query(&reopened, "SELECT name FROM t").await.expect("read RC4 database");
+            assert_eq!(result.rows[0][0], serde_json::json!("navicat-compatible"));
+            execute_query(&reopened, "INSERT INTO t VALUES ('written-by-dbx')").await.expect("update RC4 database");
+        }
+
+        let conn = Connection::open(&path).expect("reopen RC4 database independently");
+        conn.pragma_update(None, "cipher", "rc4").expect("select RC4");
+        conn.pragma_update(None, "legacy", 1).expect("set RC4 legacy mode");
+        conn.pragma_update(None, "legacy_page_size", page_size).expect("set RC4 legacy page size");
+        conn.pragma_update(None, "key", key).expect("set RC4 key");
+        let reopened_page_size: i64 =
+            conn.pragma_query_value(None, "page_size", |row| row.get(0)).expect("read page size");
+        assert_eq!(reopened_page_size, page_size);
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).expect("verify RC4 writes");
+        assert_eq!(count, 2);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(not(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers")))]
     #[tokio::test]
     async fn sqlcipher_key_requires_sqlcipher_feature() {
         let err =
@@ -702,7 +883,7 @@ mod tests {
                 Err(err) => err,
             };
 
-        assert!(err.contains("SQLCipher support is not compiled"));
+        assert!(err.contains("Encrypted SQLite support is not compiled"));
     }
 
     #[test]
@@ -1144,14 +1325,14 @@ mod tests {
         }
 
         let pool = connect_path(":memory:").await.expect("connect primary database");
-        attach_database(&pool, "analytics", path.to_str().unwrap()).expect("attach database");
+        attach_database(&pool, "analytics.db", path.to_str().unwrap()).expect("attach database");
         execute_query(&pool, "CREATE TABLE child(source TEXT NOT NULL); INSERT INTO child(source) VALUES('main');")
             .await
             .expect("create same-named main table");
 
         let qualified_child = crate::sql_dialect::qualified_table_name(
             Some(crate::models::connection::DatabaseType::Sqlite),
-            Some("analytics"),
+            Some("analytics.db"),
             "child",
         );
         pool.with_connection(|conn| {
@@ -1166,7 +1347,7 @@ mod tests {
                 .query_row("SELECT source FROM main.child", [], |row| row.get(0))
                 .map_err(|error| error.to_string())?;
             let updated_attached_source: String = conn
-                .query_row("SELECT source FROM analytics.child", [], |row| row.get(0))
+                .query_row("SELECT source FROM \"analytics.db\".child", [], |row| row.get(0))
                 .map_err(|error| error.to_string())?;
             assert_eq!(main_source, "main");
             assert_eq!(updated_attached_source, "updated");
@@ -1175,29 +1356,39 @@ mod tests {
         .expect("query attached table by qualified name");
 
         let databases = list_databases(&pool).await.expect("list databases");
-        assert_eq!(databases.into_iter().map(|database| database.name).collect::<Vec<_>>(), vec!["main", "analytics"]);
-        assert!(list_tables(&pool, "analytics")
+        assert_eq!(
+            databases.into_iter().map(|database| database.name).collect::<Vec<_>>(),
+            vec!["main", "analytics.db"]
+        );
+        assert!(list_tables(&pool, "analytics.db")
             .await
             .expect("list attached tables")
             .iter()
             .any(|table| table.name == "child"));
 
-        let columns = get_columns(&pool, "analytics", "child").await.expect("list attached columns");
+        let columns = get_columns(&pool, "analytics.db", "child").await.expect("list attached columns");
         assert_eq!(
             columns.iter().find(|column| column.name == "id").and_then(|column| column.extra.as_deref()),
             Some("autoincrement")
         );
-        assert!(list_indexes(&pool, "analytics", "child")
+        assert!(list_indexes(&pool, "analytics.db", "child")
             .await
             .expect("list attached indexes")
             .iter()
             .any(|index| index.name == "child_parent_idx"));
-        assert_eq!(list_foreign_keys(&pool, "analytics", "child").await.expect("list attached foreign keys").len(), 1);
-        assert!(list_triggers(&pool, "analytics", "child")
+        assert_eq!(
+            list_foreign_keys(&pool, "analytics.db", "child").await.expect("list attached foreign keys").len(),
+            1
+        );
+        assert!(list_triggers(&pool, "analytics.db", "child")
             .await
             .expect("list attached triggers")
             .iter()
             .any(|trigger| trigger.name == "child_touch"));
+        assert!(crate::schema::sqlite_ddl(&pool, "analytics.db", "child")
+            .await
+            .expect("read attached table DDL")
+            .contains("CREATE TABLE child"));
 
         drop(pool);
         let _ = std::fs::remove_file(path);
@@ -1211,7 +1402,7 @@ pub async fn list_databases(pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, St
             let mut stmt = conn.prepare("PRAGMA database_list").map_err(|e| e.to_string())?;
             let rows = stmt.query_map([], |row| row.get::<_, String>("name")).map_err(|e| e.to_string())?;
             rows.filter_map(|row| match row {
-                Ok(name) if !name.eq_ignore_ascii_case("temp") => Some(Ok(DatabaseInfo { name })),
+                Ok(name) if !name.eq_ignore_ascii_case("temp") => Some(Ok(DatabaseInfo { name, ..Default::default() })),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -1225,9 +1416,10 @@ pub async fn list_databases(pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, St
 
 pub async fn list_tables(pool: &SqliteHandle, schema: &str) -> Result<Vec<TableInfo>, String> {
     let pool = pool.clone();
-    let schema = sqlite_schema_name(schema).to_string();
+    let requested_schema = schema.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
             let sql = format!(
                 "SELECT name, type FROM {}.sqlite_master \
                  WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -1255,11 +1447,12 @@ pub async fn list_tables(pool: &SqliteHandle, schema: &str) -> Result<Vec<TableI
 
 pub async fn get_columns(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
     let pool = pool.clone();
-    let schema = sqlite_schema_name(schema).to_string();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        let sql = format!("PRAGMA {}.table_info({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql = format!("PRAGMA {}.table_info({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
             let autoincrement_columns = sqlite_autoincrement_pk_columns(conn, &schema, &table).unwrap_or_default();
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
@@ -1376,6 +1569,7 @@ fn sqlite_completion_schemas(
             parent_name: None,
             comment: None,
             data_type: None,
+            signature: None,
         })
         .collect())
 }
@@ -1429,6 +1623,7 @@ fn sqlite_completion_tables(
                 parent_name: None,
                 comment: None,
                 data_type: None,
+                signature: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1467,6 +1662,7 @@ fn sqlite_completion_columns(
             parent_name: Some(table.to_string()),
             comment: None,
             data_type: Some(data_type),
+            signature: None,
         });
         if candidates.len() >= limit {
             break;
@@ -1528,13 +1724,59 @@ pub(crate) fn sqlite_quote_schema_ident(value: &str) -> String {
     sqlite_quote_ident(sqlite_schema_name(value))
 }
 
-fn sqlite_schema_name(value: &str) -> &str {
+pub(crate) fn sqlite_quote_schema_ident_for_connection(conn: &Connection, value: &str) -> Result<String, String> {
+    Ok(sqlite_quote_ident(&sqlite_schema_name_for_connection(conn, value)?))
+}
+
+fn sqlite_schema_name_for_connection(conn: &Connection, value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
+        return Ok("main".to_string());
+    }
+
+    let mut stmt = conn.prepare("PRAGMA database_list").map_err(|e| e.to_string())?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>("name"))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if names.iter().any(|name| name.eq_ignore_ascii_case(value)) {
+        Ok(value.to_string())
+    } else {
+        Ok(sqlite_schema_name(value).to_string())
+    }
+}
+
+fn sqlite_schema_name(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() || is_sqlite_file_namespace(value) {
         "main"
     } else {
         value
     }
+}
+
+fn is_sqlite_file_namespace(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    lower == ":memory:"
+        || lower.starts_with("file:")
+        || lower.starts_with("sqlite:")
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.starts_with("~/")
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.contains('/')
+        || value.contains('\\')
+        || path.ends_with(".db")
+        || path.ends_with(".db3")
+        || path.ends_with(".sqlite")
+        || path.ends_with(".sqlite3")
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'/' | b'\\'))
 }
 
 fn sqlite_quote_string(value: &str) -> String {
@@ -2101,10 +2343,11 @@ fn is_sql_keyword(value: &str) -> bool {
 
 pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
     let pool = pool.clone();
-    let schema = sqlite_schema_name(schema).to_string();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
             let mut stmt = conn
                 .prepare(&format!("PRAGMA {}.index_list({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table)))
                 .map_err(|e| e.to_string())?;
@@ -2130,10 +2373,13 @@ pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Res
                     ))
                     .map_err(|e| e.to_string())?;
                 let columns = col_stmt
-                    .query_map([], |row| row.get::<_, String>("name"))
+                    .query_map([], |row| row.get::<_, Option<String>>("name"))
                     .map_err(|e| e.to_string())?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
 
                 indexes.push(IndexInfo {
                     name,
@@ -2144,6 +2390,7 @@ pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Res
                     index_type: None,
                     included_columns: None,
                     comment: None,
+                    key_is_expression: Vec::new(),
                 });
             }
             Ok(indexes)
@@ -2155,11 +2402,13 @@ pub async fn list_indexes(pool: &SqliteHandle, schema: &str, table: &str) -> Res
 
 pub async fn list_foreign_keys(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
     let pool = pool.clone();
-    let schema = sqlite_schema_name(schema).to_string();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        let sql = format!("PRAGMA {}.foreign_key_list({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
+            let sql =
+                format!("PRAGMA {}.foreign_key_list({})", sqlite_quote_ident(&schema), sqlite_quote_string(&table));
             let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -2183,10 +2432,11 @@ pub async fn list_foreign_keys(pool: &SqliteHandle, schema: &str, table: &str) -
 
 pub async fn list_triggers(pool: &SqliteHandle, schema: &str, table: &str) -> Result<Vec<TriggerInfo>, String> {
     let pool = pool.clone();
-    let schema = sqlite_schema_name(schema).to_string();
+    let requested_schema = schema.to_string();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
+            let schema = sqlite_schema_name_for_connection(conn, &requested_schema)?;
             let sql = format!(
                 "SELECT name, sql FROM {}.sqlite_master WHERE type = 'trigger' AND tbl_name = ? ORDER BY name",
                 sqlite_quote_ident(&schema)
@@ -2214,6 +2464,13 @@ pub async fn list_triggers(pool: &SqliteHandle, schema: &str, table: &str) -> Re
                         name: row.get("name")?,
                         event: event.to_string(),
                         timing: timing.to_string(),
+                        level: None,
+                        condition: None,
+                        language: None,
+                        enabled: None,
+                        valid: None,
+                        comment: None,
+                        created_at: None,
                         statement: sql_text,
                     })
                 })
@@ -2231,6 +2488,28 @@ pub async fn execute_query(pool: &SqliteHandle, sql: &str) -> Result<QueryResult
 
 fn query_result_row_limit(max_rows: Option<usize>) -> usize {
     max_rows.unwrap_or(crate::query::MAX_ROWS).max(1)
+}
+
+/// DML with `RETURNING` produces a result set in SQLite and must use the
+/// statement query API instead of `execute_batch`.
+fn sqlite_statement_returns_rows(sql: &str) -> bool {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "PRAGMA", "EXPLAIN", "WITH"]) {
+        return true;
+    }
+
+    let Ok(statements) = Parser::parse_sql(&SQLiteDialect {}, sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+
+    match statement {
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        _ => false,
+    }
 }
 
 const SQLITE_FUNCTION_ALIASES: &[(&str, &str)] = &[("if", "IIF"), ("substring", "substr")];
@@ -2337,7 +2616,7 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
     let row_limit = query_result_row_limit(max_rows);
 
     pool.with_connection(|conn| {
-        if starts_with_executable_sql_keyword(sql, &["SELECT", "PRAGMA", "EXPLAIN", "WITH"]) {
+        if sqlite_statement_returns_rows(sql) {
             let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
             let columns = stmt.column_names().iter().map(|name| name.to_string()).collect::<Vec<_>>();
             let column_decl_types =
@@ -2368,12 +2647,16 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
                 columns,
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: result_rows,
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
                 truncated,
                 session_id: None,
                 has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         } else {
             conn.execute_batch(sql).map_err(|e| e.to_string())?;
@@ -2381,12 +2664,16 @@ fn execute_query_blocking(pool: &SqliteHandle, sql: &str, max_rows: Option<usize
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
+                spatial_values: vec![],
                 rows: vec![],
                 affected_rows: conn.changes(),
                 execution_time_ms: start.elapsed().as_millis(),
                 truncated: false,
                 session_id: None,
                 has_more: false,
+                elasticsearch_raw_body: None,
+                messages: Vec::new(),
             })
         }
     })

@@ -3,6 +3,7 @@ import { displayCellValue, type CellValue } from "@/lib/dataGrid/cellValue";
 import { parseClipboardTable } from "@/lib/dataGrid/gridSelection";
 
 export type DataGridPasteIntent = "native" | "block" | "paste";
+export type DataGridSelectAllIntent = "native" | "block" | "select";
 
 export interface DataGridPasteCell {
   rowOffset: number;
@@ -24,6 +25,17 @@ interface DataGridPasteEvent {
   stopPropagation(): void;
 }
 
+interface DataGridSelectAllEvent {
+  target?: EventTarget | null;
+  preventDefault(): void;
+}
+
+export function claimDataGridSelectAll(event: DataGridSelectAllEvent, loading: boolean, hasData: boolean): DataGridSelectAllIntent {
+  if (eventTargetUsesNativeClipboard(event) || (!loading && !hasData)) return "native";
+  event.preventDefault();
+  return loading ? "block" : "select";
+}
+
 export function claimDataGridPaste(event: DataGridPasteEvent, editable: boolean, hasSelection: boolean): DataGridPasteIntent {
   if (eventTargetUsesNativeClipboard(event)) return "native";
   event.preventDefault();
@@ -35,14 +47,9 @@ export function clearDataGridClipboardCopy(): void {
   internalClipboardCopy = null;
 }
 
-export function rememberDataGridClipboardCopy(text: string, rows: readonly (readonly unknown[])[], includeHeader = false): void {
-  if (!rows.some((row) => row.some((value) => value === null))) {
-    internalClipboardCopy = null;
-    return;
-  }
-
+export function rememberDataGridClipboardCopy(text: string, rows: readonly (readonly unknown[])[], header?: readonly unknown[]): void {
   // Preserve the logical grid matrix because plain TSV cannot escape embedded tabs or newlines.
-  const headerRows = includeHeader ? parseClipboardTable(text).slice(0, 1) : [];
+  const headerRows = header ? [header.map((value) => displayCellValue(value as CellValue))] : [];
   const copiedRows = rows.map((row) => row.map((value) => (value === null ? null : displayCellValue(value as CellValue))));
   internalClipboardCopy = { text, rows: [...headerRows, ...copiedRows], writeRevision: getClipboardWriteRevision() };
 }

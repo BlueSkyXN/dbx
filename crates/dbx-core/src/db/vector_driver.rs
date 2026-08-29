@@ -29,10 +29,37 @@ const QUERY_VALUE_ENCODE_SET: &AsciiSet = &PATH_SEGMENT_ENCODE_SET.add(b'&').add
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MilvusCollectionSchema {
+    #[serde(default)]
+    pub fields: Vec<MilvusFieldInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MilvusFieldInfo {
+    pub name: String,
+    pub data_type: String,
+    pub dimension: Option<u32>,
+    #[serde(default)]
+    pub primary_key: bool,
+    #[serde(default)]
+    pub auto_id: bool,
+    #[serde(default)]
+    pub nullable: bool,
+    #[serde(default)]
+    pub has_default_value: bool,
+    #[serde(default)]
+    pub is_function_output: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CollectionInfo {
     pub name: String,
     pub id: String,
     pub dimension: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub milvus_schema: Option<MilvusCollectionSchema>,
     pub kind: Option<String>,
     pub bucket_name: Option<String>,
 }
@@ -62,6 +89,8 @@ pub struct VectorClient {
     http: HttpClient,
     base_url: String,
     auth: Option<VectorAuth>,
+    tenant: Option<String>,
+    database: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,9 +112,39 @@ impl VectorClient {
     ) -> Self {
         let base_url = url.trim_end_matches('/').to_string();
         let auth = vector_auth(kind, username, password);
+        let tenant = if kind == VectorDbKind::ChromaDb {
+            username.map(str::trim).filter(|tenant| !tenant.is_empty()).map(str::to_string)
+        } else {
+            None
+        };
         let builder = http_client_builder(timeout).danger_accept_invalid_certs(accept_invalid_certs);
         let http = builder.build().unwrap_or_else(|_| HttpClient::new());
-        Self { kind, http, base_url, auth }
+        Self { kind, http, base_url, auth, tenant, database: None }
+    }
+
+    pub fn with_database(mut self, database: Option<&str>) -> Self {
+        self.database = database.map(str::trim).filter(|database| !database.is_empty()).map(str::to_string);
+        self
+    }
+
+    fn database_or_default(&self) -> &str {
+        self.database.as_deref().unwrap_or("default")
+    }
+
+    fn chroma_tenant(&self) -> &str {
+        self.tenant.as_deref().unwrap_or("default_tenant")
+    }
+
+    fn chroma_database(&self) -> &str {
+        self.database.as_deref().unwrap_or("default_database")
+    }
+
+    fn chroma_collections_path(&self) -> String {
+        chroma_collections_path(self.chroma_tenant(), self.chroma_database())
+    }
+
+    fn chroma_collection_path(&self, collection: &str, operation: Option<&str>) -> String {
+        chroma_collection_path(self.chroma_tenant(), self.chroma_database(), collection, operation)
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -115,6 +174,17 @@ impl VectorClient {
     }
 }
 
+fn test_connection_request(client: &VectorClient) -> reqwest::RequestBuilder {
+    match client.kind {
+        VectorDbKind::Qdrant => client.get("/collections"),
+        VectorDbKind::Milvus => client
+            .post("/v2/vectordb/collections/list")
+            .json(&serde_json::json!({ "dbName": client.database_or_default() })),
+        VectorDbKind::Weaviate => client.get("/v1/meta"),
+        VectorDbKind::ChromaDb => client.get(&client.chroma_collections_path()),
+    }
+}
+
 fn vector_auth(kind: VectorDbKind, username: Option<&str>, password: Option<&str>) -> Option<VectorAuth> {
     let username = username.unwrap_or("").trim();
     let password = password.unwrap_or("");
@@ -135,23 +205,12 @@ fn vector_auth(kind: VectorDbKind, username: Option<&str>, password: Option<&str
 
 pub async fn test_connection(client: &VectorClient, timeout: Duration) -> Result<(), String> {
     let label = client.kind.label();
-    let path = match client.kind {
-        VectorDbKind::Qdrant => "/collections",
-        VectorDbKind::Milvus => "/v2/vectordb/collections/list",
-        VectorDbKind::Weaviate => "/v1/meta",
-        VectorDbKind::ChromaDb => "/api/v2/heartbeat",
-    };
-    let request = match client.kind {
-        VectorDbKind::Qdrant => client.get(path),
-        VectorDbKind::Milvus => client.post(path).json(&serde_json::json!({ "dbName": "default" })),
-        VectorDbKind::Weaviate => client.get(path),
-        VectorDbKind::ChromaDb => client.get(path),
-    };
-    let resp = with_connection_timeout(label, timeout, async {
-        request.send().await.map_err(|e| format!("{label} connection failed: {}", format_reqwest_error(&e)))
+    let request = test_connection_request(client);
+    with_connection_timeout(label, timeout, async {
+        send_json(request, client.kind).await.map_err(|error| error.replacen("request failed", "connection failed", 1))
     })
-    .await?;
-    ensure_success(label, resp).await.map(|_| ())
+    .await
+    .map(|_| ())
 }
 
 pub async fn list_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
@@ -180,26 +239,104 @@ pub async fn list_databases(client: &VectorClient) -> Result<Vec<String>, String
     }
 }
 
+/// Drop a Milvus database through the v2 REST API.
+pub async fn drop_database(client: &VectorClient, database: &str) -> Result<(), String> {
+    if client.kind != VectorDbKind::Milvus {
+        return Err("Database deletion is only supported for Milvus connections".to_string());
+    }
+    send_json(client.post("/v2/vectordb/databases/drop").json(&serde_json::json!({ "dbName": database })), client.kind)
+        .await
+        .map(|_| ())
+}
+
+/// Drop a Milvus collection through the v2 REST API.
+pub async fn drop_collection(client: &VectorClient, database: &str, collection: &str) -> Result<(), String> {
+    if client.kind != VectorDbKind::Milvus {
+        return Err("Collection deletion is only supported for Milvus connections".to_string());
+    }
+    send_json(
+        client
+            .post("/v2/vectordb/collections/drop")
+            .json(&serde_json::json!({ "dbName": database, "collectionName": collection })),
+        client.kind,
+    )
+    .await
+    .map(|_| ())
+}
+
+fn validate_milvus_collection_rename(
+    client: &VectorClient,
+    database: &str,
+    source_collection: &str,
+    target_collection: &str,
+) -> Result<(), String> {
+    if client.kind != VectorDbKind::Milvus {
+        return Err("Collection rename is only supported for Milvus connections".to_string());
+    }
+    if database.is_empty() {
+        return Err("Database name must not be empty".to_string());
+    }
+    if source_collection.is_empty() {
+        return Err("Source collection name must not be empty".to_string());
+    }
+    if target_collection.is_empty() {
+        return Err("Target collection name must not be empty".to_string());
+    }
+    if source_collection == target_collection {
+        return Err("Source and target collection names must differ".to_string());
+    }
+    Ok(())
+}
+
+/// Rename a Milvus collection through the v2 REST API.
+pub async fn rename_collection(
+    client: &VectorClient,
+    database: &str,
+    collection: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    validate_milvus_collection_rename(client, database, collection, new_name)?;
+    send_json(
+        client.post("/v2/vectordb/collections/rename").json(&serde_json::json!({
+            "dbName": database,
+            "collectionName": collection,
+            "newCollectionName": new_name,
+        })),
+        client.kind,
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn list_milvus_databases(client: &VectorClient) -> Result<Vec<String>, String> {
-    // Older Milvus versions (pre-2.2) do not expose the databases endpoint; fall back to "default"
-    // so the connection stays browsable instead of failing the whole tree load.
+    // Older Milvus versions (pre-2.2) do not expose the databases endpoint; fall back to the
+    // configured database (or "default") so the connection stays browsable instead of failing the whole tree load.
     //
     // The endpoint rejects a bodyless POST with `{"code":1801,...}` (HTTP 200, no `data` field),
     // so send an empty JSON object like every other Milvus v2 endpoint.
-    let body = match send_json(client.post("/v2/vectordb/databases/list").json(&serde_json::json!({})), "Milvus").await
-    {
-        Ok(body) => body,
-        Err(_) => return Ok(vec!["default".to_string()]),
-    };
+    let body =
+        match send_json(client.post("/v2/vectordb/databases/list").json(&serde_json::json!({})), client.kind).await {
+            Ok(body) => body,
+            Err(_) => return Ok(vec![client.database_or_default().to_string()]),
+        };
+    Ok(milvus_database_names(&body, client.database_or_default()))
+}
+
+fn milvus_database_names(body: &Value, configured_database: &str) -> Vec<String> {
+    let has_database_list = body.get("data").is_some_and(Value::is_array);
     let mut names: Vec<String> = match body.get("data") {
         Some(Value::Array(items)) => items.iter().filter_map(milvus_database_name_from_item).collect(),
         _ => Vec::new(),
     };
-    if !names.iter().any(|name| name == "default") {
-        names.push("default".to_string());
+    // Only use the configured database as a compatibility fallback when the
+    // server does not return a database list. This lets a successfully dropped
+    // database disappear from the sidebar instead of being re-added locally.
+    if !has_database_list && !names.iter().any(|name| name == configured_database) {
+        names.push(configured_database.to_string());
     }
     names.sort();
-    Ok(names)
+    names.dedup();
+    names
 }
 
 fn milvus_database_name_from_item(item: &Value) -> Option<String> {
@@ -210,7 +347,7 @@ fn milvus_database_name_from_item(item: &Value) -> Option<String> {
 }
 
 async fn list_qdrant_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
-    let body = send_json(client.get("/collections"), "Qdrant").await?;
+    let body = send_json(client.get("/collections"), client.kind).await?;
     let mut infos: Vec<CollectionInfo> = body
         .pointer("/result/collections")
         .and_then(Value::as_array)
@@ -218,13 +355,7 @@ async fn list_qdrant_collections(client: &VectorClient) -> Result<Vec<Collection
         .flatten()
         .filter_map(|item| {
             let name = item.get("name").and_then(Value::as_str)?;
-            Some(CollectionInfo {
-                name: name.to_string(),
-                id: name.to_string(),
-                dimension: None,
-                kind: None,
-                bucket_name: None,
-            })
+            Some(CollectionInfo { name: name.to_string(), id: name.to_string(), ..Default::default() })
         })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -235,7 +366,7 @@ async fn list_milvus_collections(client: &VectorClient, database: &str) -> Resul
     let db_name = if database.is_empty() { "default" } else { database };
     let body = send_json(
         client.post("/v2/vectordb/collections/list").json(&serde_json::json!({ "dbName": db_name })),
-        "Milvus",
+        client.kind,
     )
     .await?;
     let mut infos: Vec<CollectionInfo> = match body.get("data") {
@@ -243,7 +374,7 @@ async fn list_milvus_collections(client: &VectorClient, database: &str) -> Resul
             .iter()
             .filter_map(|item| {
                 let name = collection_name_from_milvus_item(item)?;
-                Some(CollectionInfo { name: name.clone(), id: name, dimension: None, kind: None, bucket_name: None })
+                Some(CollectionInfo { name: name.clone(), id: name, ..Default::default() })
             })
             .collect(),
         _ => Vec::new(),
@@ -260,19 +391,17 @@ fn collection_name_from_milvus_item(item: &Value) -> Option<String> {
 }
 
 async fn list_weaviate_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
-    let body = send_json(client.get("/v1/schema"), "Weaviate").await?;
+    let body = send_json(client.get("/v1/schema"), client.kind).await?;
     let mut infos: Vec<CollectionInfo> = weaviate_collection_names_from_schema(&body)
         .into_iter()
-        .map(|name| CollectionInfo { name: name.clone(), id: name, dimension: None, kind: None, bucket_name: None })
+        .map(|name| CollectionInfo { name: name.clone(), id: name, ..Default::default() })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(infos)
 }
 
 async fn list_chroma_collections(client: &VectorClient) -> Result<Vec<CollectionInfo>, String> {
-    let body =
-        send_json(client.get("/api/v2/tenants/default_tenant/databases/default_database/collections"), "ChromaDB")
-            .await?;
+    let body = send_json(client.get(&client.chroma_collections_path()), client.kind).await?;
     let mut infos: Vec<CollectionInfo> = body
         .as_array()
         .into_iter()
@@ -281,13 +410,7 @@ async fn list_chroma_collections(client: &VectorClient) -> Result<Vec<Collection
             let name = item.get("name").and_then(Value::as_str)?;
             let id = item.get("id").and_then(Value::as_str)?;
             let dimension = item.get("dimension").and_then(|v| v.as_u64()).map(|d| d as u32);
-            Some(CollectionInfo {
-                name: name.to_string(),
-                id: id.to_string(),
-                dimension,
-                kind: None,
-                bucket_name: None,
-            })
+            Some(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension, ..Default::default() })
         })
         .collect();
     infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -302,22 +425,23 @@ pub async fn get_collection_detail(
     match client.kind {
         VectorDbKind::Qdrant => get_qdrant_collection_detail(client, collection).await,
         VectorDbKind::Milvus => get_milvus_collection_detail(client, database, collection).await,
-        VectorDbKind::Weaviate => {
-            // Weaviate REST API does not expose vector dimension
-            Ok(CollectionInfo {
-                name: collection.to_string(),
-                id: collection.to_string(),
-                dimension: None,
-                kind: None,
-                bucket_name: None,
-            })
-        }
+        VectorDbKind::Weaviate => get_weaviate_collection_detail(client, collection).await,
         VectorDbKind::ChromaDb => get_chroma_collection_detail(client, collection).await,
     }
 }
 
+async fn get_weaviate_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
+    let query = format!("{{ Get {{ {collection}(limit: 1) {{ _additional {{ vector }} }} }} }}");
+    let dimension =
+        match send_json(client.post("/v1/graphql").json(&serde_json::json!({ "query": query })), client.kind).await {
+            Ok(body) => weaviate_vector_dimension_from_graphql(&body, collection),
+            Err(_) => None,
+        };
+    Ok(CollectionInfo { name: collection.to_string(), id: collection.to_string(), dimension, ..Default::default() })
+}
+
 async fn get_qdrant_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
-    let body = send_json(client.get(&format!("/collections/{}", path_segment(collection))), "Qdrant").await?;
+    let body = send_json(client.get(&format!("/collections/{}", path_segment(collection))), client.kind).await?;
     let dim = body
         .pointer("/result/config/params/vectors/size")
         .and_then(Value::as_u64)
@@ -331,28 +455,78 @@ async fn get_qdrant_collection_detail(client: &VectorClient, collection: &str) -
         name: collection.to_string(),
         id: collection.to_string(),
         dimension: dim,
-        kind: None,
-        bucket_name: None,
+        ..Default::default()
     })
 }
 
-fn milvus_vector_dim_from_field(field: &Value) -> Option<u32> {
-    if let Some(dim) = field.pointer("/params/dim").and_then(Value::as_u64) {
-        return Some(dim as u32);
-    }
-    if let Some(params) = field.get("params").and_then(Value::as_array) {
-        for param in params {
-            if param.get("key").and_then(Value::as_str) == Some("dim") {
-                if let Some(v) = param.get("value").and_then(Value::as_str) {
-                    return v.parse().ok();
-                }
-                if let Some(v) = param.get("value").and_then(Value::as_u64) {
-                    return Some(v as u32);
-                }
-            }
-        }
-    }
-    None
+fn milvus_data_type(field: &Value) -> Option<String> {
+    field.get("dataType").and_then(Value::as_str).map(str::to_string).or_else(|| match field.get("type")? {
+        Value::String(data_type) => Some(data_type.clone()),
+        Value::Number(code) => code.as_i64().and_then(milvus_data_type_from_code).map(str::to_string),
+        _ => None,
+    })
+}
+
+fn milvus_data_type_from_code(code: i64) -> Option<&'static str> {
+    Some(match code {
+        1 => "Bool",
+        2 => "Int8",
+        3 => "Int16",
+        4 => "Int32",
+        5 => "Int64",
+        10 => "Float",
+        11 => "Double",
+        20 => "String",
+        21 => "VarChar",
+        22 => "Array",
+        23 => "JSON",
+        24 => "Geometry",
+        100 => "BinaryVector",
+        101 => "FloatVector",
+        102 => "Float16Vector",
+        103 => "BFloat16Vector",
+        104 => "SparseFloatVector",
+        105 => "Int8Vector",
+        _ => return None,
+    })
+}
+
+fn milvus_dimension(field: &Value) -> Option<u32> {
+    let value = field.pointer("/elementTypeParams/dim").or_else(|| {
+        field
+            .get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.iter().find(|param| param.get("key").and_then(Value::as_str) == Some("dim")))
+            .and_then(|param| param.get("value"))
+    })?;
+    value.as_u64().and_then(|dimension| dimension.try_into().ok()).or_else(|| value.as_str()?.parse().ok())
+}
+
+fn milvus_flag(field: &Value, names: &[&str]) -> bool {
+    names.iter().find_map(|name| field.get(name)).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn is_milvus_vector_data_type(data_type: &str) -> bool {
+    data_type.ends_with("Vector")
+}
+
+fn milvus_field_info(field: &Value) -> Option<MilvusFieldInfo> {
+    let name = field.get("fieldName").or_else(|| field.get("name"))?.as_str()?.to_string();
+    let data_type = milvus_data_type(field)?;
+    Some(MilvusFieldInfo {
+        name,
+        dimension: is_milvus_vector_data_type(&data_type).then(|| milvus_dimension(field)).flatten(),
+        data_type,
+        primary_key: milvus_flag(field, &["primaryKey", "isPrimaryKey", "is_primary_key"]),
+        auto_id: milvus_flag(field, &["autoId", "auto_id"]),
+        nullable: field.get("nullable").and_then(Value::as_bool).unwrap_or(false),
+        has_default_value: field.get("defaultValue").is_some_and(|value| !value.is_null()),
+        is_function_output: milvus_flag(field, &["isFunctionOutput", "is_function_output"]),
+    })
+}
+
+fn milvus_collection_schema(fields: &[Value]) -> MilvusCollectionSchema {
+    MilvusCollectionSchema { fields: fields.iter().filter_map(milvus_field_info).collect() }
 }
 
 async fn get_milvus_collection_detail(
@@ -365,47 +539,34 @@ async fn get_milvus_collection_detail(
         client
             .post("/v2/vectordb/collections/describe")
             .json(&serde_json::json!({ "dbName": db_name, "collectionName": collection })),
-        "Milvus",
+        client.kind,
     )
     .await?;
     if body.get("code").and_then(Value::as_i64) != Some(0) {
         let msg = body.get("message").and_then(Value::as_str).unwrap_or("unknown error");
         return Err(format!("Milvus collection detail error: {msg}"));
     }
-    let fields = body.pointer("/data/fields").and_then(Value::as_array);
-    let dim = fields
-        .and_then(|f| {
-            f.iter().find(|f| {
-                let t = f.get("type");
-                t.and_then(Value::as_str) == Some("FloatVector")
-                    || t.and_then(Value::as_str) == Some("BinaryVector")
-                    || t.and_then(Value::as_i64) == Some(101)
-                    || t.and_then(Value::as_i64) == Some(102)
-            })
-        })
-        .and_then(milvus_vector_dim_from_field);
+    let milvus_schema =
+        body.pointer("/data/fields").and_then(Value::as_array).map(|fields| milvus_collection_schema(fields));
+    let dimension = milvus_schema
+        .as_ref()
+        .and_then(|schema| schema.fields.iter().find(|field| is_milvus_vector_data_type(&field.data_type)))
+        .and_then(|field| field.dimension);
     Ok(CollectionInfo {
         name: collection.to_string(),
         id: collection.to_string(),
-        dimension: dim,
-        kind: None,
-        bucket_name: None,
+        dimension,
+        milvus_schema,
+        ..Default::default()
     })
 }
 
 async fn get_chroma_collection_detail(client: &VectorClient, collection: &str) -> Result<CollectionInfo, String> {
-    let body = send_json(
-        client.get(&format!(
-            "/api/v2/tenants/default_tenant/databases/default_database/collections/{}",
-            path_segment(collection)
-        )),
-        "ChromaDB",
-    )
-    .await?;
+    let body = send_json(client.get(&client.chroma_collection_path(collection, None)), client.kind).await?;
     let name = body.get("name").and_then(Value::as_str).unwrap_or(collection);
     let id = body.get("id").and_then(Value::as_str).unwrap_or(collection);
     let dimension = body.get("dimension").and_then(|v| v.as_u64()).map(|d| d as u32);
-    Ok(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension, kind: None, bucket_name: None })
+    Ok(CollectionInfo { name: name.to_string(), id: id.to_string(), dimension, ..Default::default() })
 }
 
 fn chroma_get_response_to_rows(body: &Value) -> Vec<Value> {
@@ -468,6 +629,18 @@ fn weaviate_graphql_to_rows(body: &Value) -> Option<Vec<Value>> {
     )
 }
 
+fn weaviate_vector_dimension_from_graphql(body: &Value, collection: &str) -> Option<u32> {
+    let vector = body
+        .get("data")?
+        .get("Get")?
+        .get(collection)?
+        .as_array()?
+        .first()?
+        .pointer("/_additional/vector")?
+        .as_array()?;
+    u32::try_from(vector.len()).ok().filter(|dimension| *dimension > 0)
+}
+
 fn weaviate_collection_names_from_schema(body: &Value) -> Vec<String> {
     body.get("classes")
         .and_then(Value::as_array)
@@ -486,13 +659,8 @@ pub async fn find_documents(
 ) -> Result<crate::db::document_result::DocumentQueryResult, String> {
     if client.kind == VectorDbKind::ChromaDb {
         let start = std::time::Instant::now();
-        let url = format!(
-            "{}/api/v2/tenants/default_tenant/databases/default_database/collections/{}/get",
-            client.base_url,
-            path_segment(collection),
-        );
         let resp = client
-            .with_auth(client.http.post(&url))
+            .post(&client.chroma_collection_path(collection, Some("get")))
             .json(&serde_json::json!({
                 "limit": limit.max(1) as u64,
                 "offset": skip,
@@ -526,6 +694,7 @@ pub async fn find_documents(
             extended_documents: None,
             total: result.affected_rows,
             total_is_exact: true,
+            next_cursor: None,
         });
     }
 
@@ -574,6 +743,7 @@ pub async fn find_documents(
         extended_documents: None,
         total: result.affected_rows,
         total_is_exact: true,
+        next_cursor: None,
     })
 }
 
@@ -583,11 +753,35 @@ pub async fn execute_rest_query(client: &VectorClient, input: &str) -> Result<Qu
     let resp = request.send().await.map_err(|e| format!("{} request failed: {e}", client.kind.label()))?;
     let status = resp.status().as_u16();
     let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+    rest_query_result(client.kind, status, body, start)
+}
+
+fn rest_query_result(kind: VectorDbKind, status: u16, body: Value, start: Instant) -> Result<QueryResult, String> {
     if !(200..300).contains(&status) {
         let detail = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
-        return Err(format!("{} error ({status}): {detail}", client.kind.label()));
+        return Err(format!("{} error ({status}): {detail}", kind.label()));
+    }
+    if kind == VectorDbKind::Milvus {
+        if let Some(error) = milvus_business_error(&body) {
+            return Err(error);
+        }
     }
     Ok(json_to_query_result(status, body, start))
+}
+
+// Milvus REST uses HTTP-style code 200 for success, while some responses use gRPC-style code 0.
+fn milvus_business_error(body: &Value) -> Option<String> {
+    let code = body.get("code").and_then(Value::as_i64)?;
+    if code == 0 || code == 200 {
+        return None;
+    }
+    let detail = body
+        .get("message")
+        .or_else(|| body.get("msg"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string_pretty(body).unwrap_or_else(|_| body.to_string()));
+    Some(format!("Milvus error (code {code}): {detail}"))
 }
 
 fn parse_rest_query(client: &VectorClient, input: &str) -> Result<reqwest::RequestBuilder, String> {
@@ -638,10 +832,7 @@ fn default_collection_query(client: &VectorClient, collection: &str) -> Result<r
         }))),
         VectorDbKind::Weaviate => Ok(client.get(&format!("/v1/objects?class={}&limit=100", query_value(collection)))),
         VectorDbKind::ChromaDb => Ok(client
-            .post(&format!(
-                "/api/v2/tenants/default_tenant/databases/default_database/collections/{}/get",
-                path_segment(collection)
-            ))
+            .post(&client.chroma_collection_path(collection, Some("get")))
             .json(&serde_json::json!({"limit": 100, "include": ["documents", "metadatas"]}))),
     }
 }
@@ -654,14 +845,45 @@ pub(crate) fn path_segment(value: &str) -> String {
     utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
+pub(crate) fn chroma_collections_path(tenant: &str, database: &str) -> String {
+    let tenant = tenant.trim();
+    let database = database.trim();
+    format!(
+        "/api/v2/tenants/{}/databases/{}/collections",
+        path_segment(if tenant.is_empty() { "default_tenant" } else { tenant }),
+        path_segment(if database.is_empty() { "default_database" } else { database })
+    )
+}
+
+pub(crate) fn chroma_collection_path(
+    tenant: &str,
+    database: &str,
+    collection: &str,
+    operation: Option<&str>,
+) -> String {
+    let mut path = format!("{}/{}", chroma_collections_path(tenant, database), path_segment(collection));
+    if let Some(operation) = operation {
+        path.push('/');
+        path.push_str(&path_segment(operation));
+    }
+    path
+}
+
 pub(crate) fn query_value(value: &str) -> String {
     utf8_percent_encode(value, QUERY_VALUE_ENCODE_SET).to_string()
 }
 
-async fn send_json(req: reqwest::RequestBuilder, label: &str) -> Result<Value, String> {
+async fn send_json(req: reqwest::RequestBuilder, kind: VectorDbKind) -> Result<Value, String> {
+    let label = kind.label();
     let resp = req.send().await.map_err(|e| format!("{label} request failed: {e}"))?;
     let resp = ensure_success(label, resp).await?;
-    resp.json().await.map_err(|e| format!("{label} parse error: {e}"))
+    let body = resp.json().await.map_err(|e| format!("{label} parse error: {e}"))?;
+    if kind == VectorDbKind::Milvus {
+        if let Some(error) = milvus_business_error(&body) {
+            return Err(error);
+        }
+    }
+    Ok(body)
 }
 
 async fn ensure_success(label: &str, resp: reqwest::Response) -> Result<reqwest::Response, String> {
@@ -698,6 +920,8 @@ fn json_to_query_result(status: u16, body: Value, start: Instant) -> QueryResult
         columns: vec!["status".to_string(), "response".to_string()],
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows: vec![vec![
             Value::Number(status.into()),
             Value::String(serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())),
@@ -707,6 +931,8 @@ fn json_to_query_result(status: u16, body: Value, start: Instant) -> QueryResult
         truncated: false,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -731,12 +957,16 @@ fn values_to_query_result(items: Vec<Value>, start: Instant) -> QueryResult {
         columns,
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         affected_rows: rows.len() as u64,
         rows,
         execution_time_ms: start.elapsed().as_millis(),
         truncated: false,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
@@ -779,17 +1009,181 @@ fn format_reqwest_error(err: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        chroma_get_response_to_rows, starts_with_http_method, values_to_query_result, vector_auth,
-        weaviate_collection_names_from_schema, CollectionInfo, VectorAuth, VectorDbKind,
+        chroma_get_response_to_rows, default_collection_query, milvus_collection_schema, milvus_database_names,
+        rename_collection, rest_query_result, starts_with_http_method, test_connection, test_connection_request,
+        values_to_query_result, vector_auth, weaviate_collection_names_from_schema,
+        weaviate_vector_dimension_from_graphql, CollectionInfo, VectorAuth, VectorClient, VectorDbKind,
     };
-    use serde_json::json;
-    use std::time::Instant;
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_json_response_server(body: Value) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            // Mock HTTP server only needs to drain the request before writing the canned response;
+            // the byte count is irrelevant, so discard it explicitly to satisfy clippy::unused_io_amount.
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn spawn_recording_json_response_server(
+        body: Value,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 2048];
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().to_owned())
+                    })
+                    .and_then(|length| length.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            request_tx.send(String::from_utf8_lossy(&request).into_owned()).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), request_rx, server)
+    }
 
     #[test]
     fn detects_rest_queries_case_insensitively() {
         assert!(starts_with_http_method("post /collections/foo"));
         assert!(starts_with_http_method("GET /collections"));
         assert!(!starts_with_http_method("collection_name"));
+    }
+
+    #[test]
+    fn handles_milvus_business_codes_returned_with_http_success() {
+        assert_eq!(
+            rest_query_result(
+                VectorDbKind::Milvus,
+                200,
+                json!({ "code": 1100, "message": "field kind does not exist" }),
+                Instant::now()
+            )
+            .unwrap_err(),
+            "Milvus error (code 1100): field kind does not exist"
+        );
+        assert!(rest_query_result(VectorDbKind::Milvus, 200, json!({ "code": 0 }), Instant::now()).is_ok());
+        assert!(rest_query_result(
+            VectorDbKind::Milvus,
+            200,
+            json!({ "code": 200, "data": ["kb_vectors"] }),
+            Instant::now()
+        )
+        .is_ok());
+        assert!(rest_query_result(VectorDbKind::Milvus, 200, json!({ "data": [] }), Instant::now()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn milvus_connection_test_accepts_rest_success_code() {
+        let (url, server) = spawn_json_response_server(json!({
+            "code": 200,
+            "data": ["kb_vectors"]
+        }))
+        .await;
+        let client = VectorClient::new(VectorDbKind::Milvus, &url, None, None, false, Duration::from_secs(1));
+
+        test_connection(&client, Duration::from_secs(1)).await.unwrap();
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn milvus_connection_test_rejects_business_errors() {
+        let (url, server) = spawn_json_response_server(json!({
+            "code": 800,
+            "message": "database not found[database=resume_test]"
+        }))
+        .await;
+        let client = VectorClient::new(VectorDbKind::Milvus, &url, None, None, false, Duration::from_secs(1))
+            .with_database(Some("resume_test"));
+
+        let error = test_connection(&client, Duration::from_secs(1)).await.unwrap_err();
+
+        assert_eq!(error, "Milvus error (code 800): database not found[database=resume_test]");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn milvus_connection_test_uses_configured_database() {
+        let client = VectorClient::new(
+            VectorDbKind::Milvus,
+            "http://localhost:19530",
+            None,
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .with_database(Some(" resume_test "));
+        let request = test_connection_request(&client).build().unwrap();
+        let body = request.body().and_then(reqwest::Body::as_bytes).unwrap();
+
+        assert_eq!(serde_json::from_slice::<Value>(body).unwrap(), json!({ "dbName": "resume_test" }));
+    }
+
+    #[test]
+    fn milvus_connection_test_defaults_empty_database() {
+        let client = VectorClient::new(
+            VectorDbKind::Milvus,
+            "http://localhost:19530",
+            None,
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .with_database(Some("  "));
+        let request = test_connection_request(&client).build().unwrap();
+        let body = request.body().and_then(reqwest::Body::as_bytes).unwrap();
+
+        assert_eq!(serde_json::from_slice::<Value>(body).unwrap(), json!({ "dbName": "default" }));
+    }
+
+    #[test]
+    fn milvus_database_list_does_not_readd_deleted_configured_database() {
+        assert_eq!(milvus_database_names(&json!({ "data": ["default"] }), "resume_test"), vec!["default".to_string()]);
+        assert_eq!(
+            milvus_database_names(&json!({ "data": ["resume_test"] }), "resume_test"),
+            vec!["resume_test".to_string()]
+        );
     }
 
     #[test]
@@ -810,6 +1204,108 @@ mod tests {
             ]
         }));
         assert_eq!(names, vec!["Article".to_string(), "Product".to_string()]);
+    }
+
+    #[test]
+    fn extracts_weaviate_vector_dimension_from_first_object() {
+        let vector = vec![0.0; 1024];
+        let body = json!({
+            "data": {
+                "Get": {
+                    "Article": [{ "_additional": { "vector": vector } }]
+                }
+            }
+        });
+        assert_eq!(weaviate_vector_dimension_from_graphql(&body, "Article"), Some(1024));
+    }
+
+    #[test]
+    fn retains_milvus_fields_needed_for_schema_driven_upsert() {
+        let fields = vec![
+            json!({ "name": "doc_id", "type": "VarChar", "primaryKey": true, "autoId": true }),
+            json!({ "fieldName": "embedding", "dataType": "FloatVector", "elementTypeParams": { "dim": "4" } }),
+            json!({ "fieldName": "score", "dataType": "Double" }),
+            json!({ "fieldName": "optional_note", "dataType": "VarChar", "nullable": true }),
+            json!({ "fieldName": "status", "dataType": "VarChar", "defaultValue": "new" }),
+            json!({ "fieldName": "bm25", "dataType": "SparseFloatVector", "isFunctionOutput": true }),
+        ];
+
+        let schema = milvus_collection_schema(&fields);
+        assert_eq!(schema.fields.len(), 6);
+        let primary_key = schema.fields.iter().find(|field| field.name == "doc_id").unwrap();
+        assert!(primary_key.primary_key);
+        assert!(primary_key.auto_id);
+        let vector = schema.fields.iter().find(|field| field.name == "embedding").unwrap();
+        assert_eq!(vector.dimension, Some(4));
+        assert_eq!(vector.data_type, "FloatVector");
+        assert!(schema.fields.iter().find(|field| field.name == "optional_note").unwrap().nullable);
+        assert!(schema.fields.iter().find(|field| field.name == "status").unwrap().has_default_value);
+        assert!(schema.fields.iter().find(|field| field.name == "bm25").unwrap().is_function_output);
+    }
+
+    #[test]
+    fn extracts_milvus_schema_from_describe_response() {
+        let body = json!({
+            "data": {
+                "fields": [
+                    { "fieldName": "id", "dataType": "Int64" },
+                    {
+                        "fieldName": "embedding",
+                        "dataType": "FloatVector",
+                        "elementTypeParams": { "dim": "4" }
+                    }
+                ]
+            }
+        });
+
+        let schema = milvus_collection_schema(
+            body.pointer("/data/fields").and_then(Value::as_array).expect("Milvus schema fields"),
+        );
+        assert_eq!(schema.fields[1].name, "embedding");
+        assert_eq!(schema.fields[1].dimension, Some(4));
+    }
+
+    #[test]
+    fn accepts_existing_milvus_describe_fields() {
+        let body = json!({
+            "data": {
+                "fields": [{
+                    "name": "embedding",
+                    "type": 101,
+                    "params": [{ "key": "dim", "value": "4" }]
+                }]
+            }
+        });
+        let schema = milvus_collection_schema(
+            body.pointer("/data/fields").and_then(Value::as_array).expect("Milvus schema fields"),
+        );
+        assert_eq!(schema.fields[0].data_type, "FloatVector");
+        assert_eq!(schema.fields[0].dimension, Some(4));
+    }
+
+    #[test]
+    fn serializes_milvus_schema_for_the_frontend() {
+        let info = CollectionInfo {
+            name: "documents".to_string(),
+            id: "documents".to_string(),
+            milvus_schema: Some(milvus_collection_schema(&[json!({
+                "fieldName": "embedding",
+                "dataType": "FloatVector",
+                "elementTypeParams": { "dim": 3 },
+                "isPrimaryKey": true
+            })])),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(info).unwrap();
+        assert_eq!(value.pointer("/milvusSchema/fields/0/dataType"), Some(&json!("FloatVector")));
+        assert_eq!(value.pointer("/milvusSchema/fields/0/dimension"), Some(&json!(3)));
+        assert_eq!(value.pointer("/milvusSchema/fields/0/primaryKey"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn leaves_weaviate_dimension_unknown_for_empty_collections() {
+        let body = json!({ "data": { "Get": { "Article": [] } } });
+        assert_eq!(weaviate_vector_dimension_from_graphql(&body, "Article"), None);
     }
 
     #[test]
@@ -844,6 +1340,101 @@ mod tests {
         assert_eq!(vector_auth(VectorDbKind::ChromaDb, None, None), None);
     }
 
+    #[tokio::test]
+    async fn chroma_cloud_connection_test_uses_configured_namespace_and_token() {
+        let (url, request_rx, server) = spawn_recording_json_response_server(json!([])).await;
+        let client = VectorClient::new(
+            VectorDbKind::ChromaDb,
+            &url,
+            Some("tenant /eu"),
+            Some("cloud-api-key"),
+            false,
+            Duration::from_secs(1),
+        )
+        .with_database(Some("support/kb"));
+
+        test_connection(&client, Duration::from_secs(1)).await.unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert!(
+            request.starts_with("GET /api/v2/tenants/tenant%20%2Feu/databases/support%2Fkb/collections HTTP/1.1\r\n")
+        );
+        assert!(request.to_ascii_lowercase().contains("\r\nx-chroma-token: cloud-api-key\r\n"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn chroma_local_connection_test_keeps_default_namespace() {
+        let client = VectorClient::new(
+            VectorDbKind::ChromaDb,
+            "http://localhost:8000",
+            None,
+            None,
+            false,
+            Duration::from_secs(1),
+        );
+
+        let request = test_connection_request(&client).build().unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections"
+        );
+        assert!(request.headers().get("x-chroma-token").is_none());
+    }
+
+    #[tokio::test]
+    async fn milvus_rename_collection_uses_v2_api_and_expected_names() {
+        let (url, request_rx, server) = spawn_recording_json_response_server(json!({ "code": 0 })).await;
+        let client = VectorClient::new(VectorDbKind::Milvus, &url, None, None, false, Duration::from_secs(1));
+
+        rename_collection(&client, "analytics", "events", "events_archive").await.unwrap();
+        let request = request_rx.await.unwrap();
+
+        assert!(request.starts_with("POST /v2/vectordb/collections/rename HTTP/1.1\r\n"));
+        let request_body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            request_body,
+            json!({
+                "dbName": "analytics",
+                "collectionName": "events",
+                "newCollectionName": "events_archive",
+            })
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn milvus_collection_rename_rejects_invalid_targets_before_sending() {
+        let client =
+            VectorClient::new(VectorDbKind::Milvus, "http://127.0.0.1:1", None, None, false, Duration::from_secs(1));
+
+        assert!(rename_collection(&client, "default", "events", "events").await.unwrap_err().contains("differ"));
+        assert!(rename_collection(&client, "default", "events", "").await.unwrap_err().contains("must not be empty"));
+    }
+
+    #[test]
+    fn chroma_collection_paths_encode_every_dynamic_segment() {
+        let client = VectorClient::new(
+            VectorDbKind::ChromaDb,
+            "https://api.trychroma.com",
+            Some("tenant /eu"),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .with_database(Some("support/kb"));
+
+        assert_eq!(
+            client.chroma_collection_path("collection/id", Some("get/by-id")),
+            "/api/v2/tenants/tenant%20%2Feu/databases/support%2Fkb/collections/collection%2Fid/get%2Fby-id"
+        );
+        assert_eq!(
+            default_collection_query(&client, "collection/id").unwrap().build().unwrap().url().path(),
+            "/api/v2/tenants/tenant%20%2Feu/databases/support%2Fkb/collections/collection%2Fid/get"
+        );
+    }
+
     #[test]
     fn parses_chroma_collection_list() {
         let body = json!([
@@ -857,13 +1448,7 @@ mod tests {
             .filter_map(|item| {
                 let name = item.get("name").and_then(|v| v.as_str())?;
                 let id = item.get("id").and_then(|v| v.as_str())?;
-                Some(CollectionInfo {
-                    name: name.to_string(),
-                    id: id.to_string(),
-                    dimension: None,
-                    kind: None,
-                    bucket_name: None,
-                })
+                Some(CollectionInfo { name: name.to_string(), id: id.to_string(), ..Default::default() })
             })
             .collect();
         assert_eq!(infos.len(), 2);

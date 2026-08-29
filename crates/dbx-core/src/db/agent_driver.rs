@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -11,12 +12,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::models::connection::DatabaseConnectionInfo;
 
 type PendingAgentResponse = tokio::sync::oneshot::Sender<Result<Value, String>>;
 
+#[derive(Clone)]
+struct CachedAgentQuery {
+    key: String,
+    expires_at: Instant,
+    result: Result<Value, String>,
+}
+
 pub struct AgentRuntimeClient {
     child: Arc<Mutex<Child>>,
+    child_reaper_started: Arc<AtomicBool>,
+    child_reaped: Arc<AtomicBool>,
     stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     pending: Arc<Mutex<HashMap<u64, PendingAgentResponse>>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
@@ -28,15 +39,7 @@ pub struct AgentRuntimeClient {
 
 impl AgentRuntimeClient {
     pub async fn spawn(launch: AgentLaunchSpec, app_version: &str) -> Result<Arc<Self>, String> {
-        let mut command = crate::process::new_std_command(&launch.program);
-        command.args(&launch.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some(working_dir) = &launch.working_dir {
-            command.current_dir(working_dir);
-        }
-        remove_agent_proxy_env(&mut command);
-
-        let mut child =
-            command.spawn().map_err(|e| format!("Failed to spawn agent process {}: {e}", launch_display(&launch)))?;
+        let mut child = spawn_agent_process(&launch)?;
         let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
         let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
         let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
@@ -65,6 +68,8 @@ impl AgentRuntimeClient {
 
         let runtime = Arc::new(Self {
             child: Arc::new(Mutex::new(child)),
+            child_reaper_started: Arc::new(AtomicBool::new(false)),
+            child_reaped: Arc::new(AtomicBool::new(false)),
             stdin: Arc::new(Mutex::new(BufWriter::new(child_stdin))),
             pending: Arc::new(Mutex::new(HashMap::new())),
             stderr_tail,
@@ -74,14 +79,25 @@ impl AgentRuntimeClient {
             handshake: AgentHandshake { protocol_version: 0, agent_protocol_version: 0, capabilities: Vec::new() },
         });
         runtime.start_response_reader(stdout);
-        let handshake = runtime
-            .call::<AgentHandshake>(
+        let handshake = match runtime
+            .call_typed::<AgentHandshake>(
                 AgentMethod::Handshake.as_str(),
                 agent_handshake_params(app_version),
                 Some(Duration::from_secs(RPC_TIMEOUT_SECS)),
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(handshake) => handshake,
+            Err(error) if is_unsupported_handshake_error(&error.to_string()) => {
+                runtime.kill();
+                return Err("Agent runtime does not support multi_session protocol v2".to_string());
+            }
+            Err(error) => {
+                runtime.kill();
+                return Err(error.into_legacy_string());
+            }
+        };
         if handshake.protocol_version < 2 || !handshake.supports(AgentCapability::MultiSession) {
             runtime.kill();
             return Err("Agent runtime does not support multi_session protocol v2".to_string());
@@ -94,20 +110,16 @@ impl AgentRuntimeClient {
     fn start_response_reader(self: &Arc<Self>, mut stdout: BufReader<ChildStdout>) {
         let pending = self.pending.clone();
         let failed = self.failed.clone();
+        let child = self.child.clone();
+        let child_reaper_started = self.child_reaper_started.clone();
+        let child_reaped = self.child_reaped.clone();
         std::thread::spawn(move || loop {
-            let line = match read_agent_line(&mut stdout, "response") {
-                Ok(line) => line,
+            let response = match read_agent_json_response(&mut stdout) {
+                Ok((_, response)) => response,
                 Err(err) => {
                     failed.store(true, Ordering::Release);
                     fail_pending_requests(&pending, err);
-                    return;
-                }
-            };
-            let response: Value = match serde_json::from_str(line.trim()) {
-                Ok(response) => response,
-                Err(err) => {
-                    failed.store(true, Ordering::Release);
-                    fail_pending_requests(&pending, format!("Invalid JSON response from agent: {err}"));
+                    terminate_and_reap_shared_agent(child, child_reaper_started, child_reaped);
                     return;
                 }
             };
@@ -127,15 +139,30 @@ impl AgentRuntimeClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
+        self.call_typed(method, params, timeout_duration, cancel_token)
+            .await
+            .map_err(AgentCallError::into_legacy_string)
+    }
+
+    pub async fn call_typed<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
         if self.failed.load(Ordering::Acquire) {
-            return Err("Agent runtime is unavailable".to_string());
+            return Err(AgentCallError::Transport { message: "Agent runtime is unavailable".to_string() });
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let request = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let request_line =
-            serde_json::to_string(&request).map_err(|e| format!("Failed to serialize JSON-RPC request: {e}"))?;
+        let request_line = serde_json::to_string(&request)
+            .map_err(|e| AgentCallError::Transport { message: format!("Failed to serialize JSON-RPC request: {e}") })?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.pending.lock().map_err(|_| "Agent pending response lock poisoned".to_string())?.insert(id, sender);
+        self.pending
+            .lock()
+            .map_err(|_| AgentCallError::Transport { message: "Agent pending response lock poisoned".to_string() })?
+            .insert(id, sender);
         let write_result =
             self.stdin.lock().map_err(|_| "Agent stdin lock poisoned".to_string()).and_then(|mut writer| {
                 writer
@@ -146,25 +173,52 @@ impl AgentRuntimeClient {
             });
         if let Err(err) = write_result {
             self.pending.lock().expect("agent pending response lock poisoned").remove(&id);
-            return Err(err);
+            return Err(AgentCallError::Transport { message: err });
         }
 
-        let receive = async { receiver.await.map_err(|_| "Agent response channel closed".to_string())? };
+        let receive = async {
+            receiver
+                .await
+                .map_err(|_| AgentCallError::Transport { message: "Agent response channel closed".to_string() })?
+                .map_err(|message| AgentCallError::Transport { message })
+        };
         let response = match (timeout_duration, cancel_token) {
             (Some(duration), Some(token)) => tokio::select! {
                 _ = token.cancelled() => {
-                    self.cancel_session_request(&params).await;
-                    Err("Query canceled".to_string())
+                    self.cancel_session_request_for_method(method, &params).await;
+                    Err(AgentCallError::Canceled {
+                        stage: agent_error_stage(method),
+                        operation_outcome: agent_operation_outcome(method),
+                    })
                 },
-                result = tokio::time::timeout(duration, receive) => result.map_err(|_| format!("Agent RPC call timed out ({}s)", duration.as_secs()))?,
+                result = tokio::time::timeout(duration, receive) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.cancel_session_request_for_method(method, &params).await;
+                        Err(AgentCallError::Timeout {
+                            stage: agent_error_stage(method),
+                            operation_outcome: agent_operation_outcome(method),
+                        })
+                    }
+                },
             },
-            (Some(duration), None) => tokio::time::timeout(duration, receive)
-                .await
-                .map_err(|_| format!("Agent RPC call timed out ({}s)", duration.as_secs()))?,
+            (Some(duration), None) => match tokio::time::timeout(duration, receive).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.cancel_session_request_for_method(method, &params).await;
+                    Err(AgentCallError::Timeout {
+                        stage: agent_error_stage(method),
+                        operation_outcome: agent_operation_outcome(method),
+                    })
+                }
+            },
             (None, Some(token)) => tokio::select! {
                 _ = token.cancelled() => {
-                    self.cancel_session_request(&params).await;
-                    Err("Query canceled".to_string())
+                    self.cancel_session_request_for_method(method, &params).await;
+                    Err(AgentCallError::Canceled {
+                        stage: agent_error_stage(method),
+                        operation_outcome: agent_operation_outcome(method),
+                    })
                 },
                 result = receive => result,
             },
@@ -173,14 +227,25 @@ impl AgentRuntimeClient {
         if response.is_err() {
             self.pending.lock().expect("agent pending response lock poisoned").remove(&id);
         }
-        decode_agent_response(response?)
+        let response = response?;
+        decode_agent_response(
+            response,
+            self.handshake.supports(AgentCapability::StructuredErrorV1),
+            params.get("agentSessionId").and_then(Value::as_str),
+        )
+    }
+
+    async fn cancel_session_request_for_method(&self, method: &str, params: &Value) {
+        if method != AgentMethod::CancelSession.as_str() {
+            self.cancel_session_request(params).await;
+        }
     }
 
     async fn cancel_session_request(&self, params: &Value) {
         let Some(agent_session_id) = params.get("agentSessionId").and_then(Value::as_str) else {
             return;
         };
-        let _ = Box::pin(self.call::<Value>(
+        let _ = Box::pin(self.call_typed::<Value>(
             AgentMethod::CancelSession.as_str(),
             serde_json::json!({ "agentSessionId": agent_session_id }),
             Some(Duration::from_secs(5)),
@@ -228,20 +293,30 @@ impl AgentRuntimeClient {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
+        start_shared_agent_reaper(self.child.clone(), self.child_reaper_started.clone(), self.child_reaped.clone());
         fail_pending_requests(&self.pending, "Agent runtime terminated".to_string());
     }
 
     pub async fn kill_and_wait(&self) {
         self.failed.store(true, Ordering::Release);
         fail_pending_requests(&self.pending, "Agent runtime terminated".to_string());
+        if self.child_reaper_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            wait_for_shared_agent_reaper(self.child_reaped.clone()).await;
+            return;
+        }
         let child = self.child.clone();
-        match tokio::task::spawn_blocking(move || {
-            let mut child = child.lock().map_err(|_| "Shared agent process lock poisoned".to_string())?;
-            let _ = child.kill();
-            child.wait().map(|_| ()).map_err(|err| format!("Failed to wait for shared agent runtime: {err}"))
+        let child_reaped = self.child_reaped.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result =
+                child.lock().map_err(|_| "Shared agent process lock poisoned".to_string()).and_then(|mut child| {
+                    let _ = child.kill();
+                    child.wait().map(|_| ()).map_err(|err| format!("Failed to wait for shared agent runtime: {err}"))
+                });
+            child_reaped.store(true, Ordering::Release);
+            result
         })
-        .await
-        {
+        .await;
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => log::warn!("{err}"),
             Err(err) => log::warn!("Failed to join shared agent shutdown task: {err}"),
@@ -249,15 +324,535 @@ impl AgentRuntimeClient {
     }
 }
 
-fn decode_agent_response<T: DeserializeOwned>(response: Value) -> Result<T, String> {
-    if let Some(err) = response.get("error") {
-        let message = err.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error");
-        let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
-        return Err(format!("Agent RPC error ({code}): {message}"));
+fn terminate_and_reap_shared_agent(
+    child: Arc<Mutex<Child>>,
+    child_reaper_started: Arc<AtomicBool>,
+    child_reaped: Arc<AtomicBool>,
+) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
     }
-    let result =
-        response.get("result").ok_or_else(|| "Agent response missing both 'result' and 'error'".to_string())?;
-    serde_json::from_value(result.clone()).map_err(|e| format!("Failed to deserialize agent result: {e}"))
+    start_shared_agent_reaper(child, child_reaper_started, child_reaped);
+}
+
+fn start_shared_agent_reaper(
+    child: Arc<Mutex<Child>>,
+    child_reaper_started: Arc<AtomicBool>,
+    child_reaped: Arc<AtomicBool>,
+) {
+    if child_reaper_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let result =
+            child.lock().map_err(|_| "Shared agent process lock poisoned".to_string()).and_then(|mut child| {
+                child.wait().map(|_| ()).map_err(|err| format!("Failed to wait for shared agent runtime: {err}"))
+            });
+        child_reaped.store(true, Ordering::Release);
+        match result {
+            Ok(()) => {}
+            Err(err) => log::warn!("{err}"),
+        }
+    });
+}
+
+async fn wait_for_shared_agent_reaper(child_reaped: Arc<AtomicBool>) {
+    while !child_reaped.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn decode_agent_response<T: DeserializeOwned>(
+    response: Value,
+    strict_structured_errors: bool,
+    expected_session_id: Option<&str>,
+) -> Result<T, AgentCallError> {
+    if let Some(err) = response.get("error") {
+        return Err(parse_agent_call_error(err, strict_structured_errors, expected_session_id));
+    }
+    let result = response.get("result").ok_or_else(|| AgentCallError::ContractViolation {
+        rpc_code: None,
+        message: "Agent response missing both 'result' and 'error'".to_string(),
+        reason: ContractViolationReason::MissingResultOrError,
+    })?;
+    serde_json::from_value(result.clone()).map_err(|e| AgentCallError::ContractViolation {
+        rpc_code: None,
+        message: format!("Failed to deserialize agent result: {e}"),
+        reason: ContractViolationReason::InvalidResult,
+    })
+}
+
+const AGENT_RPC_ERROR_DATA_MARKER: &str = "\nDBX_AGENT_ERROR_DATA:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionDisposition {
+    Keep,
+    Quarantine,
+    ReplaceRuntime,
+}
+
+impl AgentSessionDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Quarantine => "quarantine",
+            Self::ReplaceRuntime => "replace_runtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentErrorCategory {
+    Connection,
+    Sql,
+    Resource,
+    Protocol,
+    Timeout,
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentErrorStage {
+    Request,
+    Checkout,
+    Connect,
+    Validate,
+    Execute,
+    Fetch,
+    Cancel,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOperationOutcome {
+    NotStarted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentErrorContext {
+    pub contract_version: u8,
+    pub category: AgentErrorCategory,
+    pub retryable: bool,
+    pub session_disposition: AgentSessionDisposition,
+    pub stage: AgentErrorStage,
+    pub operation_outcome: AgentOperationOutcome,
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
+    #[serde(default)]
+    pub sql_state: Option<String>,
+    #[serde(default)]
+    pub vendor_code: Option<i32>,
+    #[serde(default)]
+    pub exception_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyAgentHints {
+    pub category: Option<AgentErrorCategory>,
+    pub retryable: Option<bool>,
+    pub session_disposition: Option<AgentSessionDisposition>,
+    pub stage: Option<AgentErrorStage>,
+    pub operation_outcome: Option<AgentOperationOutcome>,
+    pub agent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractViolationReason {
+    MissingContractVersion,
+    UnsupportedContractVersion,
+    InvalidDataShape,
+    InvalidSessionId,
+    InvalidCombination,
+    MissingResultOrError,
+    InvalidResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCallError {
+    Structured { rpc_code: i64, message: String, context: AgentErrorContext },
+    Legacy { rpc_code: Option<i64>, message: String, hints: LegacyAgentHints },
+    ContractViolation { rpc_code: Option<i64>, message: String, reason: ContractViolationReason },
+    Transport { message: String },
+    Timeout { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
+    Canceled { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
+}
+
+/// Decode an already-stringified Agent failure at the compatibility boundary.
+///
+/// Business modules must use this adapter instead of inspecting the legacy
+/// `DBX_AGENT_ERROR_DATA` marker themselves. Callers must only use it after the
+/// owning pool has been identified as an Agent pool.
+pub(crate) fn agent_error_from_legacy(error: &str, expected_session_id: Option<&str>) -> AgentCallError {
+    if error == "Query canceled" {
+        return AgentCallError::Canceled {
+            stage: AgentErrorStage::Cancel,
+            operation_outcome: AgentOperationOutcome::Unknown,
+        };
+    }
+    let lower = error.to_ascii_lowercase();
+    if lower.starts_with("agent rpc call timed out") {
+        return AgentCallError::Timeout {
+            stage: AgentErrorStage::Execute,
+            operation_outcome: AgentOperationOutcome::Unknown,
+        };
+    }
+    legacy_agent_call_error(error.to_string(), expected_session_id)
+}
+
+/// Returns a typed error only when a mixed legacy path can prove the string
+/// originated from the Agent call corridor.
+pub(crate) fn try_agent_error_from_legacy(error: &str) -> Option<AgentCallError> {
+    let lower = error.to_ascii_lowercase();
+    let is_local_agent_failure = error == "Query canceled"
+        || lower.starts_with("agent rpc call timed out")
+        || lower.contains("agent stdin not available")
+        || lower.contains("agent stdout not available")
+        || lower.contains("agent runtime terminated")
+        || lower.contains("agent runtime is unavailable")
+        || lower.contains("agent runtime unavailable")
+        || lower.contains("failed to write to agent stdin")
+        || lower.contains("failed to flush agent stdin")
+        || lower.contains("agent rpc task failed");
+    (is_agent_rpc_response_error(error) || is_local_agent_failure).then(|| agent_error_from_legacy(error, None))
+}
+
+pub(crate) fn agent_recovery_decision(error: &str, scope: RecoveryScope) -> RecoveryDecision {
+    RecoveryPolicy::decide(&agent_error_from_legacy(error, None), scope)
+}
+
+impl AgentCallError {
+    pub fn into_legacy_string(self) -> String {
+        match self {
+            Self::Structured { rpc_code, message, context } => {
+                let data = serde_json::json!({
+                    "contractVersion": context.contract_version,
+                    "category": category_name(context.category),
+                    "retryable": context.retryable,
+                    "sessionDisposition": context.session_disposition.as_str(),
+                    "stage": stage_name(context.stage),
+                    "operationOutcome": outcome_name(context.operation_outcome),
+                    "agentSessionId": context.agent_session_id,
+                    "sqlState": context.sql_state,
+                    "vendorCode": context.vendor_code,
+                    "exceptionClass": context.exception_class,
+                });
+                format_agent_rpc_error_parts(rpc_code, &message, Some(&data))
+            }
+            Self::Legacy { rpc_code, message, hints } => {
+                let data = serde_json::json!({
+                    "category": hints.category.map(category_name),
+                    "retryable": hints.retryable,
+                    "sessionDisposition": hints.session_disposition.map(|value| value.as_str()),
+                    "stage": hints.stage.map(stage_name),
+                    "operationOutcome": hints.operation_outcome.map(outcome_name),
+                    "agentSessionId": hints.agent_session_id,
+                });
+                format_agent_rpc_error_parts(rpc_code.unwrap_or(-1), &message, Some(&data))
+            }
+            Self::ContractViolation { rpc_code, message, .. } => format_agent_rpc_error_parts(
+                rpc_code.unwrap_or(-1),
+                &message,
+                Some(&serde_json::json!({ "contractVersion": 1 })),
+            ),
+            Self::Transport { message } => message,
+            Self::Timeout { stage, .. } => format!("Agent RPC call timed out at {}", stage_name(stage)),
+            Self::Canceled { .. } => "Query canceled".to_string(),
+        }
+    }
+
+    fn into_legacy_string_with_session_id(self, agent_session_id: Option<&str>) -> String {
+        let has_session_id = self.session_id().is_some();
+        let message = self.into_legacy_string();
+        match (has_session_id, agent_session_id) {
+            (false, Some(agent_session_id)) => append_legacy_agent_session_id(&message, agent_session_id),
+            _ => message,
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Structured { context, .. } => context.agent_session_id.as_deref(),
+            Self::Legacy { hints, .. } => hints.agent_session_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn session_disposition(&self) -> Option<AgentSessionDisposition> {
+        match self {
+            Self::Structured { context, .. } => Some(context.session_disposition),
+            Self::Legacy { hints, .. } => hints.session_disposition,
+            _ => None,
+        }
+    }
+
+    pub fn category(&self) -> Option<AgentErrorCategory> {
+        match self {
+            Self::Structured { context, .. } => Some(context.category),
+            Self::Legacy { hints, .. } => hints.category,
+            Self::Timeout { .. } => Some(AgentErrorCategory::Timeout),
+            Self::Canceled { .. } => Some(AgentErrorCategory::Canceled),
+            Self::ContractViolation { .. } | Self::Transport { .. } => None,
+        }
+    }
+
+    pub fn operation_outcome(&self) -> AgentOperationOutcome {
+        match self {
+            Self::Structured { context, .. } => context.operation_outcome,
+            Self::Legacy { hints, .. } => hints.operation_outcome.unwrap_or(AgentOperationOutcome::Unknown),
+            Self::Timeout { operation_outcome, .. } | Self::Canceled { operation_outcome, .. } => *operation_outcome,
+            Self::ContractViolation { .. } | Self::Transport { .. } => AgentOperationOutcome::Unknown,
+        }
+    }
+
+    fn with_legacy_session_id(mut self, agent_session_id: Option<&str>) -> Self {
+        if let (Self::Legacy { hints, .. }, Some(agent_session_id)) = (&mut self, agent_session_id) {
+            hints.agent_session_id.get_or_insert_with(|| agent_session_id.to_string());
+        }
+        self
+    }
+}
+
+fn append_legacy_agent_session_id(error: &str, agent_session_id: &str) -> String {
+    if let Some((header, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) {
+        if let Some((mut data, suffix)) = parse_legacy_agent_error_data(data) {
+            if let Some(object) = data.as_object_mut() {
+                object.insert("agentSessionId".to_string(), Value::String(agent_session_id.to_string()));
+                return format!("{header}{AGENT_RPC_ERROR_DATA_MARKER}{data}{suffix}");
+            }
+        }
+    }
+    format!("{error}{AGENT_RPC_ERROR_DATA_MARKER}{}", serde_json::json!({ "agentSessionId": agent_session_id }))
+}
+
+impl fmt::Display for AgentCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Structured { message, .. } | Self::Legacy { message, .. } => f.write_str(message),
+            Self::ContractViolation { message, .. } => write!(f, "Agent error contract violation: {message}"),
+            Self::Transport { message } => f.write_str(message),
+            Self::Timeout { stage, .. } => write!(f, "Agent RPC call timed out at {}", stage_name(*stage)),
+            Self::Canceled { .. } => f.write_str("Query canceled"),
+        }
+    }
+}
+
+impl From<AgentCallError> for String {
+    fn from(error: AgentCallError) -> Self {
+        error.into_legacy_string()
+    }
+}
+
+impl From<String> for AgentCallError {
+    fn from(message: String) -> Self {
+        Self::Transport { message }
+    }
+}
+
+impl From<&str> for AgentCallError {
+    fn from(message: &str) -> Self {
+        Self::Transport { message: message.to_string() }
+    }
+}
+
+fn parse_agent_call_error(
+    error: &Value,
+    strict_structured_errors: bool,
+    expected_session_id: Option<&str>,
+) -> AgentCallError {
+    let rpc_code = error.get("code").and_then(Value::as_i64);
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error").to_string();
+    let data = error.get("data");
+
+    if !strict_structured_errors {
+        return AgentCallError::Legacy { rpc_code, message, hints: data.map(legacy_agent_hints).unwrap_or_default() };
+    }
+
+    let Some(data) = data.filter(|value| value.is_object()) else {
+        return AgentCallError::ContractViolation {
+            rpc_code,
+            message,
+            reason: ContractViolationReason::MissingContractVersion,
+        };
+    };
+    match parse_structured_error_context(data, expected_session_id) {
+        Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+        Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
+    }
+}
+
+fn parse_structured_error_context(
+    data: &Value,
+    expected_session_id: Option<&str>,
+) -> Result<AgentErrorContext, ContractViolationReason> {
+    let Some(contract_version_value) = data.get("contractVersion") else {
+        return Err(ContractViolationReason::MissingContractVersion);
+    };
+    let Some(contract_version) = contract_version_value.as_u64() else {
+        return Err(ContractViolationReason::InvalidDataShape);
+    };
+    if contract_version != 1 {
+        return Err(ContractViolationReason::UnsupportedContractVersion);
+    }
+    let context = serde_json::from_value::<AgentErrorContext>(data.clone())
+        .map_err(|_| ContractViolationReason::InvalidDataShape)?;
+    if context.contract_version != 1 {
+        return Err(ContractViolationReason::UnsupportedContractVersion);
+    }
+    if let Some(expected_session_id) = expected_session_id {
+        if context.agent_session_id.as_deref() != Some(expected_session_id) {
+            return Err(ContractViolationReason::InvalidSessionId);
+        }
+    }
+    if !valid_agent_error_combination(&context) {
+        return Err(ContractViolationReason::InvalidCombination);
+    }
+    Ok(context)
+}
+
+fn legacy_agent_hints(data: &Value) -> LegacyAgentHints {
+    LegacyAgentHints {
+        category: data.get("category").and_then(|value| serde_json::from_value(value.clone()).ok()),
+        retryable: data.get("retryable").and_then(Value::as_bool),
+        session_disposition: match data.get("sessionDisposition").and_then(Value::as_str) {
+            Some("keep") => Some(AgentSessionDisposition::Keep),
+            Some("quarantine") => Some(AgentSessionDisposition::Quarantine),
+            Some("replace_runtime") => Some(AgentSessionDisposition::ReplaceRuntime),
+            _ => None,
+        },
+        stage: data.get("stage").and_then(|value| serde_json::from_value(value.clone()).ok()),
+        operation_outcome: data.get("operationOutcome").and_then(|value| serde_json::from_value(value.clone()).ok()),
+        agent_session_id: data.get("agentSessionId").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
+pub(crate) fn valid_agent_error_combination(context: &AgentErrorContext) -> bool {
+    let expected_outcome = match context.stage {
+        AgentErrorStage::Request | AgentErrorStage::Checkout | AgentErrorStage::Connect | AgentErrorStage::Validate => {
+            AgentOperationOutcome::NotStarted
+        }
+        AgentErrorStage::Execute | AgentErrorStage::Fetch | AgentErrorStage::Cancel | AgentErrorStage::Close => {
+            AgentOperationOutcome::Unknown
+        }
+    };
+    if context.operation_outcome != expected_outcome {
+        return false;
+    }
+    let valid_disposition = match context.category {
+        AgentErrorCategory::Connection => context.session_disposition != AgentSessionDisposition::ReplaceRuntime,
+        AgentErrorCategory::Sql => {
+            matches!(
+                context.stage,
+                AgentErrorStage::Execute | AgentErrorStage::Fetch | AgentErrorStage::Cancel | AgentErrorStage::Close
+            ) && context.session_disposition != AgentSessionDisposition::ReplaceRuntime
+        }
+        AgentErrorCategory::Resource => {
+            context.session_disposition == AgentSessionDisposition::ReplaceRuntime
+                || context.operation_outcome == AgentOperationOutcome::NotStarted
+        }
+        AgentErrorCategory::Protocol => {
+            context.session_disposition != AgentSessionDisposition::ReplaceRuntime
+                || context.operation_outcome == AgentOperationOutcome::Unknown
+        }
+        AgentErrorCategory::Timeout | AgentErrorCategory::Canceled => {
+            context.session_disposition == AgentSessionDisposition::Quarantine
+        }
+    };
+    if !valid_disposition {
+        return false;
+    }
+    valid_ascii_diagnostic(context.sql_state.as_deref(), 16)
+        && valid_ascii_diagnostic(context.exception_class.as_deref(), 160)
+        && context.agent_session_id.as_deref().is_none_or(valid_ascii_identifier)
+}
+
+fn valid_ascii_diagnostic(value: Option<&str>, max_length: usize) -> bool {
+    value.is_none_or(|value| {
+        !value.is_empty() && value.len() <= max_length && value.bytes().all(|byte| byte.is_ascii_graphic())
+    })
+}
+
+fn valid_ascii_identifier(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+pub(crate) fn category_name(category: AgentErrorCategory) -> &'static str {
+    match category {
+        AgentErrorCategory::Connection => "connection",
+        AgentErrorCategory::Sql => "sql",
+        AgentErrorCategory::Resource => "resource",
+        AgentErrorCategory::Protocol => "protocol",
+        AgentErrorCategory::Timeout => "timeout",
+        AgentErrorCategory::Canceled => "canceled",
+    }
+}
+
+pub(crate) fn stage_name(stage: AgentErrorStage) -> &'static str {
+    match stage {
+        AgentErrorStage::Request => "request",
+        AgentErrorStage::Checkout => "checkout",
+        AgentErrorStage::Connect => "connect",
+        AgentErrorStage::Validate => "validate",
+        AgentErrorStage::Execute => "execute",
+        AgentErrorStage::Fetch => "fetch",
+        AgentErrorStage::Cancel => "cancel",
+        AgentErrorStage::Close => "close",
+    }
+}
+
+pub(crate) fn outcome_name(outcome: AgentOperationOutcome) -> &'static str {
+    match outcome {
+        AgentOperationOutcome::NotStarted => "not_started",
+        AgentOperationOutcome::Unknown => "unknown",
+    }
+}
+
+fn agent_error_stage(method: &str) -> AgentErrorStage {
+    match method {
+        "handshake" => AgentErrorStage::Request,
+        "connect" | "open_session" | "test_connection" => AgentErrorStage::Connect,
+        "validate_connection" | "validate_session" => AgentErrorStage::Validate,
+        "cancel_session" => AgentErrorStage::Cancel,
+        "close_session" | "disconnect" | "shutdown" | "close_query_session" | "close_table_read_session" => {
+            AgentErrorStage::Close
+        }
+        "fetch_query_page" | "fetch_table_read_page" => AgentErrorStage::Fetch,
+        _ => AgentErrorStage::Execute,
+    }
+}
+
+fn agent_operation_outcome(method: &str) -> AgentOperationOutcome {
+    match agent_error_stage(method) {
+        AgentErrorStage::Request | AgentErrorStage::Checkout | AgentErrorStage::Connect | AgentErrorStage::Validate => {
+            AgentOperationOutcome::NotStarted
+        }
+        _ => AgentOperationOutcome::Unknown,
+    }
+}
+
+fn format_agent_rpc_error(error: &Value) -> String {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("Unknown agent error");
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    format_agent_rpc_error_parts(code, message, error.get("data").filter(|data| data.is_object()))
+}
+
+fn format_agent_rpc_error_parts(code: i64, message: &str, data: Option<&Value>) -> String {
+    let mut formatted = format!("Agent RPC error ({code}): {message}");
+    if let Some(data) = data {
+        formatted.push_str(AGENT_RPC_ERROR_DATA_MARKER);
+        formatted.push_str(&data.to_string());
+    }
+    formatted
+}
+
+fn deserialize_cached_agent_result<T: DeserializeOwned>(result: Result<Value, String>) -> Result<T, String> {
+    result
+        .and_then(|value| serde_json::from_value(value).map_err(|e| format!("Failed to deserialize agent result: {e}")))
 }
 
 fn fail_pending_requests(pending: &Arc<Mutex<HashMap<u64, PendingAgentResponse>>>, error: String) {
@@ -271,6 +866,10 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 2;
 const RPC_TIMEOUT_SECS: u64 = 30;
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 const STDERR_TAIL_LINES: usize = 20;
+const MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES: usize = 8;
+const AGENT_STDOUT_NOISE_SAMPLE_LINES: usize = 3;
+const AGENT_STDOUT_NOISE_SAMPLE_CHARS: usize = 160;
+const MAX_AGENT_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 const AGENT_EXIT_DIAGNOSTIC_WAIT_MS: u64 = 1_000;
 const AGENT_EXIT_DIAGNOSTIC_POLL_MS: u64 = 10;
 const SHARED_RUNTIME_IDLE_GRACE_SECS: u64 = 30;
@@ -287,6 +886,81 @@ pub struct AgentDriverClient {
     next_id: u64,
     shared_runtime: Option<Arc<AgentRuntimeClient>>,
     agent_session_id: Option<String>,
+    cached_query: Option<CachedAgentQuery>,
+    /// Driver-reported identifier quoting, captured once after connect.
+    /// Keeping this on the client avoids a connection-info RPC on every query.
+    identifier_quote: Option<String>,
+}
+
+/// Keeps serialized session RPC access separate from the process-level fail-stop handle.
+/// A stuck RPC may hold `client` indefinitely, but it must never prevent terminating the
+/// shared Agent runtime after the pool has been removed from routing.
+pub struct PooledAgentClient {
+    client: tokio::sync::Mutex<AgentDriverClient>,
+    shared_runtime: Option<Arc<AgentRuntimeClient>>,
+    agent_session_id: Option<String>,
+    identifier_quote: Option<String>,
+}
+
+impl PooledAgentClient {
+    pub fn new(client: AgentDriverClient) -> Self {
+        let shared_runtime = client.shared_runtime.clone();
+        let agent_session_id = client.agent_session_id.clone();
+        let identifier_quote = client.identifier_quote.clone();
+        Self { client: tokio::sync::Mutex::new(client), shared_runtime, agent_session_id, identifier_quote }
+    }
+
+    pub fn identifier_quote(&self) -> Option<&str> {
+        self.identifier_quote.as_deref()
+    }
+
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, AgentDriverClient> {
+        self.client.lock().await
+    }
+
+    pub fn try_lock(&self) -> Result<tokio::sync::MutexGuard<'_, AgentDriverClient>, tokio::sync::TryLockError> {
+        self.client.try_lock()
+    }
+
+    pub fn shares_runtime_with(&self, other: &Self) -> bool {
+        match (&self.shared_runtime, &other.shared_runtime) {
+            (Some(runtime), Some(other_runtime)) => Arc::ptr_eq(runtime, other_runtime),
+            _ => false,
+        }
+    }
+
+    pub fn uses_runtime(&self, runtime: &Arc<AgentRuntimeClient>) -> bool {
+        self.shared_runtime.as_ref().is_some_and(|current| Arc::ptr_eq(current, runtime))
+    }
+
+    pub fn matches_session_id(&self, session_id: &str) -> bool {
+        self.agent_session_id.as_deref() == Some(session_id)
+    }
+
+    pub fn is_runtime_available(&self) -> bool {
+        self.shared_runtime.as_ref().is_none_or(|runtime| !runtime.is_failed())
+    }
+
+    /// True when this client is attached to a multi-session shared agent process.
+    pub fn uses_shared_runtime(&self) -> bool {
+        self.shared_runtime.is_some()
+    }
+
+    /// Terminates a protocol-v2 shared runtime without waiting for the logical session lock.
+    /// Legacy single-session clients can only be killed immediately when they are not busy.
+    pub fn fail_stop(&self) -> bool {
+        if let Some(runtime) = &self.shared_runtime {
+            runtime.kill();
+            return true;
+        }
+        match self.client.try_lock() {
+            Ok(mut client) => {
+                client.kill();
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,11 +1027,103 @@ pub enum AgentCapability {
     Transaction,
     Ddl,
     Kv,
+    KvTtl,
+    KvCas,
+    KvListValues,
+    KvStatus,
+    KvHistory,
+    EtcdCompaction,
+    EtcdDefrag,
+    EtcdWatch,
+    EtcdLease,
+    EtcdAuth,
+    MongoDropDatabase,
+    MongoCloneCollection,
+    MongoRunCommand,
+    MongoInsertDocuments,
     MultiSession,
+    StructuredErrorV1,
+}
+
+pub(crate) fn legacy_agent_call_error(error: String, agent_session_id: Option<&str>) -> AgentCallError {
+    if !is_agent_rpc_response_error(&error) {
+        return AgentCallError::Transport { message: error };
+    }
+    let (header, data, suffix) =
+        error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER).map_or((error.as_str(), None, ""), |(header, data)| {
+            match parse_legacy_agent_error_data(data) {
+                Some((data, suffix)) => (header, Some(data), suffix),
+                None => (header, None, ""),
+            }
+        });
+    let header_with_suffix = (!suffix.is_empty()).then(|| format!("{header}{suffix}"));
+    let header = header_with_suffix.as_deref().unwrap_or(header);
+    let (rpc_code, message) = parse_agent_rpc_error_header(header);
+    if let Some(data) = data.as_ref().filter(|data| data.get("contractVersion").is_some()) {
+        return match parse_structured_error_context(data, agent_session_id) {
+            Ok(context) => AgentCallError::Structured { rpc_code: rpc_code.unwrap_or(-1), message, context },
+            Err(reason) => AgentCallError::ContractViolation { rpc_code, message, reason },
+        };
+    }
+    let mut hints = data.as_ref().map(legacy_agent_hints).unwrap_or_default();
+    if hints.category.is_none() && is_legacy_connection_message(&message) {
+        hints.category = Some(AgentErrorCategory::Connection);
+        hints.session_disposition.get_or_insert(AgentSessionDisposition::Quarantine);
+    }
+    AgentCallError::Legacy { rpc_code, message, hints }.with_legacy_session_id(agent_session_id)
+}
+
+fn parse_legacy_agent_error_data(data: &str) -> Option<(Value, &str)> {
+    let mut values = serde_json::Deserializer::from_str(data).into_iter::<Value>();
+    let value = values.next()?.ok()?;
+    Some((value, &data[values.byte_offset()..]))
+}
+
+pub(crate) fn append_legacy_error_context(error: &str, context: &str) -> String {
+    if error.contains(context) {
+        return error.to_string();
+    }
+    if let Some((header, data)) = error.rsplit_once(AGENT_RPC_ERROR_DATA_MARKER) {
+        return format!("{header}\n{context}{AGENT_RPC_ERROR_DATA_MARKER}{data}");
+    }
+    format!("{error}\n{context}")
+}
+
+fn is_legacy_connection_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "connection lost",
+        "connection reset",
+        "broken pipe",
+        "communications link failure",
+        "sqlrecoverableexception",
+        "sqlnontransientconnectionexception",
+        "sqltransientconnectionexception",
+        "network communication",
+        "网络通信异常",
+        "通信异常",
+        "关闭的连接",
+        "连接已关闭",
+        "not connected",
+        "end of stream",
+        "end-of-file",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn parse_agent_rpc_error_header(header: &str) -> (Option<i64>, String) {
+    let Some(rest) = header.strip_prefix("Agent RPC error (") else {
+        return (None, header.to_string());
+    };
+    let Some((code, message)) = rest.split_once("): ") else {
+        return (None, header.to_string());
+    };
+    (code.parse().ok(), message.to_string())
 }
 
 impl AgentCapability {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 24] = [
         Self::Connect,
         Self::TestConnection,
         Self::Metadata,
@@ -366,7 +1132,22 @@ impl AgentCapability {
         Self::Transaction,
         Self::Ddl,
         Self::Kv,
+        Self::KvTtl,
+        Self::KvCas,
+        Self::KvListValues,
+        Self::KvStatus,
+        Self::KvHistory,
+        Self::EtcdCompaction,
+        Self::EtcdDefrag,
+        Self::EtcdWatch,
+        Self::EtcdLease,
+        Self::EtcdAuth,
+        Self::MongoDropDatabase,
+        Self::MongoCloneCollection,
+        Self::MongoRunCommand,
+        Self::MongoInsertDocuments,
         Self::MultiSession,
+        Self::StructuredErrorV1,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -379,7 +1160,22 @@ impl AgentCapability {
             Self::Transaction => "transaction",
             Self::Ddl => "ddl",
             Self::Kv => "kv",
+            Self::KvTtl => "kv_ttl",
+            Self::KvCas => "kv_cas",
+            Self::KvListValues => "kv_list_values",
+            Self::KvStatus => "kv_status",
+            Self::KvHistory => "kv_history",
+            Self::EtcdCompaction => "etcd_compaction",
+            Self::EtcdDefrag => "etcd_defrag",
+            Self::EtcdWatch => "etcd_watch",
+            Self::EtcdLease => "etcd_lease",
+            Self::EtcdAuth => "etcd_auth",
+            Self::MongoDropDatabase => "mongo_drop_database",
+            Self::MongoCloneCollection => "mongo_clone_collection",
+            Self::MongoRunCommand => "mongo_run_command",
+            Self::MongoInsertDocuments => "mongo_insert_documents",
             Self::MultiSession => "multi_session",
+            Self::StructuredErrorV1 => "structured_error_v1",
         }
     }
 }
@@ -403,9 +1199,13 @@ pub enum AgentMethod {
     CompletionAssistantSearchV1,
     GetObjectSource,
     GetColumns,
+    GetCustomTypeDetails,
     ListIndexes,
     ListForeignKeys,
     ListTriggers,
+    ListConstraints,
+    ListPartitions,
+    ListSubpartitions,
     GetTableDdl,
     ExecuteQuery,
     ExecuteQueryPage,
@@ -417,12 +1217,15 @@ pub enum AgentMethod {
     GetExplainInfo,
     ExecuteBatch,
     ExecuteTransaction,
+    BeginManualTransaction,
+    CommitManualTransaction,
+    RollbackManualTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 39] = [
         Self::Handshake,
         Self::Connect,
         Self::OpenSession,
@@ -444,6 +1247,9 @@ impl AgentMethod {
         Self::ListIndexes,
         Self::ListForeignKeys,
         Self::ListTriggers,
+        Self::ListConstraints,
+        Self::ListPartitions,
+        Self::ListSubpartitions,
         Self::ExecuteQuery,
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
@@ -454,6 +1260,9 @@ impl AgentMethod {
         Self::GetExplainInfo,
         Self::ExecuteBatch,
         Self::ExecuteTransaction,
+        Self::BeginManualTransaction,
+        Self::CommitManualTransaction,
+        Self::RollbackManualTransaction,
         Self::Disconnect,
         Self::Shutdown,
     ];
@@ -478,9 +1287,13 @@ impl AgentMethod {
             Self::GetObjectSource => "get_object_source",
             Self::GetTableDdl => "get_table_ddl",
             Self::GetColumns => "get_columns",
+            Self::GetCustomTypeDetails => "get_type_details",
             Self::ListIndexes => "list_indexes",
             Self::ListForeignKeys => "list_foreign_keys",
             Self::ListTriggers => "list_triggers",
+            Self::ListConstraints => "list_constraints",
+            Self::ListPartitions => "list_partitions",
+            Self::ListSubpartitions => "list_subpartitions",
             Self::ExecuteQuery => "execute_query",
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
@@ -491,6 +1304,9 @@ impl AgentMethod {
             Self::GetExplainInfo => "get_explain_info",
             Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
+            Self::BeginManualTransaction => "begin_manual_transaction",
+            Self::CommitManualTransaction => "commit_manual_transaction",
+            Self::RollbackManualTransaction => "rollback_manual_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
         }
@@ -502,6 +1318,8 @@ impl AgentMethod {
 pub struct AgentConnectionInfo {
     #[serde(default)]
     pub identifier_quote: String,
+    #[serde(default)]
+    pub compatibility_mode: Option<String>,
     #[serde(default)]
     pub database_info: Option<DatabaseConnectionInfo>,
 }
@@ -540,35 +1358,51 @@ pub enum MongoAgentMethod {
     ListDatabases,
     ListCollections,
     FindDocuments,
+    FindOne,
+    ExplainFind,
+    AggregateDocuments,
     FindDocumentsExtendedJson,
     CountDocuments,
     ServerVersion,
     CreateIndex,
+    CreateUser,
     DropIndexes,
     DropCollection,
+    CloneCollection,
+    DropDatabase,
     InsertDocument,
+    InsertDocuments,
     UpdateDocument,
     UpdateDocuments,
     DeleteDocument,
     DeleteDocuments,
+    RunCommand,
 }
 
 impl MongoAgentMethod {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 22] = [
         Self::ListDatabases,
         Self::ListCollections,
         Self::FindDocuments,
+        Self::FindOne,
+        Self::ExplainFind,
+        Self::AggregateDocuments,
         Self::FindDocumentsExtendedJson,
         Self::CountDocuments,
         Self::ServerVersion,
         Self::CreateIndex,
+        Self::CreateUser,
         Self::DropIndexes,
         Self::DropCollection,
+        Self::CloneCollection,
+        Self::DropDatabase,
         Self::InsertDocument,
+        Self::InsertDocuments,
         Self::UpdateDocument,
         Self::UpdateDocuments,
         Self::DeleteDocument,
         Self::DeleteDocuments,
+        Self::RunCommand,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -576,17 +1410,25 @@ impl MongoAgentMethod {
             Self::ListDatabases => "list_databases",
             Self::ListCollections => "list_collections",
             Self::FindDocuments => "find_documents",
+            Self::FindOne => "find_one",
+            Self::ExplainFind => "explain_find",
+            Self::AggregateDocuments => "aggregate_documents",
             Self::FindDocumentsExtendedJson => "find_documents_extended_json",
             Self::CountDocuments => "count_documents",
             Self::ServerVersion => "server_version",
             Self::CreateIndex => "create_index",
+            Self::CreateUser => "create_user",
             Self::DropIndexes => "drop_indexes",
             Self::DropCollection => "drop_collection",
+            Self::CloneCollection => "clone_collection",
+            Self::DropDatabase => "drop_database",
             Self::InsertDocument => "insert_document",
+            Self::InsertDocuments => "insert_documents",
             Self::UpdateDocument => "update_document",
             Self::UpdateDocuments => "update_documents",
             Self::DeleteDocument => "delete_document",
             Self::DeleteDocuments => "delete_documents",
+            Self::RunCommand => "run_command",
         }
     }
 }
@@ -597,10 +1439,67 @@ pub enum AgentKvMethod {
     Get,
     Put,
     Delete,
+    Rename,
+    History,
+    Status,
+    Compact,
+    Defrag,
+    WatchStart,
+    WatchPoll,
+    WatchStop,
+    LeaseList,
+    LeaseGet,
+    LeaseGrant,
+    LeaseKeepalive,
+    LeaseRevoke,
+    AuthUserList,
+    AuthUserGet,
+    AuthUserAdd,
+    AuthUserDelete,
+    AuthUserChangePassword,
+    AuthUserGrantRole,
+    AuthUserRevokeRole,
+    AuthRoleList,
+    AuthRoleGet,
+    AuthRoleAdd,
+    AuthRoleDelete,
+    AuthRoleGrantPermission,
+    AuthRoleRevokePermission,
 }
 
 impl AgentKvMethod {
-    pub const ALL: [Self; 4] = [Self::ListPrefix, Self::Get, Self::Put, Self::Delete];
+    pub const ALL: [Self; 30] = [
+        Self::ListPrefix,
+        Self::Get,
+        Self::Put,
+        Self::Delete,
+        Self::Rename,
+        Self::History,
+        Self::Status,
+        Self::Compact,
+        Self::Defrag,
+        Self::WatchStart,
+        Self::WatchPoll,
+        Self::WatchStop,
+        Self::LeaseList,
+        Self::LeaseGet,
+        Self::LeaseGrant,
+        Self::LeaseKeepalive,
+        Self::LeaseRevoke,
+        Self::AuthUserList,
+        Self::AuthUserGet,
+        Self::AuthUserAdd,
+        Self::AuthUserDelete,
+        Self::AuthUserChangePassword,
+        Self::AuthUserGrantRole,
+        Self::AuthUserRevokeRole,
+        Self::AuthRoleList,
+        Self::AuthRoleGet,
+        Self::AuthRoleAdd,
+        Self::AuthRoleDelete,
+        Self::AuthRoleGrantPermission,
+        Self::AuthRoleRevokePermission,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -608,6 +1507,32 @@ impl AgentKvMethod {
             Self::Get => "kv_get",
             Self::Put => "kv_put",
             Self::Delete => "kv_delete",
+            Self::Rename => "kv_rename",
+            Self::History => "kv_history",
+            Self::Status => "kv_status",
+            Self::Compact => "etcd_compact",
+            Self::Defrag => "etcd_defrag",
+            Self::WatchStart => "etcd_watch_start",
+            Self::WatchPoll => "etcd_watch_poll",
+            Self::WatchStop => "etcd_watch_stop",
+            Self::LeaseList => "etcd_lease_list",
+            Self::LeaseGet => "etcd_lease_get",
+            Self::LeaseGrant => "etcd_lease_grant",
+            Self::LeaseKeepalive => "etcd_lease_keepalive_once",
+            Self::LeaseRevoke => "etcd_lease_revoke",
+            Self::AuthUserList => "etcd_auth_user_list",
+            Self::AuthUserGet => "etcd_auth_user_get",
+            Self::AuthUserAdd => "etcd_auth_user_add",
+            Self::AuthUserDelete => "etcd_auth_user_delete",
+            Self::AuthUserChangePassword => "etcd_auth_user_change_password",
+            Self::AuthUserGrantRole => "etcd_auth_user_grant_role",
+            Self::AuthUserRevokeRole => "etcd_auth_user_revoke_role",
+            Self::AuthRoleList => "etcd_auth_role_list",
+            Self::AuthRoleGet => "etcd_auth_role_get",
+            Self::AuthRoleAdd => "etcd_auth_role_add",
+            Self::AuthRoleDelete => "etcd_auth_role_delete",
+            Self::AuthRoleGrantPermission => "etcd_auth_role_grant_permission",
+            Self::AuthRoleRevokePermission => "etcd_auth_role_revoke_permission",
         }
     }
 }
@@ -650,15 +1575,7 @@ impl AgentDriverClient {
     /// they speak the DBX stdin/stdout JSON-RPC protocol.
     /// Blocks (async) until the agent writes `{"ready":true}` to stdout.
     pub async fn spawn(launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut command = crate::process::new_std_command(&launch.program);
-        command.args(&launch.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some(working_dir) = &launch.working_dir {
-            command.current_dir(working_dir);
-        }
-        remove_agent_proxy_env(&mut command);
-
-        let mut child =
-            command.spawn().map_err(|e| format!("Failed to spawn agent process {}: {e}", launch_display(&launch)))?;
+        let mut child = spawn_agent_process(&launch)?;
 
         let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
         let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
@@ -723,6 +1640,8 @@ impl AgentDriverClient {
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
+            cached_query: None,
+            identifier_quote: None,
         })
     }
 
@@ -736,6 +1655,8 @@ impl AgentDriverClient {
             next_id: 0,
             shared_runtime: Some(runtime),
             agent_session_id: Some(agent_session_id),
+            cached_query: None,
+            identifier_quote: None,
         }
     }
 
@@ -745,7 +1666,18 @@ impl AgentDriverClient {
         method: &str,
         params: Value,
     ) -> Result<T, String> {
-        self.call_with_timeout(method, params, Some(Duration::from_secs(RPC_TIMEOUT_SECS))).await
+        let agent_session_id = self.agent_session_id.clone();
+        self.call_typed(method, params)
+            .await
+            .map_err(|error| error.into_legacy_string_with_session_id(agent_session_id.as_deref()))
+    }
+
+    pub async fn call_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout(method, params, Some(Duration::from_secs(RPC_TIMEOUT_SECS))).await
     }
 
     /// Send a JSON-RPC 2.0 request and wait for the response.
@@ -756,7 +1688,19 @@ impl AgentDriverClient {
         params: Value,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_with_timeout_and_cancel(method, params, timeout_duration, None).await
+        let agent_session_id = self.agent_session_id.clone();
+        self.call_typed_with_timeout(method, params, timeout_duration)
+            .await
+            .map_err(|error| error.into_legacy_string_with_session_id(agent_session_id.as_deref()))
+    }
+
+    pub async fn call_typed_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout_and_cancel(method, params, timeout_duration, None).await
     }
 
     /// Send a JSON-RPC 2.0 request and wait for the response.
@@ -769,19 +1713,36 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
+        let agent_session_id = self.agent_session_id.clone();
+        self.call_typed_with_timeout_and_cancel(method, params, timeout_duration, cancel_token)
+            .await
+            .map_err(|error| error.into_legacy_string_with_session_id(agent_session_id.as_deref()))
+    }
+
+    pub async fn call_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
         if let Some(runtime) = &self.shared_runtime {
+            let agent_session_id = self.agent_session_id.clone();
             let mut params = params;
             if method != AgentMethod::Handshake.as_str()
                 && method != AgentMethod::TestConnection.as_str()
                 && method != AgentMethod::Shutdown.as_str()
             {
-                let session_id = self.agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?;
+                let session_id = agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?;
                 params
                     .as_object_mut()
                     .ok_or_else(|| "Agent RPC parameters must be an object".to_string())?
                     .insert("agentSessionId".to_string(), Value::String(session_id.clone()));
             }
-            return runtime.call(method, params, timeout_duration, cancel_token).await;
+            return runtime
+                .call_typed(method, params, timeout_duration, cancel_token)
+                .await
+                .map_err(|error| error.with_legacy_session_id(agent_session_id.as_deref()));
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -807,29 +1768,20 @@ impl AgentDriverClient {
                 .and_then(|_| writer.flush().map_err(|e| format!("Failed to flush agent stdin: {e}")))
         };
         if let Err(e) = write_result {
-            return Err(self.format_agent_process_error(&e));
+            return Err(AgentCallError::Transport { message: self.format_agent_process_error(&e) });
         }
 
         // Read response from stdout (blocking, with timeout)
         let mut reader = self.stdout.take().ok_or("Agent stdout not available")?;
 
         let response_task = tokio::task::spawn_blocking(move || {
-            let line = match read_agent_line(&mut reader, "response") {
-                Ok(line) => line,
+            let (line, resp) = match read_agent_json_response(&mut reader) {
+                Ok(response) => response,
                 Err(e) => return (reader, Err(e)),
             };
 
-            let resp: Value = match serde_json::from_str(line.trim()) {
-                Ok(v) => v,
-                Err(e) => {
-                    return (reader, Err(format!("Invalid JSON response from agent: {e}")));
-                }
-            };
-
             let result = if let Some(err) = resp.get("error") {
-                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown agent error");
-                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
-                Err(format!("Agent RPC error ({code}): {msg}"))
+                Err(format_agent_rpc_error(err))
             } else if let Some(result_val) = resp.get("result") {
                 serde_json::from_value::<T>(result_val.clone())
                     .map_err(|e| format!("Failed to deserialize agent result: {e}"))
@@ -845,13 +1797,19 @@ impl AgentDriverClient {
                     biased;
                     _ = token.cancelled() => {
                         self.kill();
-                        return Err("Query canceled".to_string());
+                        return Err(AgentCallError::Canceled {
+                            stage: agent_error_stage(method),
+                            operation_outcome: agent_operation_outcome(method),
+                        });
                     }
                     result = tokio::time::timeout(duration, response_task) => match result {
                         Ok(result) => result,
                         Err(_) => {
                             self.kill();
-                            return Err(format!("Agent RPC call timed out ({}s)", duration.as_secs()));
+                            return Err(AgentCallError::Timeout {
+                                stage: agent_error_stage(method),
+                                operation_outcome: agent_operation_outcome(method),
+                            });
                         }
                     },
                 }
@@ -860,7 +1818,10 @@ impl AgentDriverClient {
                 Ok(result) => result,
                 Err(_) => {
                     self.kill();
-                    return Err(format!("Agent RPC call timed out ({}s)", duration.as_secs()));
+                    return Err(AgentCallError::Timeout {
+                        stage: agent_error_stage(method),
+                        operation_outcome: agent_operation_outcome(method),
+                    });
                 }
             },
             (None, Some(token)) => {
@@ -868,17 +1829,30 @@ impl AgentDriverClient {
                     biased;
                     _ = token.cancelled() => {
                         self.kill();
-                        return Err("Query canceled".to_string());
+                        return Err(AgentCallError::Canceled {
+                            stage: agent_error_stage(method),
+                            operation_outcome: agent_operation_outcome(method),
+                        });
                     }
                     result = response_task => result,
                 }
             }
             (None, None) => response_task.await,
         }
-        .map_err(|e| format!("Agent RPC task failed: {e}"))?;
+        .map_err(|e| AgentCallError::Transport { message: format!("Agent RPC task failed: {e}") })?;
 
         let _ = self.stdout.insert(returned_reader);
-        result.map_err(|e| self.format_agent_process_error(&e))
+        result
+            .map_err(
+                |error| {
+                    if is_agent_rpc_response_error(&error) {
+                        error
+                    } else {
+                        self.format_agent_process_error(&error)
+                    }
+                },
+            )
+            .map_err(|error| legacy_agent_call_error(error, self.agent_session_id.as_deref()))
     }
 
     pub async fn call_method<T: DeserializeOwned + Send + 'static>(
@@ -887,6 +1861,14 @@ impl AgentDriverClient {
         params: Value,
     ) -> Result<T, String> {
         self.call(method.as_str(), params).await
+    }
+
+    pub async fn call_method_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed(method.as_str(), params).await
     }
 
     pub async fn call_method_with_timeout<T: DeserializeOwned + Send + 'static>(
@@ -898,6 +1880,15 @@ impl AgentDriverClient {
         self.call_with_timeout(method.as_str(), params, timeout_duration).await
     }
 
+    pub async fn call_method_typed_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout(method.as_str(), params, timeout_duration).await
+    }
+
     pub async fn call_method_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
         &mut self,
         method: AgentMethod,
@@ -906,6 +1897,16 @@ impl AgentDriverClient {
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
         self.call_with_timeout_and_cancel(method.as_str(), params, timeout_duration, cancel_token).await
+    }
+
+    pub async fn call_method_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.call_typed_with_timeout_and_cancel(method.as_str(), params, timeout_duration, cancel_token).await
     }
 
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
@@ -945,11 +1946,24 @@ impl AgentDriverClient {
         self.call_method_with_timeout(AgentMethod::ValidateConnection, serde_json::json!({}), timeout_duration).await
     }
 
+    pub async fn validate_connection_typed(
+        &mut self,
+        timeout_duration: Option<Duration>,
+    ) -> Result<Value, AgentCallError> {
+        self.call_method_typed_with_timeout(AgentMethod::ValidateConnection, serde_json::json!({}), timeout_duration)
+            .await
+    }
+
     pub async fn connection_info(&mut self, timeout_duration: Option<Duration>) -> Result<AgentConnectionInfo, String> {
         self.call_method_with_timeout(AgentMethod::ConnectionInfo, serde_json::json!({}), timeout_duration).await
     }
 
+    pub(crate) fn set_identifier_quote(&mut self, identifier_quote: Option<String>) {
+        self.identifier_quote = identifier_quote.filter(|quote| !quote.trim().is_empty());
+    }
+
     pub async fn disconnect(&mut self) -> Result<Value, String> {
+        self.invalidate_cached_query();
         if self.shared_runtime.is_some() {
             let session_id = self.agent_session_id.as_ref().ok_or("Shared Agent session id is missing")?.clone();
             let result =
@@ -977,18 +1991,22 @@ impl AgentDriverClient {
         database: &str,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.list_schemas_filtered(database, None, timeout_duration).await
+        self.list_schemas_filtered(database, None, false, timeout_duration).await
     }
 
     pub async fn list_schemas_filtered<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: &str,
         visible_schemas: Option<&[String]>,
+        show_system_schemas: bool,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
         let mut params = serde_json::json!({ "database": database });
         if let Some(visible_schemas) = visible_schemas {
             params["visible_schemas"] = serde_json::json!(visible_schemas);
+        }
+        if show_system_schemas {
+            params["show_system_schemas"] = serde_json::Value::Bool(true);
         }
         self.call_method_with_timeout(AgentMethod::ListSchemas, params, timeout_duration).await
     }
@@ -1107,9 +2125,21 @@ impl AgentDriverClient {
         object_type: &K,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.get_object_source_for_relation(database, schema, name, object_type, None, timeout_duration).await
+    }
+
+    pub async fn get_object_source_for_relation<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         self.call_method_with_timeout(
             AgentMethod::GetObjectSource,
-            agent_object_source_params(database, schema, name, object_type),
+            agent_object_source_params_with_relation(database, schema, name, object_type, relation_name),
             timeout_duration,
         )
         .await
@@ -1125,6 +2155,21 @@ impl AgentDriverClient {
         self.call_method_with_timeout(
             AgentMethod::GetColumns,
             agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn get_custom_type_details<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::GetCustomTypeDetails,
+            agent_type_details_params(database, schema, name),
             timeout_duration,
         )
         .await
@@ -1192,7 +2237,7 @@ impl AgentDriverClient {
         .await
     }
 
-    pub async fn get_table_ddl<T: DeserializeOwned + Send + 'static>(
+    pub async fn list_constraints<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: &str,
         schema: &str,
@@ -1200,14 +2245,68 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
         self.call_method_with_timeout(
-            AgentMethod::GetTableDdl,
+            AgentMethod::ListConstraints,
             agent_schema_table_params(database, schema, table),
             timeout_duration,
         )
         .await
     }
 
+    pub async fn list_partitions<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ListPartitions,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn list_subpartitions<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ListSubpartitions,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn get_table_ddl<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.get_table_ddl_with_options(database, schema, table, false, timeout_duration).await
+    }
+
+    pub async fn get_table_ddl_with_options<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        portable: bool,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_table_params(database, schema, table);
+        params["portable"] = serde_json::json!(portable);
+        self.call_method_with_timeout(AgentMethod::GetTableDdl, params, timeout_duration).await
+    }
+
     pub async fn execute_query<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method(AgentMethod::ExecuteQuery, params).await
     }
 
@@ -1216,7 +2315,17 @@ impl AgentDriverClient {
         params: Value,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
+    }
+
+    pub async fn execute_query_typed_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
     }
 
     pub async fn execute_query_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
@@ -1225,14 +2334,53 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method_with_timeout_and_cancel(AgentMethod::ExecuteQuery, params, timeout_duration, cancel_token)
             .await
+    }
+
+    pub async fn execute_query_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::ExecuteQuery,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
+    }
+
+    pub async fn execute_query_cached_with_timeout<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        cache_key: String,
+        cache_ttl: Duration,
+        params: Value,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let now = Instant::now();
+        if let Some(cached) = self.cached_query.as_ref() {
+            if cached.key == cache_key && cached.expires_at > now {
+                return deserialize_cached_agent_result(cached.result.clone());
+            }
+        }
+
+        self.cached_query = None;
+        let result = self.call_method_with_timeout::<Value>(AgentMethod::ExecuteQuery, params, timeout_duration).await;
+        self.cached_query =
+            Some(CachedAgentQuery { key: cache_key, expires_at: Instant::now() + cache_ttl, result: result.clone() });
+        deserialize_cached_agent_result(result)
     }
 
     pub async fn execute_query_page<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method(AgentMethod::ExecuteQueryPage, params).await
     }
 
@@ -1241,6 +2389,7 @@ impl AgentDriverClient {
         params: Value,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method_with_timeout(AgentMethod::ExecuteQueryPage, params, timeout_duration).await
     }
 
@@ -1250,8 +2399,25 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method_with_timeout_and_cancel(AgentMethod::ExecuteQueryPage, params, timeout_duration, cancel_token)
             .await
+    }
+
+    pub async fn execute_query_page_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::ExecuteQueryPage,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
     }
 
     pub async fn fetch_query_page<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
@@ -1276,6 +2442,21 @@ impl AgentDriverClient {
             .await
     }
 
+    pub async fn fetch_query_page_typed_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, AgentCallError> {
+        self.call_method_typed_with_timeout_and_cancel(
+            AgentMethod::FetchQueryPage,
+            params,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
+    }
+
     pub async fn get_explain_info<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
         self.call_method(AgentMethod::GetExplainInfo, params).await
     }
@@ -1291,6 +2472,7 @@ impl AgentDriverClient {
         &mut self,
         params: AgentTableReadStartParams,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method(AgentMethod::StartTableRead, serde_json::to_value(params).map_err(|e| e.to_string())?).await
     }
 
@@ -1325,7 +2507,37 @@ impl AgentDriverClient {
         statements: &[String],
         schema: Option<&str>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
+    }
+
+    pub async fn execute_transaction_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema))
+            .await
+    }
+
+    pub async fn begin_manual_transaction<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        schema: Option<&str>,
+    ) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::BeginManualTransaction, agent_manual_transaction_params(schema)).await
+    }
+
+    pub async fn commit_manual_transaction<T: DeserializeOwned + Send + 'static>(&mut self) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::CommitManualTransaction, serde_json::json!({})).await
+    }
+
+    pub async fn rollback_manual_transaction<T: DeserializeOwned + Send + 'static>(&mut self) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method(AgentMethod::RollbackManualTransaction, serde_json::json!({})).await
     }
 
     pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
@@ -1335,12 +2547,33 @@ impl AgentDriverClient {
         schema: Option<&str>,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.invalidate_cached_query();
         self.call_method_with_timeout(
             AgentMethod::ExecuteBatch,
             agent_transaction_params(database, statements, schema),
             timeout_duration,
         )
         .await
+    }
+
+    pub async fn execute_batch_typed<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, AgentCallError> {
+        self.invalidate_cached_query();
+        self.call_method_typed_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
+    }
+
+    fn invalidate_cached_query(&mut self) {
+        self.cached_query = None;
     }
 
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
@@ -1370,11 +2603,42 @@ impl AgentDriverClient {
         self.call_mongo_method(MongoAgentMethod::ListCollections, mongo_database_params(database)).await
     }
 
+    /// Request collection metadata while accepting old Agents that still
+    /// return the historical string array and ignore `include_types`.
+    pub async fn mongo_list_collection_specs<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+    ) -> Result<T, String> {
+        self.call_mongo_method(
+            MongoAgentMethod::ListCollections,
+            serde_json::json!({ "database": database, "include_types": true }),
+        )
+        .await
+    }
+
     pub async fn mongo_find_documents<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
     ) -> Result<T, String> {
         self.call_mongo_method(MongoAgentMethod::FindDocuments, params).await
+    }
+
+    pub async fn mongo_find_one<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::FindOne, params).await
+    }
+
+    pub async fn mongo_explain_find<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::ExplainFind, params).await
+    }
+
+    pub async fn mongo_aggregate_documents<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::AggregateDocuments, params).await
     }
 
     /// Calls the Mongo agent read method that returns MongoDB relaxed Extended JSON.
@@ -1399,11 +2663,25 @@ impl AgentDriverClient {
         self.call_mongo_method(MongoAgentMethod::ServerVersion, mongo_database_params(database)).await
     }
 
+    pub async fn mongo_run_command<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::RunCommand, params).await
+    }
+
     pub async fn mongo_create_index<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
     ) -> Result<T, String> {
         self.call_mongo_method(MongoAgentMethod::CreateIndex, params).await
+    }
+
+    pub async fn mongo_create_user<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::CreateUser, params).await
     }
 
     pub async fn mongo_drop_indexes<T: DeserializeOwned + Send + 'static>(
@@ -1420,11 +2698,32 @@ impl AgentDriverClient {
         self.call_mongo_method(MongoAgentMethod::DropCollection, params).await
     }
 
+    pub async fn mongo_clone_collection<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::CloneCollection, params).await
+    }
+
+    pub async fn mongo_drop_database<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::DropDatabase, params).await
+    }
+
     pub async fn mongo_insert_document<T: DeserializeOwned + Send + 'static>(
         &mut self,
         params: Value,
     ) -> Result<T, String> {
         self.call_mongo_method(MongoAgentMethod::InsertDocument, params).await
+    }
+
+    pub async fn mongo_insert_documents<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+    ) -> Result<T, String> {
+        self.call_mongo_method(MongoAgentMethod::InsertDocuments, params).await
     }
 
     pub async fn mongo_update_document<T: DeserializeOwned + Send + 'static>(
@@ -1579,7 +2878,24 @@ pub fn is_unsupported_handshake_error(error: &str) -> bool {
 }
 
 pub fn agent_supports_capability(handshake: Option<&AgentHandshake>, capability: AgentCapability) -> bool {
-    if capability == AgentCapability::Kv {
+    if matches!(
+        capability,
+        AgentCapability::Kv
+            | AgentCapability::KvTtl
+            | AgentCapability::KvCas
+            | AgentCapability::KvListValues
+            | AgentCapability::KvStatus
+            | AgentCapability::KvHistory
+            | AgentCapability::EtcdCompaction
+            | AgentCapability::EtcdDefrag
+            | AgentCapability::EtcdWatch
+            | AgentCapability::EtcdLease
+            | AgentCapability::EtcdAuth
+            | AgentCapability::MongoDropDatabase
+            | AgentCapability::MongoCloneCollection
+            | AgentCapability::MongoRunCommand
+            | AgentCapability::MongoInsertDocuments
+    ) {
         return handshake.map(|value| value.supports(capability)).unwrap_or(false);
     }
     handshake.map(|value| value.supports(capability)).unwrap_or(true)
@@ -1594,7 +2910,26 @@ pub fn agent_schema_table_params(database: &str, schema: &str, table: &str) -> V
 }
 
 pub fn agent_object_source_params<K: Serialize>(database: &str, schema: &str, name: &str, object_type: &K) -> Value {
-    serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type })
+    agent_object_source_params_with_relation(database, schema, name, object_type, None)
+}
+
+pub fn agent_object_source_params_with_relation<K: Serialize>(
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &K,
+    relation_name: Option<&str>,
+) -> Value {
+    let mut params =
+        serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type });
+    if let Some(relation_name) = relation_name.map(str::trim).filter(|value| !value.is_empty()) {
+        params["relation_name"] = Value::String(relation_name.to_string());
+    }
+    params
+}
+
+pub fn agent_type_details_params(database: &str, schema: &str, name: &str) -> Value {
+    serde_json::json!({ "database": database, "schema": schema, "name": name })
 }
 
 pub fn agent_close_query_session_params(session_id: &str) -> Value {
@@ -1608,6 +2943,14 @@ pub fn agent_transaction_params(database: Option<&str>, statements: &[String], s
         "statements": statements,
         "schema": schema,
     })
+}
+
+pub fn agent_manual_transaction_params(schema: Option<&str>) -> Value {
+    let schema = schema.map(str::trim).filter(|schema| !schema.is_empty());
+    match schema {
+        Some(schema) => serde_json::json!({ "schema": schema }),
+        None => serde_json::json!({}),
+    }
 }
 
 pub fn mongo_database_params(database: &str) -> Value {
@@ -1636,6 +2979,27 @@ fn agent_java_args_with_extra_args(jar_path: &str, extra_java_args: &[String]) -
     agent_java_args_with_extra_opts(jar_path, std::env::var(AGENT_JAVA_OPTS_ENV).ok().as_deref(), extra_java_args)
 }
 
+pub(crate) fn validate_dameng_java_system_properties(options: &[String]) -> Result<(), String> {
+    for (index, option) in options.iter().enumerate() {
+        let option = option.trim();
+        let Some(property) = option.strip_prefix("-D") else {
+            return Err(java_system_property_error(index));
+        };
+        let key = property.split_once('=').map_or(property, |(key, _)| key);
+        if key.is_empty() || key.chars().any(char::is_whitespace) || option.contains('"') || option.contains('\'') {
+            return Err(java_system_property_error(index));
+        }
+    }
+    Ok(())
+}
+
+fn java_system_property_error(index: usize) -> String {
+    format!(
+        "Dameng JVM option #{} must be a Java system property (-Dkey or -Dkey=value) without shell quotes",
+        index + 1
+    )
+}
+
 fn agent_java_args_with_extra_opts(
     jar_path: &str,
     extra_opts: Option<&str>,
@@ -1656,8 +3020,32 @@ fn agent_java_args_with_extra_opts(
     .map(str::to_string)
     .collect::<Vec<_>>();
 
-    if agent_jar_path_matches_key(jar_path, "kingbase") || agent_jar_path_matches_key(jar_path, "informix") {
+    if agent_jar_path_matches_key(jar_path, "informix") {
         args.push("-Djava.net.preferIPv4Stack=true".to_string());
+    }
+
+    // Ignite's GridUnsafe/BinaryContext reflect into JDK internals; without these
+    // opens every connect fails with ExceptionInInitializerError on JDK 9+.
+    if agent_jar_path_matches_key(jar_path, "ignite") {
+        args.extend(
+            [
+                "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+                "--add-opens=java.base/java.nio=ALL-UNNAMED",
+                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+                "--add-opens=java.base/java.util=ALL-UNNAMED",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+
+    // DM's driver reflects into NetworkInterface.index when the host contains '%'
+    // (multi-NIC addresses or IPv6 zone suffixes); without this open such connects
+    // fail with InaccessibleObjectException on the managed JRE 21.
+    if agent_jar_path_matches_key(jar_path, "dameng") {
+        args.push("--add-opens=java.base/java.net=ALL-UNNAMED".to_string());
     }
 
     // Hive/Kerberos JDBC drivers read JAAS and krb5 settings during JVM startup,
@@ -1721,6 +3109,68 @@ fn launch_display(launch: &AgentLaunchSpec) -> String {
     parts.join(" ")
 }
 
+fn spawn_agent_process(launch: &AgentLaunchSpec) -> Result<Child, String> {
+    match agent_command(launch).spawn() {
+        Ok(child) => Ok(child),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let repaired = repair_native_agent_execute_permission(&launch.program).map_err(|repair_error| {
+                format!(
+                    "Failed to spawn agent process {}: {error}; failed to restore executable permission: {repair_error}",
+                    launch_display(launch)
+                )
+            })?;
+            if !repaired {
+                return Err(format!("Failed to spawn agent process {}: {error}", launch_display(launch)));
+            }
+            agent_command(launch).spawn().map_err(|retry_error| {
+                format!("Failed to spawn agent process {}: {retry_error}", launch_display(launch))
+            })
+        }
+        Err(error) => Err(format!("Failed to spawn agent process {}: {error}", launch_display(launch))),
+    }
+}
+
+fn agent_command(launch: &AgentLaunchSpec) -> Command {
+    let mut command = crate::process::new_std_command(&launch.program);
+    command.args(&launch.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(working_dir) = &launch.working_dir {
+        command.current_dir(working_dir);
+    }
+    remove_agent_proxy_env(&mut command);
+    command
+}
+
+fn repair_native_agent_execute_permission(program: &Path) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !program.is_absolute() || program.file_name().and_then(|name| name.to_str()) != Some("agent") {
+            return Ok(false);
+        }
+        let metadata = program
+            .metadata()
+            .map_err(|error| format!("Failed to inspect native agent {}: {error}", program.display()))?;
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        let mut permissions = metadata.permissions();
+        let mode = permissions.mode();
+        if mode & 0o100 != 0 {
+            return Ok(false);
+        }
+        permissions.set_mode(mode | 0o100);
+        std::fs::set_permissions(program, permissions)
+            .map_err(|error| format!("Failed to make native agent executable {}: {error}", program.display()))?;
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = program;
+        Ok(false)
+    }
+}
+
 fn remove_agent_proxy_env(command: &mut Command) {
     for key in agent_proxy_env_vars() {
         command.env_remove(key);
@@ -1732,7 +3182,14 @@ fn agent_proxy_env_vars() -> &'static [&'static str] {
 }
 
 fn read_agent_line<R: BufRead>(reader: &mut R, context: &str) -> Result<String, String> {
-    const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
+    read_agent_line_with_limit(reader, context, MAX_AGENT_RESPONSE_BYTES)
+}
+
+fn read_agent_line_with_limit<R: BufRead>(
+    reader: &mut R,
+    context: &str,
+    maximum_bytes: usize,
+) -> Result<String, String> {
     let mut bytes = Vec::new();
     loop {
         let available = reader.fill_buf().map_err(|e| format!("Failed to read {context} from agent: {e}"))?;
@@ -1747,14 +3204,58 @@ fn read_agent_line<R: BufRead>(reader: &mut R, context: &str) -> Result<String, 
         bytes.extend_from_slice(available);
         let len = available.len();
         reader.consume(len);
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(format!("Agent {context} exceeded maximum size ({} bytes)", MAX_RESPONSE_BYTES));
+        if bytes.len() > maximum_bytes {
+            return Err(format!("Agent {context} exceeded maximum size ({maximum_bytes} bytes)"));
         }
     }
     if bytes.is_empty() {
         return Err(format!("Failed to read {context} from agent: end of stream"));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_agent_json_response<R: BufRead>(reader: &mut R) -> Result<(String, Value), String> {
+    let mut noise_lines = 0;
+    let mut noise_samples = Vec::with_capacity(AGENT_STDOUT_NOISE_SAMPLE_LINES);
+    loop {
+        let line = read_agent_line(reader, "response").map_err(|error| {
+            if noise_samples.is_empty() {
+                error
+            } else {
+                format!("{error}; sampled agent stdout noise: {}", noise_samples.join(" | "))
+            }
+        })?;
+        match serde_json::from_str::<Value>(line.trim()) {
+            Ok(response) => return Ok((line, response)),
+            Err(parse_error) => {
+                noise_lines += 1;
+                let sample = sample_agent_stdout_noise(&line);
+                log::warn!("[agent:stdout] ignoring non-JSON response line: {sample}");
+                if noise_samples.len() < AGENT_STDOUT_NOISE_SAMPLE_LINES {
+                    noise_samples.push(sample);
+                }
+                if noise_lines > MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES {
+                    return Err(format!(
+                        "Agent response exceeded maximum consecutive stdout noise lines ({MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES}); last JSON error: {parse_error}; sampled agent stdout noise: {}",
+                        noise_samples.join(" | ")
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn sample_agent_stdout_noise(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return "<blank>".to_string();
+    }
+    let mut chars = trimmed.chars();
+    let mut sample = chars.by_ref().take(AGENT_STDOUT_NOISE_SAMPLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        sample.push('…');
+    }
+    format!("{sample:?}")
 }
 
 fn start_stderr_collector(stderr: ChildStderr, stderr_tail: Arc<Mutex<StderrTail>>) {
@@ -1828,6 +3329,10 @@ fn format_agent_process_error(base: &str, exit_status: Option<String>, stderr_ta
     parts.join(". ")
 }
 
+fn is_agent_rpc_response_error(message: &str) -> bool {
+    message.trim_start().starts_with("Agent RPC error (")
+}
+
 fn agent_process_error_hint(stderr: &str) -> Option<&'static str> {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("unsupportedclassversionerror")
@@ -1854,6 +3359,8 @@ impl AgentDriverClient {
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
+            cached_query: None,
+            identifier_quote: None,
         }
     }
 
@@ -1882,21 +3389,408 @@ impl Drop for AgentDriverClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_close_query_session_params, agent_handshake_params, agent_java_args, agent_java_args_with_extra,
-        agent_java_args_with_extra_opts, agent_object_source_params, agent_proxy_env_vars, agent_schema_params,
-        agent_schema_table_params, agent_supports_capability, agent_transaction_params, format_agent_process_error,
-        format_agent_startup_error, is_unsupported_handshake_error, mongo_collection_params, mongo_database_params,
-        mongo_document_id_params, parse_agent_java_opts, read_agent_line, start_stderr_collector, AgentCapability,
-        AgentDriverClient, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentRuntimeClient,
-        AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail,
-        AGENT_PROTOCOL_VERSION,
+        agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
+        agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params,
+        agent_object_source_params_with_relation, agent_proxy_env_vars, agent_schema_params, agent_schema_table_params,
+        agent_supports_capability, agent_transaction_params, append_legacy_error_context, decode_agent_response,
+        format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
+        is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
+        mongo_document_id_params, parse_agent_java_opts, read_agent_json_response, read_agent_line,
+        read_agent_line_with_limit, start_stderr_collector, validate_dameng_java_system_properties, AgentCallError,
+        AgentCapability, AgentDriverClient, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentHandshake,
+        AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentOperationOutcome, AgentRuntimeClient,
+        AgentSessionDisposition, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams,
+        MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION, AGENT_STDOUT_NOISE_SAMPLE_CHARS,
+        MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES,
     };
+    use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
     use std::io::Cursor;
     use std::io::Write;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio_util::sync::CancellationToken;
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_repairs_missing_native_execute_permission_after_eacces() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-agent-permission-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("agent");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut child = super::spawn_agent_process(&AgentLaunchSpec::new(&program)).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_ne!(fs::metadata(&program).unwrap().permissions().mode() & 0o100, 0);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_keeps_existing_native_execute_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-agent-permission-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("agent");
+        fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut child = super::spawn_agent_process(&AgentLaunchSpec::new(&program)).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::metadata(&program).unwrap().permissions().mode() & 0o777, 0o700);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_python() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
+    fn test_shell_command(unix_script: &str, windows_script: &str) -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-Command", windows_script]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", unix_script]);
+            command
+        }
+    }
+
+    #[test]
+    fn structured_agent_error_data_survives_legacy_string_boundary() {
+        let response = serde_json::json!({
+            "error": {
+                "code": -1,
+                "message": "connection lost",
+                "data": {
+                    "category": "connection",
+                    "retryable": true,
+                    "sessionDisposition": "quarantine",
+                    "agentSessionId": "session-generation-1",
+                    "stage": "execute"
+                }
+            }
+        });
+
+        let error = decode_agent_response::<serde_json::Value>(response, false, None).unwrap_err().into_legacy_string();
+
+        assert!(error.starts_with("Agent RPC error (-1): connection lost"));
+        let decoded = agent_error_from_legacy(&error, None);
+        assert_eq!(decoded.category(), Some(AgentErrorCategory::Connection));
+        assert_eq!(decoded.session_id(), Some("session-generation-1"));
+        assert_eq!(decoded.session_disposition(), Some(AgentSessionDisposition::Quarantine));
+    }
+
+    #[test]
+    fn strict_structured_error_requires_v1_and_preserves_diagnostics() {
+        let response = serde_json::json!({
+            "error": {
+                "code": -6007,
+                "message": "connection lost",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "connection",
+                    "retryable": false,
+                    "sessionDisposition": "quarantine",
+                    "stage": "execute",
+                    "operationOutcome": "unknown",
+                    "agentSessionId": "session-1",
+                    "sqlState": "08006",
+                    "vendorCode": -6007,
+                    "exceptionClass": "java.sql.SQLRecoverableException",
+                    "futureField": "allowed"
+                }
+            }
+        });
+
+        let error = decode_agent_response::<serde_json::Value>(response, true, Some("session-1")).unwrap_err();
+        match error {
+            AgentCallError::Structured { rpc_code, context, .. } => {
+                assert_eq!(rpc_code, -6007);
+                assert_eq!(context.contract_version, 1);
+                assert_eq!(context.category, AgentErrorCategory::Connection);
+                assert_eq!(context.stage, AgentErrorStage::Execute);
+                assert_eq!(context.operation_outcome, AgentOperationOutcome::Unknown);
+                assert_eq!(context.sql_state.as_deref(), Some("08006"));
+            }
+            other => panic!("expected structured error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_structured_error_keeps_identity_across_legacy_api_boundary() {
+        let response = serde_json::json!({
+            "error": {
+                "code": -6007,
+                "message": "connection lost",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "connection",
+                    "retryable": false,
+                    "sessionDisposition": "quarantine",
+                    "stage": "execute",
+                    "operationOutcome": "unknown",
+                    "agentSessionId": "session-1"
+                }
+            }
+        });
+        let legacy = decode_agent_response::<serde_json::Value>(response, true, Some("session-1"))
+            .unwrap_err()
+            .into_legacy_string();
+        let legacy = append_legacy_error_context(&legacy, "SQL text omitted");
+
+        assert!(matches!(agent_error_from_legacy(&legacy, Some("session-1")), AgentCallError::Structured { .. }));
+    }
+
+    #[test]
+    fn contract_violation_keeps_identity_when_legacy_api_adds_session_id() {
+        let legacy = AgentCallError::ContractViolation {
+            rpc_code: Some(-6007),
+            message: "invalid strict error".to_string(),
+            reason: super::ContractViolationReason::InvalidDataShape,
+        }
+        .into_legacy_string_with_session_id(Some("session-1"));
+
+        assert!(matches!(
+            agent_error_from_legacy(&legacy, Some("session-1")),
+            AgentCallError::ContractViolation { .. }
+        ));
+        assert_eq!(crate::backend_error::BackendError::from_legacy_string(&legacy).code(), "DBX-JDBC-5002");
+    }
+
+    #[test]
+    fn legacy_adapter_preserves_strict_identity_when_old_callers_append_context() {
+        let structured = AgentCallError::Structured {
+            rpc_code: -6007,
+            message: "connection lost".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Connection,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::Quarantine,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        let suffixed = format!("{}: fallback failed", structured.into_legacy_string());
+        assert!(matches!(agent_error_from_legacy(&suffixed, Some("session-1")), AgentCallError::Structured { .. }));
+
+        let violation = AgentCallError::ContractViolation {
+            rpc_code: Some(-6007),
+            message: "invalid strict error".to_string(),
+            reason: super::ContractViolationReason::InvalidDataShape,
+        };
+        let suffixed = format!("{}: fallback failed", violation.into_legacy_string());
+        assert!(matches!(agent_error_from_legacy(&suffixed, None), AgentCallError::ContractViolation { .. }));
+        assert_eq!(crate::backend_error::BackendError::from_legacy_string(&suffixed).code(), "DBX-JDBC-5002");
+    }
+
+    #[test]
+    fn strict_structured_error_rejects_missing_fields_unknown_enums_and_session_mismatch() {
+        let base = serde_json::json!({
+            "contractVersion": 1,
+            "category": "connection",
+            "retryable": false,
+            "sessionDisposition": "keep",
+            "stage": "connect",
+            "operationOutcome": "not_started",
+            "agentSessionId": "session-1"
+        });
+
+        let missing = serde_json::json!({"error": {"message": "bad", "data": {"contractVersion": 1}}});
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(missing, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidDataShape, .. }
+        ));
+
+        let mut unknown_enum = base.clone();
+        unknown_enum["category"] = serde_json::json!("future");
+        let response = serde_json::json!({"error": {"message": "bad", "data": unknown_enum}});
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidDataShape, .. }
+        ));
+
+        let response = serde_json::json!({"error": {"message": "bad", "data": base}});
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(response, true, Some("other")).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidSessionId, .. }
+        ));
+    }
+
+    #[test]
+    fn strict_structured_error_rejects_inconsistent_operation_outcome() {
+        let response = serde_json::json!({
+            "error": {
+                "message": "bad",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "connection",
+                    "retryable": false,
+                    "sessionDisposition": "keep",
+                    "stage": "connect",
+                    "operationOutcome": "unknown"
+                }
+            }
+        });
+
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(response, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
+        ));
+    }
+
+    #[test]
+    fn strict_structured_error_rejects_dangerous_disposition_and_invalid_diagnostics() {
+        let dangerous = serde_json::json!({
+            "error": {
+                "message": "bad",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "protocol",
+                    "retryable": false,
+                    "sessionDisposition": "replace_runtime",
+                    "stage": "request",
+                    "operationOutcome": "not_started"
+                }
+            }
+        });
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(dangerous, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
+        ));
+
+        let invalid_diagnostic = serde_json::json!({
+            "error": {
+                "message": "bad",
+                "data": {
+                    "contractVersion": 1,
+                    "category": "sql",
+                    "retryable": false,
+                    "sessionDisposition": "keep",
+                    "stage": "execute",
+                    "operationOutcome": "unknown",
+                    "sqlState": "08\n006"
+                }
+            }
+        });
+        assert!(matches!(
+            decode_agent_response::<serde_json::Value>(invalid_diagnostic, true, None).unwrap_err(),
+            AgentCallError::ContractViolation { reason: super::ContractViolationReason::InvalidCombination, .. }
+        ));
+    }
+
+    #[test]
+    fn recovery_policy_never_replays_user_operations_and_retries_metadata_once() {
+        let quarantined = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "connection lost".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Connection,
+                retryable: true,
+                session_disposition: AgentSessionDisposition::Quarantine,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: Some("08006".to_string()),
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::UserOperation),
+            RecoveryDecision::QuarantineSession
+        );
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::ReadOnlyMetadata { retried: false }),
+            RecoveryDecision::RetryReadOnlyMetadata
+        );
+        assert_eq!(
+            RecoveryPolicy::decide(&quarantined, RecoveryScope::ReadOnlyMetadata { retried: true }),
+            RecoveryDecision::QuarantineSession
+        );
+    }
+
+    #[test]
+    fn recovery_policy_is_conservative_for_runtime_local_and_legacy_failures() {
+        let replace = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "runtime saturated".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Resource,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::ReplaceRuntime,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        assert_eq!(RecoveryPolicy::decide(&replace, RecoveryScope::Keepalive), RecoveryDecision::ReplaceRuntime);
+        let structured_timeout = AgentCallError::Structured {
+            rpc_code: -1,
+            message: "timed out".to_string(),
+            context: AgentErrorContext {
+                contract_version: 1,
+                category: AgentErrorCategory::Timeout,
+                retryable: false,
+                session_disposition: AgentSessionDisposition::Keep,
+                stage: AgentErrorStage::Execute,
+                operation_outcome: AgentOperationOutcome::Unknown,
+                agent_session_id: Some("session-1".to_string()),
+                sql_state: None,
+                vendor_code: None,
+                exception_class: None,
+            },
+        };
+        assert_eq!(
+            RecoveryPolicy::decide(&structured_timeout, RecoveryScope::UserOperation),
+            RecoveryDecision::QuarantineSession
+        );
+        assert_eq!(
+            RecoveryPolicy::decide(
+                &AgentCallError::Timeout {
+                    stage: AgentErrorStage::Connect,
+                    operation_outcome: AgentOperationOutcome::NotStarted,
+                },
+                RecoveryScope::UserOperation,
+            ),
+            RecoveryDecision::QuarantineSession
+        );
+
+        let legacy = legacy_agent_call_error(
+            "Agent RPC error (-1): SQLRecoverableException: connection lost".to_string(),
+            Some("legacy-session"),
+        );
+        assert_eq!(legacy.category(), Some(AgentErrorCategory::Connection));
+        assert_eq!(
+            RecoveryPolicy::decide(&legacy, RecoveryScope::ReadOnlyMetadata { retried: false }),
+            RecoveryDecision::RetryReadOnlyMetadata
+        );
+    }
 
     #[test]
     fn agent_java_args_include_oracle_network_compatibility_flags() {
@@ -1924,13 +3818,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_java_args_prefer_ipv4_for_kingbase() {
-        let args = agent_java_args("/tmp/dbx/drivers/kingbase/agent.jar");
-
-        assert!(args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
-    }
-
-    #[test]
     fn agent_java_args_prefer_ipv4_for_informix() {
         let args = agent_java_args("/tmp/dbx/drivers/informix/agent.jar");
 
@@ -1942,6 +3829,36 @@ mod tests {
         let args = agent_java_args("/tmp/dbx/drivers/highgo/agent.jar");
 
         assert!(!args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
+    }
+
+    #[test]
+    fn agent_java_args_open_java_net_for_dameng() {
+        let args = agent_java_args("/tmp/dbx/drivers/dameng/agent.jar");
+
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.net=ALL-UNNAMED"));
+    }
+
+    #[test]
+    fn agent_java_args_do_not_open_java_net_for_other_agents() {
+        let args = agent_java_args("/tmp/dbx/drivers/highgo/agent.jar");
+
+        assert!(!args.iter().any(|arg| arg == "--add-opens=java.base/java.net=ALL-UNNAMED"));
+    }
+
+    #[test]
+    fn agent_java_args_open_jdk_internals_for_ignite() {
+        let args = agent_java_args("/tmp/dbx/drivers/ignite/agent.jar");
+
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.nio=ALL-UNNAMED"));
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.util=ALL-UNNAMED"));
+        assert!(args.iter().any(|arg| arg == "--add-opens=java.base/java.lang=ALL-UNNAMED"));
+    }
+
+    #[test]
+    fn agent_java_args_do_not_open_jdk_internals_for_other_agents() {
+        let args = agent_java_args("/tmp/dbx/drivers/kylin/agent.jar");
+
+        assert!(!args.iter().any(|arg| arg == "--add-opens=java.base/java.nio=ALL-UNNAMED"));
     }
 
     #[test]
@@ -1984,6 +3901,30 @@ mod tests {
     }
 
     #[test]
+    fn connection_java_system_properties_allow_flags_and_values_with_spaces() {
+        validate_dameng_java_system_properties(&[
+            "-Djava.net.preferIPv4Stack".to_string(),
+            "-Ddm.config.path=C:\\Program Files\\DM\\dm.ini".to_string(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn connection_java_system_properties_reject_launcher_options_and_empty_keys() {
+        for option in ["-jar", "-javaagent:agent.jar", "-agentpath:agent.dll", "-Xmx1g", "", "-D", "-D=value"] {
+            assert!(validate_dameng_java_system_properties(&[option.to_string()]).is_err(), "{option}");
+        }
+    }
+
+    #[test]
+    fn connection_java_system_properties_reject_shell_quotes() {
+        assert!(validate_dameng_java_system_properties(&[
+            r#"-Ddm.config.path="C:\Program Files\DM\dm.ini""#.to_string(),
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn agent_java_opts_parser_preserves_quoted_windows_paths() {
         let args = parse_agent_java_opts(
             r#"-Djava.security.krb5.conf="C:\Program Files\MIT\Kerberos5\krb5.ini" -Dsun.security.krb5.debug=true"#,
@@ -2020,6 +3961,63 @@ mod tests {
     }
 
     #[test]
+    fn reads_agent_json_responses_after_bounded_noise_and_resets_the_limit() {
+        let mut input = String::new();
+        for _ in 0..MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES {
+            input.push_str("driver banner\n");
+        }
+        input.push_str("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":true}\n");
+        for index in 0..MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES {
+            if index % 2 == 0 {
+                input.push('\n');
+            } else {
+                input.push_str("more driver chatter\n");
+            }
+        }
+        input.push_str("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":false}\n");
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let (_, first) = read_agent_json_response(&mut reader).unwrap();
+        let (_, second) = read_agent_json_response(&mut reader).unwrap();
+
+        assert_eq!(first["id"], 1);
+        assert_eq!(second["id"], 2);
+    }
+
+    #[test]
+    fn reads_immediate_agent_json_response_without_noise() {
+        let mut reader = Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":true}\n".to_vec());
+
+        let (line, response) = read_agent_json_response(&mut reader).unwrap();
+
+        assert_eq!(line, "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":true}\n");
+        assert_eq!(response["id"], 7);
+    }
+
+    #[test]
+    fn rejects_unbounded_agent_stdout_noise_with_bounded_diagnostics() {
+        let long_noise = "x".repeat(AGENT_STDOUT_NOISE_SAMPLE_CHARS + 40);
+        let input = format!("{long_noise}\n").repeat(MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES + 1);
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let error = read_agent_json_response(&mut reader).unwrap_err();
+
+        assert!(error.contains("exceeded maximum consecutive stdout noise lines (8)"));
+        assert!(error.contains("sampled agent stdout noise:"));
+        assert!(error.contains('…'));
+        assert!(error.len() < 700, "diagnostic was not bounded: {} bytes", error.len());
+    }
+
+    #[test]
+    fn preserves_agent_response_line_size_limit() {
+        let mut reader = Cursor::new(b"123456789".to_vec());
+
+        let error = read_agent_line_with_limit(&mut reader, "response", 8).unwrap_err();
+
+        assert_eq!(error, "Agent response exceeded maximum size (8 bytes)");
+    }
+
+    #[test]
     fn formats_agent_process_error_with_exit_status_and_stderr_tail() {
         let mut stderr_tail = StderrTail::default();
         stderr_tail.push_line("java.lang.NoClassDefFoundError: org/apache/hive/jdbc/HiveDriver".to_string());
@@ -2040,14 +4038,17 @@ mod tests {
 
     #[test]
     fn startup_error_waits_briefly_for_exit_status_and_stderr_tail() {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1")
+        let mut child = test_shell_command(
+            "sleep 0.05; echo 'java.lang.UnsupportedClassVersionError: class file version 65.0' >&2; exit 1",
+            "Start-Sleep -Milliseconds 50; [Console]::Error.WriteLine('java.lang.UnsupportedClassVersionError: class file version 65.0'); exit 1",
+        )
             .stderr(Stdio::piped())
             .spawn()
             .expect("child should start");
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child.stderr.take().expect("stderr should be piped"), Arc::clone(&stderr_tail));
+
+        std::thread::sleep(Duration::from_millis(200));
 
         let message = format_agent_startup_error(
             "Failed to read startup line from agent: end of stream",
@@ -2056,7 +4057,12 @@ mod tests {
         );
 
         assert!(message.contains("Failed to read startup line from agent: end of stream"));
-        assert!(message.contains("agent process exited with exit status: 1"));
+        let expected_exit = if cfg!(windows) {
+            "agent process exited with exit code: 1"
+        } else {
+            "agent process exited with exit status: 1"
+        };
+        assert!(message.contains(expected_exit), "unexpected message: {message}");
         assert!(message.contains("Agent requires Java 21"));
         assert!(message.contains("details: Failed to read startup line from agent: end of stream"));
         assert!(message.contains("UnsupportedClassVersionError"));
@@ -2064,9 +4070,7 @@ mod tests {
 
     #[test]
     fn runtime_agent_process_error_does_not_wait_for_live_child() {
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 2")
+        let child = test_shell_command("sleep 2", "Start-Sleep -Seconds 2")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2081,6 +4085,8 @@ mod tests {
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
+            cached_query: None,
+            identifier_quote: None,
         };
 
         let started_at = std::time::Instant::now();
@@ -2089,6 +4095,484 @@ mod tests {
         assert!(started_at.elapsed() < std::time::Duration::from_millis(500));
         assert!(message.contains("Agent RPC error (-1): syntax error"));
         assert!(!message.contains("agent process exited"));
+    }
+
+    #[test]
+    fn rpc_response_errors_do_not_require_process_stderr_diagnostics() {
+        assert!(is_agent_rpc_response_error(
+            "Agent RPC error (-1): ETCD_CAS_CONFLICT: key changed after it was loaded"
+        ));
+        assert!(!is_agent_rpc_response_error("Failed to read response from agent: end of stream"));
+    }
+
+    async fn spawn_stateful_test_runtime(prefix: &str) -> (Arc<AgentRuntimeClient>, std::path::PathBuf) {
+        let script_path = std::env::temp_dir().join(format!("dbx-agent-{prefix}-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys, threading
+print(json.dumps({'ready': True}), flush=True)
+state_lock = threading.Lock()
+output_lock = threading.Lock()
+session_locks = {}
+blocked = {}
+query_count = 0
+cancel_count = 0
+
+def write_response(req, result=None, error=None):
+    response = {'jsonrpc': '2.0', 'id': req['id']}
+    if error is None:
+        response['result'] = result
+    else:
+        response['error'] = {'code': -1, 'message': error}
+    with output_lock:
+        print(json.dumps(response), flush=True)
+
+def session_lock(session_id):
+    with state_lock:
+        return session_locks.setdefault(session_id, threading.Lock())
+
+def respond(req):
+    global query_count, cancel_count
+    method = req['method']
+    params = req.get('params', {})
+    if method == 'handshake':
+        write_response(req, {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']})
+        return
+    if method == 'query_count':
+        with state_lock:
+            value = query_count
+        write_response(req, value)
+        return
+    if method == 'cancel_count':
+        with state_lock:
+            value = cancel_count
+        write_response(req, value)
+        return
+    if method == 'cancel_session':
+        session_id = params['agentSessionId']
+        with state_lock:
+            cancel_count += 1
+            event = blocked.get(session_id)
+        if event is not None:
+            event.set()
+        write_response(req, {'ok': True})
+        return
+
+    session_id = params.get('agentSessionId', '__legacy__')
+    with session_lock(session_id):
+        if method == 'execute_query':
+            sql = params.get('sql', '')
+            with state_lock:
+                query_count += 1
+                current_count = query_count
+            if sql.startswith('slow'):
+                event = threading.Event()
+                with state_lock:
+                    blocked[session_id] = event
+                event.wait(2)
+                with state_lock:
+                    blocked.pop(session_id, None)
+            if sql == 'error':
+                write_response(req, error='synthetic query error')
+                return
+            write_response(req, {'sql': sql, 'count': current_count})
+            return
+        write_response(req, {'ok': True})
+
+for line in sys.stdin:
+    threading.Thread(target=respond, args=(json.loads(line),), daemon=True).start()
+"#,
+        )
+        .unwrap();
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        (runtime, script_path)
+    }
+
+    async fn runtime_counter(runtime: &Arc<AgentRuntimeClient>, method: &str) -> u64 {
+        runtime.call(method, serde_json::json!({}), Some(Duration::from_secs(2)), None).await.unwrap()
+    }
+
+    async fn wait_for_runtime_reap(runtime: &AgentRuntimeClient) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !runtime.child_reaped.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shared Agent child should be reaped");
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_kill_reaps_child_process() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("kill-reap-test").await;
+
+        runtime.kill();
+        wait_for_runtime_reap(&runtime).await;
+
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_kill_and_wait_joins_existing_reaper() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("kill-and-wait-reap-test").await;
+
+        runtime.kill();
+        runtime.kill_and_wait().await;
+
+        assert!(runtime.child_reaped.load(Ordering::Acquire));
+        assert!(runtime.child.lock().unwrap().try_wait().unwrap().is_some());
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_timeout_cancels_session_with_and_without_token() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("timeout-cancel-test").await;
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "timeout-session".to_string());
+
+        let error = client
+            .execute_query_with_timeout::<serde_json::Value>(
+                serde_json::json!({"sql": "slow-without-token"}),
+                Some(Duration::from_millis(75)),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Agent RPC call timed out"));
+        let typed_error = agent_error_from_legacy(&error, None);
+        assert_eq!(typed_error.category(), Some(AgentErrorCategory::Timeout));
+        assert_eq!(typed_error.operation_outcome(), AgentOperationOutcome::Unknown);
+        let started = Instant::now();
+        client
+            .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let error = client
+            .execute_query_with_timeout_and_cancel::<serde_json::Value>(
+                serde_json::json!({"sql": "slow-with-token"}),
+                Some(Duration::from_millis(75)),
+                Some(CancellationToken::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Agent RPC call timed out"));
+        let typed_error = agent_error_from_legacy(&error, None);
+        assert_eq!(typed_error.category(), Some(AgentErrorCategory::Timeout));
+        assert_eq!(typed_error.operation_outcome(), AgentOperationOutcome::Unknown);
+        let started = Instant::now();
+        client
+            .call_with_timeout::<serde_json::Value>("probe", serde_json::json!({}), Some(Duration::from_millis(500)))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(runtime_counter(&runtime, "cancel_count").await, 2);
+
+        runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn cached_agent_query_handles_hits_errors_ttl_and_invalidation() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("query-cache-test").await;
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "cache-session".to_string());
+        let timeout = Some(Duration::from_secs(2));
+        let cache_ttl = Duration::from_secs(1);
+
+        let first: serde_json::Value = client
+            .execute_query_cached_with_timeout(
+                "same-key".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "same"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        let second: serde_json::Value = client
+            .execute_query_cached_with_timeout(
+                "same-key".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "same"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 1);
+
+        let first_error = client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "error-key".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "slow-cache-error"}),
+                Some(Duration::from_millis(75)),
+            )
+            .await
+            .unwrap_err();
+        let second_error = client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "error-key".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "slow-cache-error"}),
+                Some(Duration::from_millis(75)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(first_error, second_error);
+        assert!(first_error.contains("Agent RPC call timed out"));
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 2);
+
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "ttl-key".to_string(),
+                Duration::from_millis(20),
+                serde_json::json!({"sql": "ttl"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "ttl-key".to_string(),
+                Duration::from_millis(20),
+                serde_json::json!({"sql": "ttl"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 4);
+
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "query-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-query"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        client.execute_query::<serde_json::Value>(serde_json::json!({"sql": "ordinary"})).await.unwrap();
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "query-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-query"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 7);
+
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "batch-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-batch"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        client
+            .execute_batch::<serde_json::Value>(None, &["UPDATE t SET a = 1".to_string()], None, timeout)
+            .await
+            .unwrap();
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "batch-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-batch"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 9);
+
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "transaction-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-transaction"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        client.execute_transaction::<serde_json::Value>(None, &["UPDATE t SET a = 2".to_string()], None).await.unwrap();
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "transaction-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-transaction"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_counter(&runtime, "query_count").await, 11);
+
+        client
+            .execute_query_cached_with_timeout::<serde_json::Value>(
+                "disconnect-invalidation".to_string(),
+                cache_ttl,
+                serde_json::json!({"sql": "cached-before-disconnect"}),
+                timeout,
+            )
+            .await
+            .unwrap();
+        assert!(client.cached_query.is_some());
+        client.disconnect().await.unwrap();
+        assert!(client.cached_query.is_none());
+
+        runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_tolerates_post_startup_driver_stdout_noise() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-runtime-stdout-noise-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'result': result}
+    elif req['method'] == 'fail':
+        print('Log4j class not found, fallback to sl4j', flush=True)
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -42, 'message': 'synthetic agent error'}}
+    else:
+        print('Log4j class not found, fallback to sl4j', flush=True)
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'result': {'ok': True}}
+    print(json.dumps(response), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let runtime = AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+
+        let result = runtime
+            .call::<serde_json::Value>(
+                AgentMethod::TestConnection.as_str(),
+                serde_json::json!({}),
+                Some(Duration::from_secs(2)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+
+        let error = runtime
+            .call_typed::<serde_json::Value>("fail", serde_json::json!({}), Some(Duration::from_secs(2)), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentCallError::Legacy { rpc_code: Some(-42), ref message, .. }
+                if message == "synthetic agent error"
+        ));
+        assert!(!runtime.is_failed());
+
+        runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_fails_all_pending_requests_after_stdout_noise_limit() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-runtime-stdout-noise-limit-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"import json, sys
+pending = []
+print(json.dumps({{'ready': True}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        result = {{'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}}
+        print(json.dumps({{'jsonrpc': '2.0', 'id': req['id'], 'result': result}}), flush=True)
+    else:
+        pending.append(req)
+        if len(pending) == 2:
+            for index in range({}):
+                print('driver-noise-' + str(index), flush=True)
+"#,
+                MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES + 1
+            ),
+        )
+        .unwrap();
+
+        let runtime = AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        let first =
+            runtime.call::<serde_json::Value>("first", serde_json::json!({}), Some(Duration::from_secs(2)), None);
+        let second =
+            runtime.call::<serde_json::Value>("second", serde_json::json!({}), Some(Duration::from_secs(2)), None);
+
+        let (first, second) = tokio::join!(first, second);
+
+        for error in [first.unwrap_err(), second.unwrap_err()] {
+            assert!(error.contains("exceeded maximum consecutive stdout noise lines (8)"));
+            assert!(error.contains("driver-noise-0"));
+        }
+        assert!(runtime.is_failed());
+
+        runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_client_tolerates_post_startup_driver_stdout_noise() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-legacy-stdout-noise-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    print('', flush=True)
+    print('Log4j class not found, fallback to sl4j', flush=True)
+    if req['method'] == 'fail':
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -42, 'message': 'synthetic agent error'}}
+    else:
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'result': {'ok': True}}
+    print(json.dumps(response), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let mut client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
+        )
+        .await
+        .unwrap();
+
+        let result = client.call::<serde_json::Value>("echo", serde_json::json!({})).await.unwrap();
+        assert_eq!(result, serde_json::json!({"ok": true}));
+
+        let error = client.call::<serde_json::Value>("fail", serde_json::json!({})).await.unwrap_err();
+        assert!(error.contains("Agent RPC error (-42): synthetic agent error"));
+
+        client.kill();
+        let _ = std::fs::remove_file(script_path);
     }
 
     #[tokio::test]
@@ -2114,7 +4598,7 @@ for line in sys.stdin:
         drop(script);
 
         let runtime = AgentRuntimeClient::spawn(
-            AgentLaunchSpec::new("python3").with_args([script_path.to_string_lossy().to_string()]),
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
             "test",
         )
         .await
@@ -2126,6 +4610,102 @@ for line in sys.stdin:
         assert_eq!(first.unwrap(), 1);
         assert_eq!(second.unwrap(), 2);
         runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_routes_agents_without_handshake_to_legacy_fallback() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-runtime-no-handshake-test-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    print(json.dumps({
+        'jsonrpc': '2.0',
+        'id': req['id'],
+        'error': {'code': -1, 'message': 'Unknown method: ' + req['method']}
+    }), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let error = match AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        {
+            Ok(runtime) => {
+                runtime.kill();
+                panic!("agent without handshake unexpectedly started as a shared runtime");
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "Agent runtime does not support multi_session protocol v2");
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn disconnect_reports_runtime_replacement_without_owning_runtime_routing() {
+        let script_path =
+            std::env::temp_dir().join(format!("dbx-agent-runtime-cleanup-saturation-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        response = {
+            'jsonrpc': '2.0',
+            'id': req['id'],
+            'result': {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+        }
+    elif req['method'] == 'close_session':
+        response = {
+            'jsonrpc': '2.0',
+            'id': req['id'],
+            'error': {
+                'code': -1,
+                'message': 'Agent runtime resource limit reached',
+                'data': {
+                    'category': 'resource',
+                    'retryable': False,
+                    'sessionDisposition': 'replace_runtime',
+                    'stage': 'close'
+                }
+            }
+        }
+    else:
+        response = {'jsonrpc': '2.0', 'id': req['id'], 'result': {}}
+    print(json.dumps(response), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = AgentRuntimeClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        runtime.increment_session_count();
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "session-1".to_string());
+
+        let error = client.disconnect().await.unwrap_err();
+
+        assert_eq!(
+            agent_error_from_legacy(&error, None).session_disposition(),
+            Some(AgentSessionDisposition::ReplaceRuntime)
+        );
+        assert!(!runtime.is_failed());
+        runtime.kill();
+        drop(client);
         let _ = std::fs::remove_file(script_path);
     }
 
@@ -2149,7 +4729,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let runtime = AgentRuntimeClient::spawn(
-            AgentLaunchSpec::new("python3").with_args([script_path.to_string_lossy().to_string()]),
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
             "test",
         )
         .await
@@ -2199,7 +4779,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let runtime = AgentRuntimeClient::spawn(
-            AgentLaunchSpec::new("python3").with_args([script_path.to_string_lossy().to_string()]),
+            AgentLaunchSpec::new(test_python()).with_args([script_path.to_string_lossy().to_string()]),
             "test",
         )
         .await
@@ -2211,6 +4791,7 @@ for line in sys.stdin:
             .unwrap_err();
         assert!(error.contains("end of stream") || error.contains("response channel closed"));
         assert!(runtime.is_failed());
+        wait_for_runtime_reap(&runtime).await;
         let _ = std::fs::remove_file(script_path);
     }
 
@@ -2257,8 +4838,23 @@ for line in sys.stdin:
         assert_eq!(AgentCapability::Transaction.as_str(), "transaction");
         assert_eq!(AgentCapability::Ddl.as_str(), "ddl");
         assert_eq!(AgentCapability::Kv.as_str(), "kv");
+        assert_eq!(AgentCapability::KvTtl.as_str(), "kv_ttl");
+        assert_eq!(AgentCapability::KvCas.as_str(), "kv_cas");
+        assert_eq!(AgentCapability::KvListValues.as_str(), "kv_list_values");
+        assert_eq!(AgentCapability::KvStatus.as_str(), "kv_status");
+        assert_eq!(AgentCapability::KvHistory.as_str(), "kv_history");
+        assert_eq!(AgentCapability::EtcdCompaction.as_str(), "etcd_compaction");
+        assert_eq!(AgentCapability::EtcdDefrag.as_str(), "etcd_defrag");
+        assert_eq!(AgentCapability::EtcdWatch.as_str(), "etcd_watch");
+        assert_eq!(AgentCapability::EtcdLease.as_str(), "etcd_lease");
+        assert_eq!(AgentCapability::EtcdAuth.as_str(), "etcd_auth");
+        assert_eq!(AgentCapability::MongoDropDatabase.as_str(), "mongo_drop_database");
+        assert_eq!(AgentCapability::MongoCloneCollection.as_str(), "mongo_clone_collection");
+        assert_eq!(AgentCapability::MongoRunCommand.as_str(), "mongo_run_command");
+        assert_eq!(AgentCapability::MongoInsertDocuments.as_str(), "mongo_insert_documents");
         assert_eq!(AgentCapability::MultiSession.as_str(), "multi_session");
-        assert_eq!(AgentCapability::ALL.len(), 9);
+        assert_eq!(AgentCapability::StructuredErrorV1.as_str(), "structured_error_v1");
+        assert_eq!(AgentCapability::ALL.len(), 24);
     }
 
     #[test]
@@ -2278,6 +4874,9 @@ for line in sys.stdin:
         assert_eq!(AgentMethod::ListIndexes.as_str(), "list_indexes");
         assert_eq!(AgentMethod::ListForeignKeys.as_str(), "list_foreign_keys");
         assert_eq!(AgentMethod::ListTriggers.as_str(), "list_triggers");
+        assert_eq!(AgentMethod::ListConstraints.as_str(), "list_constraints");
+        assert_eq!(AgentMethod::ListPartitions.as_str(), "list_partitions");
+        assert_eq!(AgentMethod::ListSubpartitions.as_str(), "list_subpartitions");
         assert_eq!(AgentMethod::GetTableDdl.as_str(), "get_table_ddl");
         assert_eq!(AgentMethod::ExecuteQuery.as_str(), "execute_query");
         assert_eq!(AgentMethod::ExecuteQueryPage.as_str(), "execute_query_page");
@@ -2288,6 +4887,9 @@ for line in sys.stdin:
         assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
         assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
+        assert_eq!(AgentMethod::BeginManualTransaction.as_str(), "begin_manual_transaction");
+        assert_eq!(AgentMethod::CommitManualTransaction.as_str(), "commit_manual_transaction");
+        assert_eq!(AgentMethod::RollbackManualTransaction.as_str(), "rollback_manual_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
     }
@@ -2297,13 +4899,20 @@ for line in sys.stdin:
         assert_eq!(MongoAgentMethod::ListDatabases.as_str(), "list_databases");
         assert_eq!(MongoAgentMethod::ListCollections.as_str(), "list_collections");
         assert_eq!(MongoAgentMethod::FindDocuments.as_str(), "find_documents");
+        assert_eq!(MongoAgentMethod::FindOne.as_str(), "find_one");
+        assert_eq!(MongoAgentMethod::ExplainFind.as_str(), "explain_find");
+        assert_eq!(MongoAgentMethod::AggregateDocuments.as_str(), "aggregate_documents");
         assert_eq!(MongoAgentMethod::FindDocumentsExtendedJson.as_str(), "find_documents_extended_json");
         assert_eq!(MongoAgentMethod::CountDocuments.as_str(), "count_documents");
         assert_eq!(MongoAgentMethod::ServerVersion.as_str(), "server_version");
         assert_eq!(MongoAgentMethod::CreateIndex.as_str(), "create_index");
+        assert_eq!(MongoAgentMethod::CreateUser.as_str(), "create_user");
         assert_eq!(MongoAgentMethod::DropIndexes.as_str(), "drop_indexes");
         assert_eq!(MongoAgentMethod::DropCollection.as_str(), "drop_collection");
+        assert_eq!(MongoAgentMethod::CloneCollection.as_str(), "clone_collection");
+        assert_eq!(MongoAgentMethod::DropDatabase.as_str(), "drop_database");
         assert_eq!(MongoAgentMethod::InsertDocument.as_str(), "insert_document");
+        assert_eq!(MongoAgentMethod::InsertDocuments.as_str(), "insert_documents");
         assert_eq!(MongoAgentMethod::UpdateDocument.as_str(), "update_document");
         assert_eq!(MongoAgentMethod::UpdateDocuments.as_str(), "update_documents");
         assert_eq!(MongoAgentMethod::DeleteDocument.as_str(), "delete_document");
@@ -2316,7 +4925,22 @@ for line in sys.stdin:
         assert_eq!(AgentKvMethod::Get.as_str(), "kv_get");
         assert_eq!(AgentKvMethod::Put.as_str(), "kv_put");
         assert_eq!(AgentKvMethod::Delete.as_str(), "kv_delete");
-        assert_eq!(AgentKvMethod::ALL.len(), 4);
+        assert_eq!(AgentKvMethod::Rename.as_str(), "kv_rename");
+        assert_eq!(AgentKvMethod::History.as_str(), "kv_history");
+        assert_eq!(AgentKvMethod::Status.as_str(), "kv_status");
+        assert_eq!(AgentKvMethod::Compact.as_str(), "etcd_compact");
+        assert_eq!(AgentKvMethod::Defrag.as_str(), "etcd_defrag");
+        assert_eq!(AgentKvMethod::WatchStart.as_str(), "etcd_watch_start");
+        assert_eq!(AgentKvMethod::WatchPoll.as_str(), "etcd_watch_poll");
+        assert_eq!(AgentKvMethod::WatchStop.as_str(), "etcd_watch_stop");
+        assert_eq!(AgentKvMethod::LeaseList.as_str(), "etcd_lease_list");
+        assert_eq!(AgentKvMethod::LeaseGet.as_str(), "etcd_lease_get");
+        assert_eq!(AgentKvMethod::LeaseGrant.as_str(), "etcd_lease_grant");
+        assert_eq!(AgentKvMethod::LeaseKeepalive.as_str(), "etcd_lease_keepalive_once");
+        assert_eq!(AgentKvMethod::LeaseRevoke.as_str(), "etcd_lease_revoke");
+        assert_eq!(AgentKvMethod::AuthUserList.as_str(), "etcd_auth_user_list");
+        assert_eq!(AgentKvMethod::AuthRoleGrantPermission.as_str(), "etcd_auth_role_grant_permission");
+        assert_eq!(AgentKvMethod::ALL.len(), 30);
     }
 
     #[test]
@@ -2330,6 +4954,9 @@ for line in sys.stdin:
         let _list_indexes = AgentDriverClient::list_indexes::<serde_json::Value>;
         let _list_foreign_keys = AgentDriverClient::list_foreign_keys::<serde_json::Value>;
         let _list_triggers = AgentDriverClient::list_triggers::<serde_json::Value>;
+        let _list_constraints = AgentDriverClient::list_constraints::<serde_json::Value>;
+        let _list_partitions = AgentDriverClient::list_partitions::<serde_json::Value>;
+        let _list_subpartitions = AgentDriverClient::list_subpartitions::<serde_json::Value>;
         let _get_table_ddl = AgentDriverClient::get_table_ddl::<serde_json::Value>;
         let _execute_query = AgentDriverClient::execute_query::<serde_json::Value>;
         let _execute_query_page = AgentDriverClient::execute_query_page::<serde_json::Value>;
@@ -2343,13 +4970,17 @@ for line in sys.stdin:
     fn exposes_mongo_protocol_wrappers() {
         let _mongo_list_databases = AgentDriverClient::mongo_list_databases::<serde_json::Value>;
         let _mongo_list_collections = AgentDriverClient::mongo_list_collections::<serde_json::Value>;
+        let _mongo_list_collection_specs = AgentDriverClient::mongo_list_collection_specs::<serde_json::Value>;
         let _mongo_find_documents = AgentDriverClient::mongo_find_documents::<serde_json::Value>;
+        let _mongo_find_one = AgentDriverClient::mongo_find_one::<serde_json::Value>;
         let _mongo_find_documents_extended_json =
             AgentDriverClient::mongo_find_documents_extended_json::<serde_json::Value>;
         let _mongo_server_version = AgentDriverClient::mongo_server_version::<serde_json::Value>;
         let _mongo_create_index = AgentDriverClient::mongo_create_index::<serde_json::Value>;
         let _mongo_drop_indexes = AgentDriverClient::mongo_drop_indexes::<serde_json::Value>;
         let _mongo_drop_collection = AgentDriverClient::mongo_drop_collection::<serde_json::Value>;
+        let _mongo_clone_collection = AgentDriverClient::mongo_clone_collection::<serde_json::Value>;
+        let _mongo_drop_database = AgentDriverClient::mongo_drop_database::<serde_json::Value>;
         let _mongo_insert_document = AgentDriverClient::mongo_insert_document::<serde_json::Value>;
         let _mongo_update_document = AgentDriverClient::mongo_update_document::<serde_json::Value>;
         let _mongo_update_documents = AgentDriverClient::mongo_update_documents::<serde_json::Value>;
@@ -2505,6 +5136,16 @@ for line in sys.stdin:
                 "object_type": "VIEW",
             })
         );
+        assert_eq!(
+            agent_object_source_params_with_relation("sales", "public", "audit_before", &"TRIGGER", Some("orders")),
+            serde_json::json!({
+                "database": "sales",
+                "schema": "public",
+                "name": "audit_before",
+                "object_type": "TRIGGER",
+                "relation_name": "orders",
+            })
+        );
         assert_eq!(agent_close_query_session_params("session-1"), serde_json::json!({ "sessionId": "session-1" }));
         assert_eq!(
             agent_transaction_params(Some("sales"), &["BEGIN".to_string(), "COMMIT".to_string()], Some("public")),
@@ -2527,7 +5168,7 @@ for line in sys.stdin:
             string_array(&contract["allCapabilities"]),
             AgentCapability::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
         );
-        assert_eq!(string_array(&contract["capabilities"]), default_sql_capabilities());
+        assert_eq!(string_array(&contract["capabilities"]), multi_session_capabilities());
         assert_eq!(string_array(&contract["defaultSqlCapabilities"]), default_sql_capabilities());
         assert_eq!(
             string_array(&contract["commonMethods"]),
@@ -2570,6 +5211,49 @@ for line in sys.stdin:
         assert!(!agent_supports_capability(Some(&handshake), AgentCapability::Query));
         assert!(!agent_supports_capability(None, AgentCapability::Kv));
         assert!(!agent_supports_capability(Some(&handshake), AgentCapability::Kv));
+        assert!(!agent_supports_capability(None, AgentCapability::KvTtl));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::KvTtl));
+        assert!(!agent_supports_capability(None, AgentCapability::KvCas));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::KvCas));
+        assert!(!agent_supports_capability(None, AgentCapability::KvListValues));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::KvListValues));
+        assert!(!agent_supports_capability(None, AgentCapability::KvStatus));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::KvStatus));
+        assert!(!agent_supports_capability(None, AgentCapability::KvHistory));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::KvHistory));
+        assert!(!agent_supports_capability(None, AgentCapability::MongoDropDatabase));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::MongoDropDatabase));
+        assert!(!agent_supports_capability(None, AgentCapability::MongoCloneCollection));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::MongoCloneCollection));
+        assert!(!agent_supports_capability(None, AgentCapability::MongoRunCommand));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::MongoRunCommand));
+        assert!(!agent_supports_capability(None, AgentCapability::MongoInsertDocuments));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::MongoInsertDocuments));
+
+        let mongo_handshake =
+            AgentHandshake { capabilities: vec![AgentCapability::MongoDropDatabase.as_str().to_string()], ..handshake };
+        assert!(agent_supports_capability(Some(&mongo_handshake), AgentCapability::MongoDropDatabase));
+
+        let mongo_clone_handshake = AgentHandshake {
+            capabilities: vec![AgentCapability::MongoCloneCollection.as_str().to_string()],
+            ..mongo_handshake
+        };
+        assert!(agent_supports_capability(Some(&mongo_clone_handshake), AgentCapability::MongoCloneCollection));
+
+        let mongo_run_command_handshake = AgentHandshake {
+            capabilities: vec![AgentCapability::MongoRunCommand.as_str().to_string()],
+            ..mongo_clone_handshake
+        };
+        assert!(agent_supports_capability(Some(&mongo_run_command_handshake), AgentCapability::MongoRunCommand));
+
+        let mongo_insert_documents_handshake = AgentHandshake {
+            capabilities: vec![AgentCapability::MongoInsertDocuments.as_str().to_string()],
+            ..mongo_run_command_handshake
+        };
+        assert!(agent_supports_capability(
+            Some(&mongo_insert_documents_handshake),
+            AgentCapability::MongoInsertDocuments
+        ));
     }
 
     #[test]
@@ -2592,9 +5276,17 @@ for line in sys.stdin:
             AgentCapability::Transaction,
             AgentCapability::Ddl,
             AgentCapability::MultiSession,
+            AgentCapability::StructuredErrorV1,
         ]
         .iter()
         .map(|capability| capability.as_str())
         .collect()
+    }
+
+    fn multi_session_capabilities() -> Vec<&'static str> {
+        default_sql_capabilities()
+            .into_iter()
+            .filter(|capability| *capability != AgentCapability::StructuredErrorV1.as_str())
+            .collect()
     }
 }

@@ -21,7 +21,9 @@ pub const MQ_TOKEN_SIGNING_SECRET_PREFIX: &str = "mq.token_signing.";
 pub const MQ_TOKEN_SIGNING_KEY: &str = "mq.token_signing.key";
 pub const NACOS_AUTH_SECRET_PREFIX: &str = "nacos.auth.";
 pub const NACOS_AUTH_PASSWORD_KEY: &str = "nacos.auth.password";
-pub const FEISHU_ACCESS_TOKEN_KEY: &str = "feishu_access_token";
+pub const NACOS_RNACOS_CONSOLE_PASSWORD_KEY: &str = "nacos.auth.rnacos_console_password";
+pub const MQTT_AUTH_SECRET_PREFIX: &str = "mqtt.auth.";
+pub const MQTT_AUTH_PASSWORD_KEY: &str = "mqtt.auth.password";
 
 pub trait ConnectionSecretStore {
     fn set_secret(&self, connection_id: &str, key: &str, secret: &str) -> Result<(), String>;
@@ -109,8 +111,7 @@ pub fn save_connections_to_file(
         persist_optional_secret(store, &config.id, INIT_SCRIPT_KEY, config.init_script.as_deref())?;
         persist_mq_auth_secrets(store, config)?;
         persist_mq_token_signing_secret(store, config)?;
-        persist_nacos_auth_secrets(store, config)?;
-        persist_optional_secret(store, &config.id, FEISHU_ACCESS_TOKEN_KEY, feishu_access_token(config).as_deref())?;
+        persist_mqtt_auth_secrets(store, config)?;
 
         // New configs persist transport-layer secrets only. Remove legacy transport secret slots after the
         // migrated layer values have been written so old configs do not keep two sources of truth.
@@ -134,7 +135,6 @@ pub fn load_connections_from_file(
     let mut configs = read_connections(path)?;
     let mut needs_rewrite = false;
     for config in &mut configs {
-        let legacy_feishu_token = feishu_access_token(config);
         if config.password.is_empty() {
             if let Some(secret) = store.get_secret(&config.id, MAIN_PASSWORD_KEY)? {
                 config.password = secret;
@@ -180,19 +180,7 @@ pub fn load_connections_from_file(
         }
         hydrate_mq_auth_secrets(store, config, &mut needs_rewrite)?;
         hydrate_mq_token_signing_secret(store, config, &mut needs_rewrite)?;
-        hydrate_nacos_auth_secret(store, config, &mut needs_rewrite)?;
-        let stored_feishu_token = store.get_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
-        if legacy_feishu_token.is_some() {
-            needs_rewrite = true;
-        }
-        match (stored_feishu_token, legacy_feishu_token) {
-            (Some(token), _) => set_feishu_access_token(config, token),
-            (None, Some(token)) => {
-                store.set_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY, &token)?;
-                set_feishu_access_token(config, token);
-            }
-            (None, None) => {}
-        }
+        hydrate_mqtt_auth_secrets(store, config, &mut needs_rewrite)?;
     }
 
     if needs_rewrite {
@@ -371,8 +359,7 @@ fn delete_removed_connection_secrets(
         store.delete_secret(&config.id, INIT_SCRIPT_KEY)?;
         delete_secret_prefix(store, &config.id, MQ_AUTH_SECRET_PREFIX)?;
         delete_secret_prefix(store, &config.id, MQ_TOKEN_SIGNING_SECRET_PREFIX)?;
-        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
-        store.delete_secret(&config.id, FEISHU_ACCESS_TOKEN_KEY)?;
+        delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
     }
     Ok(())
 }
@@ -468,44 +455,6 @@ fn persist_mq_token_signing_secret(store: &dyn ConnectionSecretStore, config: &C
     persist_json_secret_if_present(store, &config.id, MQ_TOKEN_SIGNING_KEY, signing, "key")
 }
 
-fn persist_nacos_auth_secrets(store: &dyn ConnectionSecretStore, config: &ConnectionConfig) -> Result<(), String> {
-    if config.db_type != DatabaseType::Nacos {
-        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
-        return Ok(());
-    }
-
-    let Some(auth) = mq_auth_object(config.external_config.as_ref()) else {
-        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
-        return Ok(());
-    };
-
-    if mq_auth_kind(auth).as_deref() == Some("usernamePassword") {
-        replace_nacos_auth_secret(store, &config.id, auth, "password")?;
-    } else {
-        delete_secret_prefix(store, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
-    }
-
-    Ok(())
-}
-
-fn replace_nacos_auth_secret(
-    store: &dyn ConnectionSecretStore,
-    connection_id: &str,
-    auth: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<(), String> {
-    let current = auth.get(field).and_then(serde_json::Value::as_str).filter(|secret| !secret.is_empty());
-    let existing = if current.is_none() { store.get_secret(connection_id, NACOS_AUTH_PASSWORD_KEY)? } else { None };
-    delete_secret_prefix(store, connection_id, NACOS_AUTH_SECRET_PREFIX)?;
-    match current {
-        Some(secret) => store.set_secret(connection_id, NACOS_AUTH_PASSWORD_KEY, secret),
-        None => match existing {
-            Some(secret) => store.set_secret(connection_id, NACOS_AUTH_PASSWORD_KEY, &secret),
-            None => Ok(()),
-        },
-    }
-}
-
 fn hydrate_mq_auth_secrets(
     store: &dyn ConnectionSecretStore,
     config: &mut ConnectionConfig,
@@ -548,25 +497,6 @@ fn hydrate_mq_token_signing_secret(
     };
 
     hydrate_json_secret(store, &config.id, MQ_TOKEN_SIGNING_KEY, signing, "key", needs_rewrite)
-}
-
-fn hydrate_nacos_auth_secret(
-    store: &dyn ConnectionSecretStore,
-    config: &mut ConnectionConfig,
-    needs_rewrite: &mut bool,
-) -> Result<(), String> {
-    if config.db_type != DatabaseType::Nacos {
-        return Ok(());
-    }
-
-    let Some(auth) = mq_auth_object_mut(config.external_config.as_mut()) else {
-        return Ok(());
-    };
-    if mq_auth_kind(auth).as_deref() != Some("usernamePassword") {
-        return Ok(());
-    }
-
-    hydrate_json_secret(store, &config.id, NACOS_AUTH_PASSWORD_KEY, auth, "password", needs_rewrite)
 }
 
 fn persist_json_secret_if_present(
@@ -624,61 +554,93 @@ fn scrub_mq_token_signing_secret(config: &mut ConnectionConfig) {
     scrub_json_secret(signing, "key");
 }
 
-fn scrub_nacos_auth_secrets(config: &mut ConnectionConfig) {
-    if config.db_type != DatabaseType::Nacos {
-        return;
+// ── MQTT 密钥持久化 ──────────────────────────────────────────────
+
+fn persist_mqtt_auth_secrets(store: &dyn ConnectionSecretStore, config: &ConnectionConfig) -> Result<(), String> {
+    if config.db_type != DatabaseType::Mqtt {
+        delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
+        return Ok(());
     }
-    let Some(auth) = mq_auth_object_mut(config.external_config.as_mut()) else {
+
+    let Some(auth) = mqtt_auth_object(config.external_config.as_ref()) else {
+        delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?;
+        return Ok(());
+    };
+
+    match mqtt_auth_kind(auth).as_deref() {
+        Some("password") => replace_mqtt_auth_secret(store, &config.id, MQTT_AUTH_PASSWORD_KEY, auth, "password")?,
+        _ => delete_secret_prefix(store, &config.id, MQTT_AUTH_SECRET_PREFIX)?,
+    }
+
+    Ok(())
+}
+
+fn hydrate_mqtt_auth_secrets(
+    store: &dyn ConnectionSecretStore,
+    config: &mut ConnectionConfig,
+    needs_rewrite: &mut bool,
+) -> Result<(), String> {
+    if config.db_type != DatabaseType::Mqtt {
+        return Ok(());
+    }
+
+    let Some(auth) = mqtt_auth_object_mut(config.external_config.as_mut()) else {
+        return Ok(());
+    };
+
+    if let Some("password") = mqtt_auth_kind(auth).as_deref() {
+        hydrate_json_secret(store, &config.id, MQTT_AUTH_PASSWORD_KEY, auth, "password", needs_rewrite)?
+    }
+
+    Ok(())
+}
+
+fn scrub_mqtt_auth_secrets(config: &mut ConnectionConfig) {
+    let Some(auth) = mqtt_auth_object_mut(config.external_config.as_mut()) else {
         return;
     };
-    if mq_auth_kind(auth).as_deref() == Some("usernamePassword") {
-        scrub_json_secret(auth, "password");
+    if let Some("password") = mqtt_auth_kind(auth).as_deref() {
+        scrub_json_secret(auth, "password")
     }
+}
+
+fn replace_mqtt_auth_secret(
+    store: &dyn ConnectionSecretStore,
+    connection_id: &str,
+    key: &str,
+    auth: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), String> {
+    let current = auth.get(field).and_then(serde_json::Value::as_str).filter(|secret| !secret.is_empty());
+    let existing = if current.is_none() { store.get_secret(connection_id, key)? } else { None };
+    delete_secret_prefix(store, connection_id, MQTT_AUTH_SECRET_PREFIX)?;
+    match current {
+        Some(secret) => store.set_secret(connection_id, key, secret),
+        None => match existing {
+            Some(secret) => store.set_secret(connection_id, key, &secret),
+            None => Ok(()),
+        },
+    }
+}
+
+fn mqtt_auth_kind(auth: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    auth.get("kind").and_then(serde_json::Value::as_str).map(ToString::to_string)
+}
+
+fn mqtt_auth_object(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value?.get("auth")?.as_object()
+}
+
+fn mqtt_auth_object_mut(
+    value: Option<&mut serde_json::Value>,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    value?.get_mut("auth")?.as_object_mut()
 }
 
 fn scrub_json_secret(auth: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
     if auth.contains_key(field) {
         auth.insert(field.to_string(), serde_json::Value::String(String::new()));
     }
-}
-
-fn is_feishu_connection(db_type: &DatabaseType) -> bool {
-    matches!(db_type, DatabaseType::FeishuSheets | DatabaseType::FeishuBitable)
-}
-
-fn feishu_access_token(config: &ConnectionConfig) -> Option<String> {
-    if !is_feishu_connection(&config.db_type) {
-        return None;
-    }
-    config
-        .external_config
-        .as_ref()
-        .and_then(|value| value.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn scrub_feishu_access_token(config: &mut ConnectionConfig) {
-    if !is_feishu_connection(&config.db_type) {
-        return;
-    }
-    if let Some(serde_json::Value::Object(object)) = config.external_config.as_mut() {
-        object.remove("access_token");
-    }
-}
-
-fn set_feishu_access_token(config: &mut ConnectionConfig, token: String) {
-    if !is_feishu_connection(&config.db_type) {
-        return;
-    }
-    let mut object = match config.external_config.take() {
-        Some(serde_json::Value::Object(object)) => object,
-        _ => serde_json::Map::new(),
-    };
-    object.insert("access_token".to_string(), serde_json::Value::String(token));
-    config.external_config = Some(serde_json::Value::Object(object));
 }
 
 fn mq_auth_kind(auth: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
@@ -782,8 +744,7 @@ fn sanitize_connections(configs: &[ConnectionConfig]) -> Vec<ConnectionConfig> {
             config.init_script = None;
             scrub_mq_auth_secrets(&mut config);
             scrub_mq_token_signing_secret(&mut config);
-            scrub_nacos_auth_secrets(&mut config);
-            scrub_feishu_access_token(&mut config);
+            scrub_mqtt_auth_secrets(&mut config);
             config
         })
         .collect()
@@ -796,8 +757,8 @@ pub fn secret_account(connection_id: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        feishu_access_token, load_connections_from_file, save_connections_to_file, ConnectionSecretStore,
-        CONNECTION_STRING_KEY, FEISHU_ACCESS_TOKEN_KEY, MAIN_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
+        load_connections_from_file, save_connections_to_file, ConnectionSecretStore, CONNECTION_STRING_KEY,
+        INIT_SCRIPT_KEY, MAIN_PASSWORD_KEY, MQTT_AUTH_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
         MQ_TOKEN_SIGNING_KEY, REDIS_SENTINEL_PASSWORD_KEY, SSH_PASSWORD_KEY,
     };
     use crate::models::connection::{
@@ -863,8 +824,10 @@ mod tests {
 
     fn connection(id: &str, password: &str, _ssh_password: &str) -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: id.to_string(),
             name: format!("{id} connection"),
+            note: String::new(),
             db_type: DatabaseType::Postgres,
             driver_profile: None,
             driver_label: None,
@@ -875,8 +838,11 @@ mod tests {
             username: "postgres".to_string(),
             password: password.to_string(),
             database: Some("postgres".to_string()),
+            default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -901,6 +867,8 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -908,26 +876,12 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],
             database_info: None,
         }
-    }
-
-    fn feishu_connection(id: &str, token: &str) -> ConnectionConfig {
-        let mut config = connection(id, "", "");
-        config.db_type = DatabaseType::FeishuBitable;
-        config.driver_profile = Some("feishu_bitable".to_string());
-        config.driver_label = Some("Feishu Bitable".to_string());
-        config.host = "https://open.feishu.cn".to_string();
-        config.port = 0;
-        config.database = None;
-        config.external_config = Some(serde_json::json!({
-            "access_token": token,
-            "app_token": "app_test"
-        }));
-        config
     }
 
     fn ssh_hop(id: &str, password: &str, passphrase: &str) -> SshTunnelConfig {
@@ -947,6 +901,7 @@ mod tests {
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
             auth_method: "key".to_string(),
+            allow_exec_channel_proxy: false,
         }
     }
 
@@ -1124,38 +1079,25 @@ mod tests {
     }
 
     #[test]
-    fn save_connections_moves_feishu_access_token_to_secret_store_and_restores_it() {
-        let path = temp_connections_file("feishu-token");
+    fn save_connections_moves_init_script_to_secret_store_and_restores_it() {
+        let path = temp_connections_file("init-script");
         let store = MemorySecretStore::default();
-        let config = feishu_connection("feishu", "tenant-token");
+        let mut config = connection("duck", "", "");
+        config.db_type = DatabaseType::DuckDb;
+        config.init_script = Some("CREATE SECRET (TYPE quack, TOKEN 'token-value');".to_string());
 
         save_connections_to_file(&path, &[config], &store).unwrap();
 
-        assert_eq!(store.get_existing("feishu", FEISHU_ACCESS_TOKEN_KEY).as_deref(), Some("tenant-token"));
+        assert_eq!(
+            store.get_existing("duck", INIT_SCRIPT_KEY).as_deref(),
+            Some("CREATE SECRET (TYPE quack, TOKEN 'token-value');")
+        );
         let persisted = read_configs(&path);
-        let persisted_json = serde_json::to_string(&persisted[0].external_config).unwrap();
-        assert!(!persisted_json.contains("tenant-token"));
-        assert!(!persisted_json.contains("access_token"));
+        assert_eq!(persisted[0].init_script, None);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("token-value"));
 
         let loaded = load_connections_from_file(&path, &store).unwrap();
-        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("tenant-token"));
-    }
-
-    #[test]
-    fn load_connections_migrates_legacy_feishu_access_token_and_rewrites_sanitized_file() {
-        let path = temp_connections_file("legacy-feishu-token");
-        let store = MemorySecretStore::default();
-        let legacy = vec![feishu_connection("legacy", "legacy-token")];
-        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-
-        let loaded = load_connections_from_file(&path, &store).unwrap();
-
-        assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("legacy-token"));
-        assert_eq!(store.get_existing("legacy", FEISHU_ACCESS_TOKEN_KEY).as_deref(), Some("legacy-token"));
-        let persisted = read_configs(&path);
-        let persisted_json = serde_json::to_string(&persisted[0].external_config).unwrap();
-        assert!(!persisted_json.contains("legacy-token"));
-        assert!(!persisted_json.contains("access_token"));
+        assert_eq!(loaded[0].init_script.as_deref(), Some("CREATE SECRET (TYPE quack, TOKEN 'token-value');"));
     }
 
     #[test]
@@ -1299,5 +1241,198 @@ mod tests {
         let loaded = load_connections_from_file(&path, &store).unwrap();
         let signing = loaded[0].external_config.as_ref().and_then(|value| value.get("tokenSigning")).unwrap();
         assert_eq!(signing.get("key").and_then(serde_json::Value::as_str), Some("broker-signing-secret"));
+    }
+
+    // ── MQTT 密钥持久化测试 ────────────────────────────────────────
+
+    #[test]
+    fn save_connections_moves_mqtt_password_to_secret_store_and_redacts_file() {
+        let path = temp_connections_file("mqtt-auth");
+        let store = MemorySecretStore::default();
+        let mut config = connection("mqtt-broker", "", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "clientId": "dbx-test",
+            "protocolVersion": "v5",
+            "transport": "tcp",
+            "tls": false,
+            "tlsSkipVerify": false,
+            "auth": {
+                "kind": "password",
+                "username": "admin",
+                "password": "mqtt-secret"
+            },
+            "keepAliveSecs": 60,
+            "connectTimeoutSecs": 30
+        }));
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(store.get_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY).as_deref(), Some("mqtt-secret"));
+        let persisted_json = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted_json.contains("mqtt-secret"));
+    }
+
+    #[test]
+    fn load_connections_restores_mqtt_password_from_secret_store() {
+        let path = temp_connections_file("mqtt-load");
+        let store = MemorySecretStore::default();
+        store.set_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY, "mqtt-secret");
+        let sanitized = vec![{
+            let mut c = connection("mqtt-broker", "", "");
+            c.db_type = DatabaseType::Mqtt;
+            c.external_config = Some(serde_json::json!({
+                "host": "localhost",
+                "port": 1883,
+                "clientId": "dbx-test",
+                "protocolVersion": "v5",
+                "transport": "tcp",
+                "tls": false,
+                "tlsSkipVerify": false,
+                "auth": {
+                    "kind": "password",
+                    "username": "admin",
+                    "password": ""
+                },
+                "keepAliveSecs": 60,
+                "connectTimeoutSecs": 30
+            }));
+            c
+        }];
+        std::fs::write(&path, serde_json::to_string_pretty(&sanitized).unwrap()).unwrap();
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        let auth = loaded[0].external_config.as_ref().and_then(|v| v.get("auth")).unwrap();
+        assert_eq!(auth.get("password").and_then(serde_json::Value::as_str), Some("mqtt-secret"));
+    }
+
+    #[test]
+    fn load_connections_migrates_plaintext_mqtt_password_and_rewrites_sanitized_file() {
+        let path = temp_connections_file("mqtt-migrate");
+        let store = MemorySecretStore::default();
+        let legacy = serde_json::json!([{
+            "id": "mqtt-legacy",
+            "name": "legacy mqtt",
+            "db_type": "mqtt",
+            "host": "localhost",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "external_config": {
+                "host": "localhost",
+                "port": 1883,
+                "clientId": "dbx-legacy",
+                "protocolVersion": "v5",
+                "transport": "tcp",
+                "tls": false,
+                "tlsSkipVerify": false,
+                "auth": {
+                    "kind": "password",
+                    "username": "admin",
+                    "password": "plain-mqtt-password"
+                },
+                "keepAliveSecs": 60,
+                "connectTimeoutSecs": 30
+            }
+        }]);
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        let auth = loaded[0].external_config.as_ref().and_then(|v| v.get("auth")).unwrap();
+        assert_eq!(auth.get("password").and_then(serde_json::Value::as_str), Some("plain-mqtt-password"));
+        assert_eq!(store.get_existing("mqtt-legacy", MQTT_AUTH_PASSWORD_KEY).as_deref(), Some("plain-mqtt-password"));
+
+        let persisted_json = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted_json.contains("plain-mqtt-password"));
+    }
+
+    #[test]
+    fn save_connections_preserves_existing_mqtt_secret_when_config_is_sanitized() {
+        let path = temp_connections_file("mqtt-preserve");
+        let store = MemorySecretStore::default();
+        store.set_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY, "existing-mqtt-password");
+        let mut config = connection("mqtt-broker", "", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "clientId": "dbx-test",
+            "protocolVersion": "v5",
+            "transport": "tcp",
+            "tls": false,
+            "tlsSkipVerify": false,
+            "auth": {
+                "kind": "password",
+                "username": "admin",
+                "password": ""
+            },
+            "keepAliveSecs": 60,
+            "connectTimeoutSecs": 30
+        }));
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(
+            store.get_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY).as_deref(),
+            Some("existing-mqtt-password")
+        );
+        let loaded = load_connections_from_file(&path, &store).unwrap();
+        let auth = loaded[0].external_config.as_ref().and_then(|v| v.get("auth")).unwrap();
+        assert_eq!(auth.get("password").and_then(serde_json::Value::as_str), Some("existing-mqtt-password"));
+    }
+
+    #[test]
+    fn mqtt_none_auth_does_not_store_password() {
+        let path = temp_connections_file("mqtt-none-auth");
+        let store = MemorySecretStore::default();
+        let mut config = connection("mqtt-none", "", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "clientId": "dbx-test",
+            "protocolVersion": "v5",
+            "transport": "tcp",
+            "tls": false,
+            "tlsSkipVerify": false,
+            "auth": {
+                "kind": "none"
+            },
+            "keepAliveSecs": 60,
+            "connectTimeoutSecs": 30
+        }));
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(store.get_existing("mqtt-none", MQTT_AUTH_PASSWORD_KEY), None);
+    }
+
+    #[test]
+    fn mqtt_auth_kind_change_from_password_to_none_clears_stored_secret() {
+        let path = temp_connections_file("mqtt-kind-change");
+        let store = MemorySecretStore::default();
+        store.set_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY, "old-mqtt-password");
+        let mut config = connection("mqtt-broker", "", "");
+        config.db_type = DatabaseType::Mqtt;
+        config.external_config = Some(serde_json::json!({
+            "host": "localhost",
+            "port": 1883,
+            "clientId": "dbx-test",
+            "protocolVersion": "v5",
+            "transport": "tcp",
+            "tls": false,
+            "tlsSkipVerify": false,
+            "auth": {
+                "kind": "none"
+            },
+            "keepAliveSecs": 60,
+            "connectTimeoutSecs": 30
+        }));
+
+        save_connections_to_file(&path, &[config], &store).unwrap();
+
+        assert_eq!(store.get_existing("mqtt-broker", MQTT_AUTH_PASSWORD_KEY), None);
     }
 }

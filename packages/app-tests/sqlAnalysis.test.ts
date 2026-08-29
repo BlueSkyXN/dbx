@@ -36,6 +36,63 @@ test("keeps the legacy analyzer API for editable SELECT queries", () => {
   assert.deepEqual(analysis.columns, []);
 });
 
+test("recognizes top-level SQL set operations as read-only", () => {
+  for (const operator of ["UNION", "INTERSECT", "EXCEPT", "MINUS"]) {
+    const sql = `SELECT id FROM users ${operator} SELECT id FROM archived_users`;
+
+    assert.deepEqual(analyzeEditableQueryEditability(sql), { editable: false, reason: "set-operation" }, operator);
+  }
+});
+
+test("ignores MINUS in strings, comments, and nested queries", () => {
+  for (const sql of ["SELECT id, 'MINUS' AS operation FROM users", "SELECT id FROM users -- MINUS\nWHERE active = 1", "SELECT id FROM users /* MINUS */ WHERE active = 1", "SELECT * FROM users WHERE id IN (SELECT id FROM archived_users MINUS SELECT id FROM blocked_users)"]) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, true, sql);
+    assert.equal(result.analysis.tableName, "users", sql);
+  }
+});
+
+test("recognizes Oracle FOR UPDATE variants without treating FOR as an alias", () => {
+  for (const sql of [
+    "SELECT * FROM employees FOR UPDATE",
+    "SELECT * FROM employees FOR UPDATE NOWAIT",
+    "SELECT * FROM employees FOR UPDATE SKIP LOCKED",
+    "SELECT * FROM employees FOR UPDATE OF salary, department_id WAIT 5",
+    "SELECT * FROM employees WHERE department_id = 10 ORDER BY employee_id FOR UPDATE OF salary NOWAIT",
+  ]) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, true, sql);
+    assert.equal(result.analysis.tableName, "employees", sql);
+    assert.equal(result.analysis.tableAlias, undefined, sql);
+    assert.equal(result.analysis.selectStar, true, sql);
+  }
+
+  const aliased = analyzeEditableQueryEditability("SELECT e.employee_id, e.salary FROM employees e FOR UPDATE OF e.salary SKIP LOCKED");
+  assert.equal(aliased.editable, true);
+  assert.equal(aliased.analysis.tableAlias, "e");
+});
+
+test("keeps explicit read-only and output FOR clauses non-editable", () => {
+  for (const sql of ["SELECT * FROM employees FOR READ ONLY", "SELECT * FROM employees FOR FETCH ONLY", "SELECT * FROM employees FOR JSON"]) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, false, sql);
+    assert.equal(result.reason, "complex-source", sql);
+  }
+});
+
+test("recognizes PostgreSQL row-lock FOR variants", () => {
+  for (const sql of ["SELECT * FROM jobs FOR SHARE", "SELECT * FROM jobs FOR NO KEY UPDATE SKIP LOCKED", "SELECT * FROM jobs FOR KEY SHARE NOWAIT"]) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, true, sql);
+    assert.equal(result.analysis.tableName, "jobs", sql);
+    assert.equal(result.analysis.tableAlias, undefined, sql);
+  }
+});
+
 test("maps joined query source columns for column-level editing", () => {
   const result = analyzeEditableQueryEditability("select u.id as user_id, u.name, o.total from users u join orders o on o.user_id = u.id");
 
@@ -75,6 +132,7 @@ test("treats DISTINCT single-table projections as update-only", () => {
 
   assert.equal(result.editable, true);
   assert.equal(result.analysis.distinct, true);
+  assert.equal(result.analysis.allowInsert, false);
   assert.equal(result.analysis.allowInsertDelete, false);
   assert.deepEqual(result.analysis.columns, [
     { sourceName: "id", sourceNameQuoted: false, resultName: "id", expression: "id" },
@@ -83,13 +141,25 @@ test("treats DISTINCT single-table projections as update-only", () => {
 });
 
 test("maps a DISTINCT qualified star to one joined source", () => {
-  const result = analyzeEditableQueryEditability("select distinct u.* from users u left join orders o on o.user_id = u.id");
+  const result = analyzeEditableQueryEditability(`select distinct t4.*
+    from TASK_CHECK_BASE t1
+    left join TASK_FORMULATE_EXECUTE t20 on t1.EXECUTE_UID = t20.EXECUTE_UID
+    left join TASK_FORMULATE_BASE t40 on t20.FORMULATE_UID = t40.FORMULATE_UID
+    left join TASK_EXECUTE_FORM t30 on t20.EXECUTE_UID = t30.EXECUTE_UID
+    left join TASK_CHECK_ORG t2 on t1.TASK_ID = t2.TASK_ID
+    left join TASK_CHECK_ORG_INNER_DEPT t3 on t2.TASK_ORG_ID = t3.TASK_ORG_ID
+    left join TASK_CHECK_ENT t4 on t1.TASK_ID = t4.TASK_ID
+    left join TASK_EXECUTE_OBJ_ENT t44 on t1.EXECUTE_UID = t44.EXECUTE_UID
+    left join TASK_CHECK_DEPT_RESULT t5 on t4.TASK_ID = t5.TASK_ID and t4.TASK_ENT_ID = t5.TASK_ENT_ID
+    left join TASK_EXECUTE_PERSON_AGENT t6 on t1.EXECUTE_UID = t6.EXECUTE_UID`);
 
   assert.equal(result.editable, true);
   assert.equal(result.analysis.distinct, true);
   assert.equal(result.analysis.multiSource, true);
+  assert.equal(result.analysis.allowInsert, false);
   assert.equal(result.analysis.allowInsertDelete, false);
-  assert.deepEqual(result.analysis.columns, [{ star: true, sourceQualifier: "u", sourceKey: "u:0", resultName: "*", expression: "u.*" }]);
+  assert.equal(result.analysis.sources?.length, 10);
+  assert.deepEqual(result.analysis.columns, [{ star: true, sourceQualifier: "t4", sourceKey: "t4:6", resultName: "*", expression: "t4.*" }]);
 });
 
 test("keeps ambiguous DISTINCT projections read-only", () => {
@@ -143,6 +213,69 @@ test("accepts aliased primary key source columns for row identity", () => {
   assert.equal(allPrimaryKeysPresent(["id"], ["user_id", "name"], analysis), true);
   assert.equal(allEditableColumnsWriteable(analysis, ["user_id", "name"]), true);
   assert.equal(allPrimaryKeysPresent(["id"], ["id", "name"], analyzeEditableQuery("select id, name from users")!), true);
+});
+
+test("accepts unquoted Unicode aliases in editable MySQL and SQL Server queries", () => {
+  for (const sql of ["SELECT Guid, FDeleted AS 禁用, IsAuditing AS 审核 FROM xy.dbo.GL_CUSTOM WHERE TJBH=\n24049", "SELECT Guid, FDeleted AS 禁用, IsAuditing AS 审核 FROM xy.GL_CUSTOM WHERE TJBH=24049"]) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, true, sql);
+    assert.deepEqual(result.analysis.columns, [
+      { sourceName: "Guid", sourceNameQuoted: false, resultName: "Guid", expression: "Guid" },
+      { sourceName: "FDeleted", sourceNameQuoted: false, resultName: "禁用", expression: "FDeleted" },
+      { sourceName: "IsAuditing", sourceNameQuoted: false, resultName: "审核", expression: "IsAuditing" },
+    ]);
+  }
+
+  const computed = analyzeEditableQueryEditability("SELECT Guid, FDeleted AS 禁用, CASE WHEN IsAuditing = 1 THEN 1 ELSE 0 END AS 审核状态 FROM xy.dbo.GL_CUSTOM");
+  assert.equal(computed.editable, true);
+  assert.deepEqual(computed.analysis.columns[2], {
+    sourceName: undefined,
+    sourceNameQuoted: false,
+    resultName: "审核状态",
+    expression: "CASE WHEN IsAuditing = 1 THEN 1 ELSE 0 END",
+  });
+});
+
+test("accepts MySQL string-quoted column aliases", () => {
+  for (const [sql, resultName] of [
+    ["SELECT id, report_type '计划类型' FROM biz_work_log", "计划类型"],
+    ["SELECT id, report_type AS '计划类型' FROM biz_work_log", "计划类型"],
+    ["SELECT id, report_type '计划''类型' FROM biz_work_log", "计划'类型"],
+    ["SELECT id, report_type AS '计划''类型' FROM biz_work_log", "计划'类型"],
+  ] as const) {
+    const result = analyzeEditableQueryEditability(sql);
+
+    assert.equal(result.editable, true, sql);
+    assert.deepEqual(result.analysis.columns, [
+      { sourceName: "id", sourceNameQuoted: false, resultName: "id", expression: "id" },
+      { sourceName: "report_type", sourceNameQuoted: false, resultName, expression: "report_type" },
+    ]);
+    assert.deepEqual(sourceColumnsForResult(result.analysis, ["id", resultName]), ["id", "report_type"], sql);
+    assert.equal(allPrimaryKeysPresent(["id"], ["id", resultName], result.analysis), true, sql);
+    assert.equal(allEditableColumnsWriteable(result.analysis, ["id", resultName]), true, sql);
+  }
+});
+
+test("keeps string literals computed and rejects malformed string aliases", () => {
+  for (const sql of ["SELECT id, report_type '计划类型 FROM biz_work_log", "SELECT id, report_type '计划类型' trailing FROM biz_work_log"]) {
+    assert.equal(analyzeEditableQueryEditability(sql).editable, false, sql);
+  }
+
+  for (const sql of ["SELECT id, 'constant' '固定值' FROM biz_work_log", "SELECT id, 'constant' AS '固定值' FROM biz_work_log"]) {
+    const computed = analyzeEditableQueryEditability(sql);
+    assert.equal(computed.editable, true, sql);
+    assert.deepEqual(computed.analysis.columns[1], {
+      sourceName: undefined,
+      sourceNameQuoted: false,
+      resultName: "固定值",
+      expression: "'constant'",
+    });
+  }
+
+  for (const sql of ["SELECT id, report_type AS 计划类型 FROM biz_work_log", "SELECT id, report_type AS `计划类型` FROM biz_work_log", 'SELECT id, report_type AS "计划类型" FROM biz_work_log']) {
+    assert.equal(analyzeEditableQueryEditability(sql).editable, true, sql);
+  }
 });
 
 test("resolves metadata columns with dialect and quote aware identifier rules", () => {

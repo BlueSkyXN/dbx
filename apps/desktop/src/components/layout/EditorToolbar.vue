@@ -1,23 +1,26 @@
 <script setup lang="ts">
 import { computed, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
-import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste, Minimize2 } from "@lucide/vue";
+import { Play, CirclePlay, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste, Minimize2, SpellCheck2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import TruncatedTextTooltip from "@/components/ui/TruncatedTextTooltip.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import ConnectionTreeSelect from "@/components/connection/ConnectionTreeSelect.vue";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { catalogDatabaseOptionsKey, databaseAfterCatalogChange, normalizedQueryTabCatalog, queryCatalogSelectorVisible, selectedQueryCatalogName, useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connection/connectionPresentation";
 import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/database/defaultDatabase";
-import { connectionDisplayName } from "@/lib/tabs/tabPresentation";
-import { useConnectionGroupLabel } from "@/composables/useConnectionGroupLabel";
 import { isSingleDatabase, supportsClearableQuerySchema, supportsSqlInListPaste, supportsTransaction as supportsTransactionFeature } from "@/lib/database/databaseCapabilities";
+import { supportsQueryExecution } from "@/lib/database/databaseFeatureSupport";
+import { connectionIsDorisFamilyCatalogCapable } from "@/lib/database/databaseFeatureSupport";
 import { hexToRgba } from "@/lib/common/color";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
+import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 
 const props = defineProps<{
@@ -31,6 +34,12 @@ const props = defineProps<{
   autoCommit?: boolean;
   txnSessionId?: string;
   txnAutoRolledBack?: boolean;
+  /** Oracle-only: whether the current manual Oracle session executed a statement
+   *  DBX cannot prove read-only. Commit/Rollback are hidden while false. */
+  oracleTxnPossiblyDirty?: boolean;
+  /** Oracle manual mode derived from the resolved database type (not raw
+   *  db_type, which can be the agent transport). */
+  isOracleManualTransaction?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -45,7 +54,9 @@ const emit = defineEmits<{
   openSql: [];
   importResultArchive: [];
   pasteSqlInCondition: [];
+  multiExecute: [];
   changeConnection: [connectionId: string];
+  changeCatalog: [catalog: string | undefined, database: string];
   changeDatabase: [database: string];
   changeSchema: [schema: string | undefined];
   setDefaultDatabase: [];
@@ -59,16 +70,32 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
-const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions } = useDatabaseOptions();
+const settingsStore = useSettingsStore();
+const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOptions, loadingCatalogOptions, loadCatalogOptions, catalogDatabaseOptions, loadingCatalogDatabaseOptions, loadCatalogDatabaseOptions } = useDatabaseOptions();
 const { loadSchemaOptions, getSchemaOptionsForDb, isLoadingSchemas, isSchemaAware } = useSchemaOptions();
 
+const activeCatalogs = computed(() => {
+  const connection = props.activeConnection;
+  return connection ? (catalogOptions.value[connection.id] ?? []) : [];
+});
+const activeCatalogNames = computed(() => activeCatalogs.value.map((catalog) => catalog.name));
+const showCatalogSelector = computed(() => connectionIsDorisFamilyCatalogCapable(props.activeConnection) && queryCatalogSelectorVisible(activeCatalogs.value));
+const activeCatalogValue = computed(() => selectedQueryCatalogName(activeCatalogs.value, props.activeTab.catalog));
+const activeCatalogDatabaseKey = computed(() => (props.activeConnection && props.activeTab.catalog ? catalogDatabaseOptionsKey(props.activeConnection.id, props.activeTab.catalog) : ""));
 const activeDatabaseOptions = computed(() => {
   const connection = props.activeConnection;
-  return connection ? (databaseOptions.value[connection.id] ?? []) : [];
+  if (!connection) return [];
+  if (props.activeTab.catalog) return catalogDatabaseOptions.value[activeCatalogDatabaseKey.value] ?? [];
+  return databaseOptions.value[connection.id] ?? [];
 });
+const loadingActiveDatabaseOptions = computed(() => {
+  const connection = props.activeConnection;
+  if (!connection) return false;
+  if (props.activeTab.catalog) return loadingCatalogDatabaseOptions.value[activeCatalogDatabaseKey.value] ?? false;
+  return loadingDatabaseOptions.value[connection.id] ?? false;
+});
+const switchingCatalog = ref(false);
 
-const connectionOptionIds = computed(() => connectionStore.connections.map((connection) => connection.id));
-const { connectionGroupLabel } = useConnectionGroupLabel();
 const activeDatabaseValue = computed(() => props.activeTab.database || "");
 const activeProductionContext = computed(() => productionContextForDatabase(props.activeConnection, props.activeTab.database));
 const showConnectionProductionBadge = computed(() => activeProductionContext.value.reason === "connection");
@@ -77,7 +104,23 @@ const activeConnectionValue = computed(() => props.activeConnection?.id || "");
 const activeSchemaValue = computed(() => props.activeTab.schema || "");
 const supportsExplain = computed(() => {
   const dbType = props.activeConnection?.db_type;
-  return dbType !== "redis" && dbType !== "mongodb" && dbType !== "elasticsearch" && dbType !== "qdrant" && dbType !== "milvus" && dbType !== "weaviate" && dbType !== "chromadb" && dbType !== "etcd" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "nacos";
+  return (
+    dbType !== "redis" &&
+    dbType !== "mongodb" &&
+    dbType !== "elasticsearch" &&
+    dbType !== "easysearch" &&
+    dbType !== "meilisearch" &&
+    dbType !== "qdrant" &&
+    dbType !== "milvus" &&
+    dbType !== "weaviate" &&
+    dbType !== "chromadb" &&
+    dbType !== "etcd" &&
+    dbType !== "zookeeper" &&
+    dbType !== "consul" &&
+    dbType !== "mq" &&
+    dbType !== "nacos" &&
+    dbType !== "victoriametrics"
+  );
 });
 const isSingleDb = computed(() => isSingleDatabase(props.activeConnection?.db_type));
 const supportsExPaste = computed(() => supportsSqlInListPaste(props.activeConnection?.db_type));
@@ -85,12 +128,46 @@ const supportsTransaction = computed(() => supportsTransactionFeature(props.acti
 const hasDefaultDatabaseOption = computed(() => activeDatabaseOptions.value.includes(""));
 const schemaDatabaseKey = computed(() => props.activeTab.database || (isSingleDb.value ? "_" : ""));
 const saveTooltip = computed(() => (props.activeTab.objectSource ? t("objects.saveSource") : t("toolbar.saveSql")));
+const executeShortcutDisplay = computed(() => formatShortcutDisplay(settingsStore.editorSettings.shortcuts.executeSql));
+const executeShortcutTooltip = computed(() => t("toolbar.executeShortcut", { shortcut: executeShortcutDisplay.value }));
+// DM calls it autotrace, Postgres EXPLAIN ANALYZE, SQL Server the actual execution
+// plan (SET STATISTICS XML); all three execute the statement.
+const supportsExplainAnalyze = computed(() => {
+  const dbType = props.activeConnection?.db_type;
+  return dbType === "dameng" || dbType === "postgres" || dbType === "sqlserver";
+});
+const explainAnalyzeTooltip = computed(() => {
+  const dbType = props.activeConnection?.db_type;
+  if (dbType === "postgres") return t("toolbar.explainAnalyze");
+  if (dbType === "sqlserver") return t("toolbar.actualPlan");
+  return t("toolbar.autotrace");
+});
 const canSaveSql = computed(() => !!props.activeTab.externalSqlPath || !!props.activeTab.sql.trim());
 const keywordCaseIsLower = computed(() => props.sqlKeywordCase === "lower");
 const keywordCaseToggleTooltip = computed(() => (keywordCaseIsLower.value ? t("toolbar.keywordCaseUpper") : t("toolbar.keywordCaseLower")));
+const sqlSemanticDiagnosticsEnabled = computed(() => settingsStore.editorSettings.sqlSemanticDiagnosticsEnabled);
+const sqlSemanticDiagnosticsToggleTooltip = computed(() => (sqlSemanticDiagnosticsEnabled.value ? t("toolbar.sqlSemanticDiagnosticsToggleOn") : t("toolbar.sqlSemanticDiagnosticsToggleOff")));
+const supportsSqlSemanticDiagnosticsToggle = computed(() => {
+  const dbType = props.activeConnection?.db_type;
+  return dbType !== "redis" && dbType !== "victoriametrics";
+});
+function toggleSqlSemanticDiagnostics() {
+  settingsStore.updateEditorSettings({
+    sqlSemanticDiagnosticsMode: sqlSemanticDiagnosticsEnabled.value ? "disabled" : "enabled",
+  });
+}
+const isTransactionActive = computed(() => !!props.txnSessionId);
+const isManualTransactionMode = computed(() => props.autoCommit === false || isTransactionActive.value);
+const transactionModeBadge = computed(() => (isManualTransactionMode.value ? "M" : "A"));
+// Oracle manual mode hides Commit/Rollback while the session is clean (no
+// unproven statement executed). Every other database keeps the existing rule.
+const showTxnActions = computed(() => {
+  if (props.isOracleManualTransaction) return isTransactionActive.value && props.oracleTxnPossiblyDirty === true;
+  return isTransactionActive.value;
+});
 const transactionTooltip = computed(() => {
   const isAgent = (props.activeConnection?.db_type as string) === "agent";
-  const isManual = props.autoCommit === false;
+  const isManual = isManualTransactionMode.value;
   if (isAgent && isManual) return t("toolbar.manualTransactionAgent");
   if (isAgent) return t("toolbar.autoCommitAgent");
   return isManual ? t("toolbar.manualTransaction") : t("toolbar.autoCommit");
@@ -100,7 +177,12 @@ const executeButtonClass = computed(() => {
   return activeProductionContext.value.active ? "bg-red-500/10 text-red-700 hover:bg-red-500/20 hover:text-red-800 dark:text-red-300 dark:hover:text-red-200" : "bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-800 dark:text-emerald-300 dark:hover:text-emerald-200";
 });
 
-const isTransactionActive = computed(() => !!props.txnSessionId);
+const canMultiExecute = computed(() => {
+  if (!supportsQueryExecution(props.activeConnection?.db_type)) return false;
+  if (props.activeTab.isExecuting || props.activeTab.isExplaining || props.activeTab.isCancelling) return false;
+  if (props.autoCommit === false || isTransactionActive.value) return false;
+  return !!props.executableSql.trim();
+});
 
 const showSchemaSelector = computed(() => {
   const connection = props.activeConnection;
@@ -135,6 +217,18 @@ watchEffect(() => {
     loadSchemaOptions(connection.id, schemaDatabaseKey.value).catch(() => {});
   }
 });
+watchEffect(() => {
+  const connection = props.activeConnection;
+  if (!connection || !connectionIsDorisFamilyCatalogCapable(connection)) return;
+  void loadCatalogOptions(connection.id).catch(() => {});
+});
+
+watchEffect(() => {
+  const connection = props.activeConnection;
+  const catalog = props.activeTab.catalog;
+  if (!connection || !catalog) return;
+  void loadCatalogDatabaseOptions(connection.id, catalog).catch(() => {});
+});
 
 const isActiveDatabaseDefault = computed(() => isDefaultDatabase(props.activeConnection, activeDatabaseValue.value));
 const toolbarStyle = computed(() => {
@@ -153,13 +247,21 @@ function databaseDisplayName(database: string): string {
   });
 }
 
-function connectionById(connectionId: string): ConnectionConfig | undefined {
-  return connectionStore.getConfig(connectionId);
-}
-
 function databaseOptionIsProduction(database: string): boolean {
   if (!database || props.activeConnection?.is_production) return false;
   return productionContextForDatabase(props.activeConnection, database).reason === "database";
+}
+async function changeCatalog(selectedCatalog: string) {
+  const connection = props.activeConnection;
+  if (!connection) return;
+  switchingCatalog.value = true;
+  try {
+    const catalog = normalizedQueryTabCatalog(activeCatalogs.value, selectedCatalog);
+    const databases = catalog ? await loadCatalogDatabaseOptions(connection.id, selectedCatalog) : await loadDatabaseOptions(connection.id).then(() => databaseOptions.value[connection.id] ?? []);
+    emit("changeCatalog", catalog, databaseAfterCatalogChange(props.activeTab.database, databases));
+  } finally {
+    switchingCatalog.value = false;
+  }
 }
 </script>
 
@@ -174,6 +276,7 @@ function databaseOptionIsProduction(database: string): boolean {
             class="h-6 w-6"
             :class="executeButtonClass"
             :disabled="activeTab.isCancelling || activeTab.isExplaining || (!activeTab.isExecuting && !executableSql.trim())"
+            @mousedown.prevent
             @click="activeTab.isExecuting ? emit('cancel') : emit('execute')"
           >
             <Loader2 v-if="activeTab.isCancelling" class="h-3.5 w-3.5 animate-spin" />
@@ -181,7 +284,7 @@ function databaseOptionIsProduction(database: string): boolean {
             <Play v-else class="h-3.5 w-3.5" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{{ activeTab.isExecuting ? t("toolbar.stopQuery") : t("toolbar.executeShortcut") }}</TooltipContent>
+        <TooltipContent>{{ activeTab.isExecuting ? t("toolbar.stopQuery") : executeShortcutTooltip }}</TooltipContent>
       </Tooltip>
       <Tooltip v-if="supportsExplain">
         <TooltipTrigger as-child>
@@ -199,52 +302,23 @@ function databaseOptionIsProduction(database: string): boolean {
         </TooltipTrigger>
         <TooltipContent>{{ activeTab.isExplaining ? t("toolbar.stopExplain") : t("toolbar.explainPlan") }}</TooltipContent>
       </Tooltip>
-      <!-- Autotrace toggle (only for DM) -->
-      <Button
-        v-if="activeConnection?.db_type === 'dameng'"
-        variant="ghost"
-        size="icon"
-        class="h-6 w-6"
-        :class="props.explainMode === 'autotrace' ? 'text-green-600 bg-green-100 dark:text-green-300 dark:bg-green-900/30' : 'text-muted-foreground/50'"
-        :disabled="activeTab.isExecuting"
-        @click="emit('update:explainMode', props.explainMode === 'autotrace' ? 'explain' : 'autotrace')"
-      >
-        <span class="font-bold" style="font-size: 9px">A</span>
-      </Button>
-      <!-- Transaction toggle -->
-      <Tooltip v-if="supportsTransaction">
+      <!-- Autotrace (DM) / EXPLAIN ANALYZE (Postgres) / actual plan (SQL Server) toggle -->
+      <Tooltip v-if="supportsExplainAnalyze">
         <TooltipTrigger as-child>
           <Button
             variant="ghost"
             size="icon"
             class="h-6 w-6"
-            :class="isTransactionActive || autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'"
-            :disabled="activeTab.isExecuting || activeTab.isExplaining"
-            @click="emit('update:autoCommit', autoCommit === false)"
+            :class="props.explainMode === 'autotrace' ? 'text-green-600 bg-green-100 dark:text-green-300 dark:bg-green-900/30' : 'text-muted-foreground/50'"
+            :disabled="activeTab.isExecuting"
+            :aria-label="explainAnalyzeTooltip"
+            :aria-pressed="props.explainMode === 'autotrace'"
+            @click="emit('update:explainMode', props.explainMode === 'autotrace' ? 'explain' : 'autotrace')"
           >
-            <span class="font-bold" style="font-size: 9px">Tx</span>
+            <span class="font-bold" style="font-size: 9px">A</span>
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{{ transactionTooltip }}</TooltipContent>
-      </Tooltip>
-      <!-- Commit button (only when transaction is active) -->
-      <Tooltip v-if="isTransactionActive">
-        <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" :disabled="activeTab.isExecuting" @click="emit('commit')">
-            <Check class="h-3.5 w-3.5" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{{ t("toolbar.commit") }}</TooltipContent>
-      </Tooltip>
-
-      <!-- Rollback button (only when transaction is active) -->
-      <Tooltip v-if="isTransactionActive">
-        <TooltipTrigger as-child>
-          <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" :disabled="activeTab.isExecuting" @click="emit('rollback')">
-            <RotateCcw class="h-3.5 w-3.5" />
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent>{{ t("toolbar.rollback") }}</TooltipContent>
+        <TooltipContent>{{ explainAnalyzeTooltip }}</TooltipContent>
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
@@ -267,8 +341,8 @@ function databaseOptionIsProduction(database: string): boolean {
           <Button
             variant="ghost"
             size="icon"
-            class="h-6 w-6 font-mono text-[11px] leading-none"
-            :class="keywordCaseIsLower ? 'bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200' : 'text-muted-foreground hover:bg-muted hover:text-foreground'"
+            class="h-6 w-6 font-mono text-sm font-semibold leading-none"
+            :class="keywordCaseIsLower ? 'bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200' : 'text-amber-600/70 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300/70 dark:hover:text-amber-200'"
             :aria-label="keywordCaseToggleTooltip"
             @click="emit('toggleSqlKeywordCase')"
           >
@@ -276,6 +350,21 @@ function databaseOptionIsProduction(database: string): boolean {
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ keywordCaseToggleTooltip }}</TooltipContent>
+      </Tooltip>
+      <Tooltip v-if="supportsSqlSemanticDiagnosticsToggle">
+        <TooltipTrigger as-child>
+          <Button
+            variant="ghost"
+            size="icon"
+            class="h-6 w-6"
+            :class="sqlSemanticDiagnosticsEnabled ? 'text-emerald-600 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-700 dark:text-emerald-300 dark:hover:text-emerald-200' : 'text-muted-foreground/50 hover:bg-muted hover:text-muted-foreground'"
+            :aria-label="sqlSemanticDiagnosticsToggleTooltip"
+            @click="toggleSqlSemanticDiagnostics"
+          >
+            <SpellCheck2 class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ sqlSemanticDiagnosticsToggleTooltip }}</TooltipContent>
       </Tooltip>
       <Tooltip v-if="activeConnection?.db_type === 'redis'">
         <TooltipTrigger as-child>
@@ -323,22 +412,71 @@ function databaseOptionIsProduction(database: string): boolean {
         </TooltipTrigger>
         <TooltipContent>{{ t("toolbar.exPasteSqlInCondition") }}</TooltipContent>
       </Tooltip>
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-primary hover:bg-primary/10" :disabled="!canMultiExecute" :aria-label="t('toolbar.multiDbExecute')" @click="emit('multiExecute')">
+            <CirclePlay class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.multiDbExecute") }}</TooltipContent>
+      </Tooltip>
+      <div v-if="supportsTransaction" class="ml-1 flex items-center gap-0.5 border-l border-border/60 pl-1" role="group" :aria-label="transactionTooltip">
+        <!-- Transaction toggle -->
+        <Tooltip>
+          <TooltipTrigger as-child>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="h-6 w-8 px-1"
+              :class="isManualTransactionMode ? 'bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-300' : 'text-orange-600/70 hover:bg-orange-500/10 hover:text-orange-700 dark:text-orange-300/70 dark:hover:text-orange-200'"
+              :disabled="activeTab.isExecuting || activeTab.isExplaining"
+              :aria-label="transactionTooltip"
+              :aria-pressed="isManualTransactionMode"
+              @click="emit('update:autoCommit', autoCommit === false)"
+            >
+              <span class="inline-flex items-center gap-px leading-none" aria-hidden="true">
+                <span class="text-[11px] font-bold">Tx:</span>
+                <span class="inline-flex h-3 min-w-3 items-center justify-center rounded-[3px] border border-current px-px text-[8px] font-extrabold leading-none">{{ transactionModeBadge }}</span>
+              </span>
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{{ transactionTooltip }}</TooltipContent>
+        </Tooltip>
+        <!-- Commit button (only when a transaction action is warranted) -->
+        <Tooltip v-if="showTxnActions">
+          <TooltipTrigger as-child>
+            <Button variant="ghost" size="icon" class="h-6 w-6 text-green-600 hover:bg-green-500/10 hover:text-green-700 dark:text-green-300 dark:hover:text-green-200" :disabled="activeTab.isExecuting" :aria-label="t('toolbar.commit')" @click="emit('commit')">
+              <Check class="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{{ t("toolbar.commit") }}</TooltipContent>
+        </Tooltip>
+
+        <!-- Rollback button (only when a transaction action is warranted) -->
+        <Tooltip v-if="showTxnActions">
+          <TooltipTrigger as-child>
+            <Button variant="ghost" size="icon" class="h-6 w-6 text-red-600 hover:bg-red-500/10 hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" :disabled="activeTab.isExecuting" :aria-label="t('toolbar.rollback')" @click="emit('rollback')">
+              <RotateCcw class="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>{{ t("toolbar.rollback") }}</TooltipContent>
+        </Tooltip>
+      </div>
     </div>
     <span class="flex-1 min-w-0" />
     <div class="flex items-center gap-2 shrink-0">
       <div class="flex items-center gap-1">
         <span v-if="activeConnection?.color" class="h-4 w-1 rounded-full shrink-0" :style="{ backgroundColor: activeConnection.color }" />
-        <SearchableSelect
+        <ConnectionTreeSelect
           :model-value="activeConnectionValue"
-          :options="connectionOptionIds"
+          :connections="connectionStore.connections"
+          :layout="connectionStore.sidebarLayout"
           :placeholder="t('editor.selectConnection')"
           :search-placeholder="t('editor.searchConnection')"
           :empty-text="t('grid.noSearchResults')"
-          :loading-text="t('common.loading')"
           trigger-class="font-medium text-foreground"
-          :display-name="connectionDisplayName"
+          trigger-icon-class="h-3 w-3"
           list-class="w-96 max-w-[calc(100vw-2rem)]"
-          item-class="min-h-9 h-auto py-1"
           @update:model-value="(connectionId) => emit('changeConnection', connectionId)"
         >
           <template #trigger-label="{ label }">
@@ -349,21 +487,46 @@ function databaseOptionIsProduction(database: string): boolean {
             </div>
             <span v-else class="truncate text-muted-foreground">{{ t("editor.selectConnection") }}</span>
           </template>
-          <template #option-label="{ option, label }">
-            <div class="flex min-w-0 items-center gap-2">
-              <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
-              <div class="flex min-w-0 flex-1 items-center gap-2">
-                <span class="block min-w-0 max-w-48 shrink-0 whitespace-normal break-words rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] leading-tight text-muted-foreground">
-                  {{ connectionGroupLabel(option) }}
-                </span>
-                <TruncatedTextTooltip :text="label" class="block min-w-[7rem] flex-1 text-sm font-medium" side="left" :side-offset="8" />
-              </div>
-            </div>
+        </ConnectionTreeSelect>
+      </div>
+      <div v-if="showCatalogSelector" class="flex items-center gap-1">
+        <SearchableSelect
+          :model-value="activeCatalogValue"
+          :options="activeCatalogNames"
+          :placeholder="t('editor.selectCatalog')"
+          :search-placeholder="t('editor.searchCatalog')"
+          :empty-text="t('grid.noSearchResults')"
+          :loading-text="t('common.loading')"
+          :loading="loadingCatalogOptions[activeConnection?.id || ''] || switchingCatalog"
+          trigger-variant="ghost"
+          trigger-class="gap-1.5"
+          trigger-icon-class="h-3 w-3"
+          @update:model-value="changeCatalog"
+          @update:open="
+            (open: boolean) => {
+              if (open && activeConnection) loadCatalogOptions(activeConnection.id).catch(() => {});
+            }
+          "
+        >
+          <template #trigger-label="{ label, loading }">
+            <Layers class="h-3.5 w-3.5 shrink-0" />
+            <span class="truncate">{{ loading ? t("common.loading") : label }}</span>
           </template>
         </SearchableSelect>
       </div>
       <div
-        v-if="activeConnection?.db_type !== 'elasticsearch' && activeConnection?.db_type !== 'qdrant' && activeConnection?.db_type !== 'milvus' && activeConnection?.db_type !== 'weaviate' && activeConnection?.db_type !== 'chromadb' && activeConnection?.db_type !== 'zookeeper' && !isSingleDb"
+        v-if="
+          activeConnection?.db_type !== 'elasticsearch' &&
+          activeConnection?.db_type !== 'easysearch' &&
+          activeConnection?.db_type !== 'meilisearch' &&
+          activeConnection?.db_type !== 'qdrant' &&
+          activeConnection?.db_type !== 'milvus' &&
+          activeConnection?.db_type !== 'weaviate' &&
+          activeConnection?.db_type !== 'chromadb' &&
+          activeConnection?.db_type !== 'zookeeper' &&
+          activeConnection?.db_type !== 'consul' &&
+          !isSingleDb
+        "
         class="flex items-center gap-1"
         :class="{ 'database-required-prompt': databaseRequiredVisible }"
       >
@@ -374,13 +537,17 @@ function databaseOptionIsProduction(database: string): boolean {
           :search-placeholder="t('editor.searchDatabase')"
           :empty-text="t('grid.noSearchResults')"
           :loading-text="t('common.loading')"
-          :loading="loadingDatabaseOptions[activeConnection?.id || '']"
+          :loading="loadingActiveDatabaseOptions"
           :display-name="databaseDisplayName"
+          trigger-variant="ghost"
           trigger-class="gap-1.5"
+          trigger-icon-class="h-3 w-3"
           @update:model-value="(database) => emit('changeDatabase', database)"
           @update:open="
             (open: boolean) => {
-              if (open && activeConnection) loadDatabaseOptions(activeConnection.id).catch(() => {});
+              if (!open || !activeConnection) return;
+              if (activeTab.catalog) loadCatalogDatabaseOptions(activeConnection.id, activeTab.catalog).catch(() => {});
+              else loadDatabaseOptions(activeConnection.id).catch(() => {});
             }
           "
         >
@@ -404,7 +571,7 @@ function databaseOptionIsProduction(database: string): boolean {
           </TooltipTrigger>
           <TooltipContent>{{ t("editor.clearDatabase") }}</TooltipContent>
         </Tooltip>
-        <Button v-if="activeDatabaseValue" variant="ghost" size="sm" class="h-6 px-2 text-[11px]" @click="isActiveDatabaseDefault ? emit('clearDefaultDatabase') : emit('setDefaultDatabase')">
+        <Button v-if="activeDatabaseValue && !activeTab.catalog" variant="ghost" size="sm" class="h-6 px-2 text-[11px]" @click="isActiveDatabaseDefault ? emit('clearDefaultDatabase') : emit('setDefaultDatabase')">
           <Check v-if="isActiveDatabaseDefault" class="h-3 w-3" />
           {{ isActiveDatabaseDefault ? t("editor.defaultDatabase") : t("editor.setDefaultDatabase") }}
         </Button>
@@ -419,7 +586,9 @@ function databaseOptionIsProduction(database: string): boolean {
           :loading-text="t('common.loading')"
           :loading="!!activeConnection && isLoadingSchemas(activeConnection.id, schemaDatabaseKey)"
           :clear-selected-option="supportsClearableQuerySchema(activeConnection?.db_type)"
+          trigger-variant="ghost"
           trigger-class="gap-1.5"
+          trigger-icon-class="h-3 w-3"
           @update:model-value="(schema) => emit('changeSchema', schema || undefined)"
           @update:open="
             (open: boolean) => {

@@ -18,22 +18,21 @@ export interface GitHubReleaseAsset {
   browser_download_url: string;
 }
 
-interface GitHubRelease {
-  assets?: GitHubReleaseAsset[];
-}
-
 interface AgentRegistryArtifact {
   url: string;
   size: number;
+  format?: "tar_zstd";
 }
 
 interface AgentRegistryDriver {
   version?: string;
+  min_app_version?: string;
+  jre?: string;
   jar?: AgentRegistryArtifact;
   native?: Record<string, AgentRegistryArtifact>;
 }
 
-interface AgentRegistry {
+export interface AgentRegistry {
   jres?: Record<string, { platforms?: Record<string, AgentRegistryArtifact> }>;
   drivers?: Record<string, AgentRegistryDriver>;
 }
@@ -87,14 +86,11 @@ export interface AgentDownloadCatalog {
   nativeAgents: NativeAgentDisplayEntry[];
 }
 
-const AGENTS_LATEST_RELEASE_API_URL = "https://api.github.com/repos/t8y2/dbx/releases/tags/agents-latest";
-const CNB_AGENT_REGISTRY_URL = "https://cnb.cool/dbxio.com/dbx/-/releases/download/agents-latest/agent-registry.json";
 const JDBC_PLUGIN_DOWNLOAD_URL = "https://dl.dbxio.com/releases/latest/dbx-jdbc-plugin-latest.zip";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX = "https://github.com/t8y2/dbx/releases/download/";
 const CNB_RELEASE_DOWNLOAD_PREFIX = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
 const MIN_APP_VERSION = "0.6.0";
 const driverVersionMap = driverVersions as Record<string, string>;
-const nativeDriverKeys = new Set(["oracle", "kingbase", "xugu"]);
 
 const platformLabels: Record<string, string> = {
   "macos-aarch64": "macOS (Apple Silicon)",
@@ -108,11 +104,12 @@ const platformLabels: Record<string, string> = {
 const driverLabels: Record<string, string> = {
   access: "Microsoft Access",
   bigquery: "BigQuery",
-  cassandra: "Cassandra",
+  cassandra: "Apache Cassandra",
   dameng: "Dameng",
   databend: "Databend",
   databricks: "Databricks",
   db2: "DB2",
+  duckdb: "DuckDB",
   etcd: "etcd",
   exasol: "Exasol",
   firebird: "Firebird",
@@ -121,31 +118,40 @@ const driverLabels: Record<string, string> = {
   goldendb: "GoldenDB",
   h2: "H2",
   highgo: "HighGo",
-  hive: "Hive",
+  hive: "Apache Hive",
+  ignite: "Apache Ignite",
+  ignite3: "Apache Ignite 3",
   informix: "Informix",
   iotdb: "Apache IoTDB",
   iris: "InterSystems IRIS",
-  kingbase: "KingBase",
+  kingbase: "KingbaseES",
   kylin: "Apache Kylin",
   mongodb: "MongoDB (Legacy)",
   neo4j: "Neo4j",
   "oceanbase-oracle": "OceanBase Oracle Mode",
   oracle: "Oracle",
+  rabbitmq: "RabbitMQ",
+  rocketmq: "Apache RocketMQ",
   saphana: "SAP HANA",
   snowflake: "Snowflake",
+  spanner: "Cloud Spanner",
   sundb: "SunDB",
   tdengine: "TDengine",
   teradata: "Teradata",
   trino: "Trino",
+  uxdb: "优炫 UXDB",
   vastbase: "Vastbase",
   vertica: "Vertica",
   xugu: "虚谷 XuguDB",
   yashandb: "YashanDB",
-  zookeeper: "ZooKeeper",
+  zookeeper: "Apache ZooKeeper",
 };
 
 const currentDriverKeys = Object.keys(driverVersionMap).sort((a, b) => labelForDriver(a).localeCompare(labelForDriver(b)));
-const currentJavaDriverKeys = currentDriverKeys.filter((key) => !nativeDriverKeys.has(key));
+const currentDriverKeyPattern = [...currentDriverKeys]
+  .sort((a, b) => b.length - a.length)
+  .map(escapeRegExp)
+  .join("|");
 
 const jreVersions: Record<string, string> = {
   "21": "21",
@@ -153,6 +159,10 @@ const jreVersions: Record<string, string> = {
 
 function labelForDriver(key: string): string {
   return driverLabels[key] ?? key.replace(/-/g, " ");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function assetInfo(asset: GitHubReleaseAsset): ArtifactInfo {
@@ -175,68 +185,41 @@ function siblingReleaseAssetUrl(url: string, filename: string): string {
   return separator >= 0 ? `${url.slice(0, separator + 1)}${filename}` : filename;
 }
 
-function githubReleaseAsset(name: string, size: number, tag = "agents-latest"): GitHubReleaseAsset {
-  return {
-    name,
-    size,
-    browser_download_url: `${GITHUB_RELEASE_DOWNLOAD_PREFIX}${tag}/${name}`,
-  };
-}
-
 function registryReleaseAssets(registry: AgentRegistry): GitHubReleaseAsset[] {
   const assets = new Map<string, GitHubReleaseAsset>();
+  let releaseAssetUrl: string | undefined;
   const addArtifact = (artifact: AgentRegistryArtifact | undefined, fallbackName: string) => {
     if (!artifact?.url) return;
+    releaseAssetUrl ??= artifact.url.startsWith(GITHUB_RELEASE_DOWNLOAD_PREFIX) ? artifact.url : undefined;
     const name = releaseAssetName(artifact.url, fallbackName);
     assets.set(name, { name, size: artifact.size || 0, browser_download_url: artifact.url });
   };
 
   for (const [jreKey, jre] of Object.entries(registry.jres ?? {})) {
     for (const [platformKey, artifact] of Object.entries(jre.platforms ?? {})) {
-      addArtifact(artifact, `dbx-jre-${jreKey}-${platformKey}.tar.gz`);
+      addArtifact(artifact, `dbx-jre-${jreKey}-${platformKey}.tar.zst`);
     }
   }
 
   for (const [driverKey, driver] of Object.entries(registry.drivers ?? {})) {
-    addArtifact(driver.jar, `dbx-agent-${driverKey}.jar`);
-    if (driver.version && driver.jar?.url && driver.jar.size > 0) {
-      const packageName = `dbx-agent-${driverKey}-${driver.version}.zip`;
-      assets.set(packageName, {
-        name: packageName,
-        size: 0,
-        browser_download_url: siblingReleaseAssetUrl(driver.jar.url, packageName),
-      });
-    }
+    addArtifact(driver.jar, `dbx-agent-${driverKey}-${driver.version ?? "latest"}.tar.zst`);
     for (const [platformKey, artifact] of Object.entries(driver.native ?? {})) {
-      addArtifact(artifact, `dbx-agent-${driverKey}-${platformKey}`);
-      const filename = releaseAssetName(artifact.url, "");
-      if (driver.version && filename.includes(`-${driver.version}-${platformKey}`)) {
-        const packageName = `${filename.replace(/\.exe$/, "")}.zip`;
-        assets.set(packageName, {
-          name: packageName,
-          size: 0,
-          browser_download_url: siblingReleaseAssetUrl(artifact.url, packageName),
-        });
-      }
+      addArtifact(artifact, `dbx-agent-${driverKey}-${driver.version ?? "latest"}-${platformKey}.tar.zst`);
     }
   }
 
-  for (const platformKey of Object.keys(registry.jres?.["21"]?.platforms ?? {})) {
-    const name = `dbx-agents-offline-${platformKey}.zip`;
-    assets.set(name, githubReleaseAsset(name, 0));
+  if (releaseAssetUrl) {
+    for (const platformKey of Object.keys(registry.jres?.["21"]?.platforms ?? {})) {
+      const name = `dbx-agents-offline-${platformKey}.zip`;
+      assets.set(name, {
+        name,
+        size: 0,
+        browser_download_url: siblingReleaseAssetUrl(releaseAssetUrl, name),
+      });
+    }
   }
 
   return Array.from(assets.values());
-}
-
-function hasDownloadAssets(catalog: AgentDownloadCatalog): boolean {
-  return catalog.bundles.length > 0 || catalog.drivers.length > 0 || catalog.jres.length > 0 || catalog.nativeAgents.length > 0;
-}
-
-async function fetchJson<T>(url: string, headers?: HeadersInit): Promise<T> {
-  const response = await fetch(url, { cache: "no-store", headers });
-  if (!response.ok) throw new Error(`Download catalog request failed with ${response.status}`);
-  return response.json() as Promise<T>;
 }
 
 export function downloadLinksFor(url: string): DownloadLink[] {
@@ -253,22 +236,15 @@ function assetMap(assets: GitHubReleaseAsset[]): Map<string, GitHubReleaseAsset>
   return new Map(assets.map((asset) => [asset.name, asset]));
 }
 
-export async function fetchAgentDownloadCatalog(): Promise<AgentDownloadCatalog | null> {
-  const loaders: Array<() => Promise<GitHubReleaseAsset[]>> = [
-    async () => (await fetchJson<GitHubRelease>(AGENTS_LATEST_RELEASE_API_URL, { Accept: "application/vnd.github+json" })).assets ?? [],
-    async () => registryReleaseAssets(await fetchJson<AgentRegistry>(CNB_AGENT_REGISTRY_URL)),
-  ];
-
-  for (const loadAssets of loaders) {
-    try {
-      const catalog = buildAgentDownloadCatalog(await loadAssets());
-      if (hasDownloadAssets(catalog)) return catalog;
-    } catch {
-      // Try the next synchronized release source.
-    }
-  }
-
-  return null;
+export function buildAgentDownloadCatalogFromRegistry(registry: AgentRegistry): AgentDownloadCatalog {
+  const assets = registryReleaseAssets(registry);
+  return {
+    jdbcPlugin: buildJdbcPluginDownloadEntry(),
+    bundles: buildOfflineBundleEntries(assets),
+    drivers: buildDriverEntriesFromRegistry(registry),
+    jres: buildJreEntries(assets),
+    nativeAgents: buildNativeAgentEntries(assets),
+  };
 }
 
 export function buildAgentDownloadCatalog(assets: GitHubReleaseAsset[]): AgentDownloadCatalog {
@@ -292,7 +268,7 @@ export function buildJdbcPluginDownloadEntry(): JdbcPluginDownloadEntry {
 export function buildJreEntries(assets: GitHubReleaseAsset[]): JreDisplayEntry[] {
   return assets
     .map((asset) => {
-      const match = /^dbx-jre-(\d+)-(.+)\.tar\.gz$/.exec(asset.name);
+      const match = /^dbx-jre-(\d+)-(.+)\.tar\.(?:zst|gz)$/.exec(asset.name);
       if (!match) return null;
 
       const [, jreKey, platformKey] = match;
@@ -313,13 +289,10 @@ export function buildJreEntries(assets: GitHubReleaseAsset[]): JreDisplayEntry[]
 export function buildDriverEntries(assets: GitHubReleaseAsset[]): DriverDisplayEntry[] {
   const byName = assetMap(assets);
 
-  return currentJavaDriverKeys
+  return currentDriverKeys
     .map((key) => {
       const version = driverVersionMap[key] ?? "";
-      const asset =
-        byName.get(`dbx-agent-${key}-${version}.zip`) ??
-        byName.get(`dbx-agent-${key}-${version}.jar`) ??
-        byName.get(`dbx-agent-${key}.jar`);
+      const asset = byName.get(`dbx-agent-${key}-${version}.tar.zst`) ?? byName.get(`dbx-agent-${key}-${version}.zip`) ?? byName.get(`dbx-agent-${key}-${version}.jar`) ?? byName.get(`dbx-agent-${key}.jar`);
       if (!asset) return null;
 
       return {
@@ -334,14 +307,33 @@ export function buildDriverEntries(assets: GitHubReleaseAsset[]): DriverDisplayE
     .filter((entry): entry is DriverDisplayEntry => entry !== null);
 }
 
+function buildDriverEntriesFromRegistry(registry: AgentRegistry): DriverDisplayEntry[] {
+  return Object.entries(registry.drivers ?? {})
+    .map(([key, driver]) => {
+      const jar = driver.jar;
+      if (!jar?.url || jar.size <= 0) return null;
+
+      return {
+        key,
+        label: labelForDriver(key),
+        version: driver.version ?? driverVersionMap[key] ?? "",
+        minAppVersion: driver.min_app_version ?? MIN_APP_VERSION,
+        jar: { url: jar.url, size: jar.size },
+        jre: driver.jre ?? "21",
+      };
+    })
+    .filter((entry): entry is DriverDisplayEntry => entry !== null)
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
 export function buildNativeAgentEntries(assets: GitHubReleaseAsset[]): NativeAgentDisplayEntry[] {
   const entries = new Map<string, NativeAgentDisplayEntry & { packaged: boolean }>();
   const platforms = "macos-aarch64|macos-x64|linux-aarch64|linux-x64|windows-aarch64|windows-x64";
 
   for (const asset of assets) {
-    const packageMatch = new RegExp(`^dbx-agent-(oracle|kingbase|xugu)-(.+)-(${platforms})\\.zip$`).exec(asset.name);
-    const versionedMatch = new RegExp(`^dbx-agent-(oracle|kingbase|xugu)-(.+)-(${platforms})(?:\\.exe)?$`).exec(asset.name);
-    const legacyMatch = new RegExp(`^dbx-agent-(oracle|kingbase|xugu)-(${platforms})(?:\\.exe)?$`).exec(asset.name);
+    const packageMatch = new RegExp(`^dbx-agent-(${currentDriverKeyPattern})-(.+)-(${platforms})\\.(?:tar\\.zst|zip)$`).exec(asset.name);
+    const versionedMatch = new RegExp(`^dbx-agent-(${currentDriverKeyPattern})-(.+)-(${platforms})(?:\\.exe)?$`).exec(asset.name);
+    const legacyMatch = new RegExp(`^dbx-agent-(${currentDriverKeyPattern})-(${platforms})(?:\\.exe)?$`).exec(asset.name);
     const match = packageMatch ?? versionedMatch ?? legacyMatch;
     if (!match) continue;
 
@@ -349,7 +341,6 @@ export function buildNativeAgentEntries(assets: GitHubReleaseAsset[]): NativeAge
     const key = match[1];
     const version = legacyMatch ? (driverVersionMap[key] ?? "") : match[2];
     const platformKey = legacyMatch ? match[2] : match[3];
-    if (!nativeDriverKeys.has(key)) continue;
     const entryKey = `${key}:${platformKey}`;
     const existing = entries.get(entryKey);
     if (existing?.packaged && !packaged) continue;

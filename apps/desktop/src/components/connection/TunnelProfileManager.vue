@@ -6,7 +6,9 @@ import { Input } from "@/components/ui/input";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Loader2, Plus, Trash2 } from "@lucide/vue";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Loader2, Plus, Trash2, FolderOpen } from "@lucide/vue";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { createTunnelProfile, createTunnelProfileTestGuard, tunnelProfileSummary, type TunnelProfileType } from "@/lib/connection/tunnelProfiles";
@@ -119,9 +121,9 @@ function removeSelected() {
 function updateSshAuthMethod(value: unknown) {
   const profile = selectedSsh.value;
   if (!profile) return;
-  profile.auth_method = value === "key" ? "key" : value === "none" ? "none" : "password";
-  if (profile.auth_method !== "password") profile.password = "";
-  if (profile.auth_method !== "key") {
+  profile.auth_method = value === "key" ? "key" : value === "key+password" ? "key+password" : value === "none" ? "none" : "password";
+  if (profile.auth_method !== "password" && profile.auth_method !== "key+password") profile.password = "";
+  if (profile.auth_method !== "key" && profile.auth_method !== "key+password") {
     profile.key_path = "";
     profile.key_passphrase = "";
   }
@@ -133,6 +135,19 @@ function updateProxyType(value: unknown) {
   profile.proxy_type = value === "http" ? "http" : "socks5";
 }
 
+async function browseSshKeyPath(target?: { key_path?: string } | null) {
+  if (isTauriRuntime()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      title: "Select SSH Private Key",
+      multiple: false,
+    });
+    if (selected && typeof selected === "string" && target) {
+      target.key_path = selected;
+    }
+  }
+}
+
 async function save() {
   if (isSaving.value) return;
   invalidateProfileTest();
@@ -141,7 +156,7 @@ async function save() {
     await store.saveProfiles(cloneProfiles(draft.value));
     toast(t("settings.tunnelsSaved"));
   } catch (error) {
-    toast(t("settings.tunnelsSaveFailed", { message: translateBackendError(t, String(error)) }), 5000);
+    toast(t("settings.tunnelsSaveFailed", { message: translateBackendError(t, error) }), 5000);
   } finally {
     isSaving.value = false;
   }
@@ -160,7 +175,7 @@ async function testSelected() {
     testResult.value = { ok: true, message: message ? t("settings.tunnelsTestSuccess") + ": " + message : t("settings.tunnelsTestSuccess") };
   } catch (error) {
     if (!testGuard.isCurrent(requestId, profile)) return;
-    testResult.value = { ok: false, message: t("settings.tunnelsTestFailed", { message: translateBackendError(t, String(error)) }) };
+    testResult.value = { ok: false, message: t("settings.tunnelsTestFailed", { message: translateBackendError(t, error) }) };
   } finally {
     if (testGuard.isCurrent(requestId, selectedSsh.value || selectedProxy.value)) isTesting.value = false;
   }
@@ -175,7 +190,14 @@ async function testSelected() {
       <p v-if="!draft.length" class="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
         {{ t("settings.tunnelsEmpty") }}
       </p>
-      <button v-for="profile in draft" :key="profile.id" type="button" class="flex min-h-10 items-center gap-2 rounded-md border px-3 text-left text-xs transition-colors" :class="profile.id === selectedId ? 'border-primary bg-primary/5' : 'hover:bg-muted/50'" @click="selectedId = profile.id">
+      <button
+        v-for="profile in draft"
+        :key="profile.id"
+        type="button"
+        class="flex min-h-10 items-center gap-2 rounded-md border px-3 text-left text-xs transition-colors"
+        :class="profile.id === selectedId ? 'tunnel-profile-option--selected border-primary bg-primary/5' : 'hover:bg-muted/50'"
+        @click="selectedId = profile.id"
+      >
         <span class="shrink-0 rounded border bg-muted/40 px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">{{ profileTypeLabel(profile) }}</span>
         <span class="min-w-0 flex-1 truncate">{{ profileDisplayName(profile) }}</span>
         <span class="min-w-0 truncate text-muted-foreground">{{ tunnelProfileSummary(profile) }}</span>
@@ -229,19 +251,30 @@ async function testSelected() {
             <SelectContent>
               <SelectItem value="password">{{ t("connection.sshAuthMethodPassword") }}</SelectItem>
               <SelectItem value="key">{{ t("connection.sshAuthMethodKey") }}</SelectItem>
+              <SelectItem value="key+password">{{ t("connection.sshAuthMethodKeyPassword") }}</SelectItem>
               <SelectItem value="none">{{ t("connection.sshAuthMethodNone") }}</SelectItem>
             </SelectContent>
           </Select>
         </div>
-        <div v-if="!selectedSsh.auth_method || selectedSsh.auth_method === 'password'" class="grid grid-cols-4 items-center gap-4">
+        <div v-if="!selectedSsh.auth_method || selectedSsh.auth_method === 'password' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.sshPassword") }}</Label>
           <PasswordInput v-model="selectedSsh.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" />
         </div>
-        <div v-if="selectedSsh.auth_method === 'key'" class="grid grid-cols-4 items-center gap-4">
+        <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.sshKeyPath") }}</Label>
-          <Input v-model="selectedSsh.key_path" class="col-span-3" placeholder="~/.ssh/id_rsa" />
+          <div class="col-span-3 flex items-center gap-1">
+            <Input v-model="selectedSsh.key_path" class="flex-1" placeholder="~/.ssh/id_rsa" />
+            <Tooltip v-if="isTauriRuntime()">
+              <TooltipTrigger as-child>
+                <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="browseSshKeyPath(selectedSsh)">
+                  <FolderOpen class="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{{ t("connection.sshKeyPathBrowse") }}</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
-        <div v-if="selectedSsh.auth_method === 'key'" class="grid grid-cols-4 items-center gap-4">
+        <div v-if="selectedSsh.auth_method === 'key' || selectedSsh.auth_method === 'key+password'" class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
           <PasswordInput v-model="selectedSsh.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" />
         </div>
@@ -330,3 +363,20 @@ async function testSelected() {
     </p>
   </div>
 </template>
+
+<style>
+html.dbx-legacy-webview .tunnel-profile-option--selected {
+  color: var(--foreground) !important;
+  border-color: var(--ring) !important;
+  background-color: var(--muted) !important;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+html.dbx-legacy-webview .tunnel-profile-option--selected:hover {
+  background-color: var(--accent) !important;
+}
+
+html.dbx-legacy-webview .tunnel-profile-option--selected .text-muted-foreground {
+  color: var(--muted-foreground) !important;
+}
+</style>

@@ -4,10 +4,9 @@ import { describe, expect, it } from "vitest";
 import { createStatementGutterMarkerDom, shouldShowStatementGutter } from "@/lib/editor/codemirrorStatementGutter";
 
 describe("CodeMirror statement gutter marker", () => {
-  it("omits the gutter when run buttons and status markers are absent", () => {
-    expect(shouldShowStatementGutter(false, 0)).toBe(false);
-    expect(shouldShowStatementGutter(true, 0)).toBe(true);
-    expect(shouldShowStatementGutter(false, 1)).toBe(true);
+  it("keeps gutter visibility controlled by the run-button preference", () => {
+    expect(shouldShowStatementGutter(false)).toBe(false);
+    expect(shouldShowStatementGutter(true)).toBe(true);
   });
 
   it("keeps execution status inside the run button column", () => {
@@ -36,5 +35,18 @@ describe("CodeMirror statement gutter marker", () => {
     expect(marker.classList.contains("cm-statement-execution-marker--error")).toBe(true);
     expect(marker.querySelectorAll(".cm-statement-execution-badge")).toHaveLength(0);
     expect(marker.getAttribute("aria-label")).toBe("1 statement failed");
+  });
+
+  it("renders an animated running marker", () => {
+    const marker = createStatementGutterMarkerDom({
+      canExecute: false,
+      executeLabel: "Execute SQL",
+      status: "running",
+      statusLabel: "1 statement running",
+    });
+
+    expect(marker.classList.contains("cm-statement-execution-marker--running")).toBe(true);
+    expect(marker.querySelector(".cm-statement-execution-spinner")).not.toBeNull();
+    expect(marker.getAttribute("aria-label")).toBe("1 statement running");
   });
 });

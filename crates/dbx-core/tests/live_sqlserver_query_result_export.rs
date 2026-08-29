@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connection::ConnectionConfig {
     dbx_core::models::connection::ConnectionConfig {
+        docs_notes_path: None,
         id: id.to_string(),
         name: id.to_string(),
+        note: String::new(),
         db_type: DatabaseType::SqlServer,
         driver_profile: None,
         driver_label: None,
@@ -20,7 +22,9 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         username: std::env::var("DBX_LIVE_SQLSERVER_USER").unwrap_or_else(|_| "sa".to_string()),
         password: std::env::var("DBX_LIVE_SQLSERVER_PASSWORD").expect("DBX_LIVE_SQLSERVER_PASSWORD"),
         database: Some(database.to_string()),
+        default_schema: None,
         visible_databases: None,
+        visible_database_patterns: None,
         visible_schemas: None,
         attached_databases: Vec::new(),
         init_script: None,
@@ -46,6 +50,8 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_cluster_nodes: String::new(),
         redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
         redis_scan_page_size: None,
+        redis_database_aliases: Default::default(),
+        redis_key_templates: Vec::new(),
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
         informix_server: String::new(),
@@ -53,9 +59,11 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         jdbc_driver_class: None,
         jdbc_driver_paths: Vec::new(),
         one_time: false,
+        save_password: true,
         read_only: false,
         is_production: false,
         production_databases: vec![],
+        show_system_schemas: false,
         database_info: None,
     }
 }
@@ -93,6 +101,7 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         connection_id: connection_id.to_string(),
         database: database.clone(),
         schema: Some("dbo".to_string()),
+        catalog: None,
         sql: sql.to_string(),
         query_base_sql: sql.to_string(),
         setup_sql: Vec::new(),
@@ -109,6 +118,12 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         client_session_id: None,
         execution_id: Some(format!("live-sqlserver-xlsx-{suffix}")),
         date_time_format: None,
+        export_table_name: None,
+        export_column_types: None,
+        column_comments: None,
+        auto_filter: None,
+        identifier_quote: None,
+        numeric_column_right_align: false,
     };
     let rows_exported = AtomicU64::new(0);
     let done_seen = AtomicBool::new(false);

@@ -36,6 +36,11 @@ pub struct BuildViewDdlInput {
     pub schema: Option<String>,
     pub name: String,
     pub source: String,
+    /// Driver-reported identifier quote (e.g. `` ` `` for Kingbase MySQL
+    /// compatibility mode). When set, overrides the database_type-based quote
+    /// selection so hyphenated schemas render as valid identifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +162,12 @@ pub fn build_executable_object_source_statements(input: EditableObjectSourceSqlI
         return Ok(vec![executable_oracle_view_ddl(input.schema.as_deref(), &input.name, source)]);
     }
 
+    if is_oracle_like(input.database_type)
+        && matches!(input.object_type, ObjectSourceKind::Function | ObjectSourceKind::Procedure)
+    {
+        return Ok(vec![executable_oracle_routine_ddl(source)]);
+    }
+
     if input.database_type == DatabaseType::Informix && input.object_type == ObjectSourceKind::View {
         return Ok(executable_informix_view_statements(input.schema.as_deref(), &input.name, source));
     }
@@ -202,6 +213,10 @@ pub fn build_editable_object_source(input: EditableObjectSourceSqlInput) -> Stri
     {
         return ensure_semicolon(source.trim());
     }
+    if input.database_type == DatabaseType::Mysql && input.object_type == ObjectSourceKind::View {
+        // Existing view DDL opens as ALTER, while save must preserve CREATE for new views and TiDB.
+        return executable_mysql_view_ddl(&source);
+    }
     match build_executable_object_source_statements(input) {
         Ok(statements) => statements.into_iter().next().unwrap_or_default(),
         Err(_) => ensure_semicolon(source.trim()),
@@ -214,7 +229,13 @@ pub fn build_view_ddl_sql(input: BuildViewDdlInput) -> String {
         return ensure_semicolon(source);
     }
 
-    let qualified_name = if matches!(input.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)) {
+    // Backtick-quoting is used for MySQL-family engines and for connections
+    // whose driver reports a backtick identifier quote (Kingbase MySQL
+    // compatibility mode); everything else keeps the PostgreSQL double quote.
+    let use_backtick = input.identifier_quote.as_deref() == Some("`")
+        || (input.identifier_quote.is_none()
+            && matches!(input.database_type, Some(DatabaseType::Mysql | DatabaseType::Goldendb)));
+    let qualified_name = if use_backtick {
         mysql_qualified_name(input.schema.as_deref(), &input.name)
     } else {
         postgres_qualified_name(input.schema.as_deref(), &input.name)
@@ -302,6 +323,7 @@ fn is_postgres_like(database_type: DatabaseType) -> bool {
             | DatabaseType::Questdb
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
+            | DatabaseType::Uxdb
             | DatabaseType::Vastbase
     )
 }
@@ -325,7 +347,9 @@ fn object_type_keyword(object_type: &ObjectSourceKind) -> &'static str {
         ObjectSourceKind::Procedure => "PROCEDURE",
         ObjectSourceKind::Function => "FUNCTION",
         ObjectSourceKind::Trigger => "TRIGGER",
+        ObjectSourceKind::Event => "EVENT",
         ObjectSourceKind::Sequence => "SEQUENCE",
+        ObjectSourceKind::Synonym => "SYNONYM",
         ObjectSourceKind::Package => "PACKAGE",
         ObjectSourceKind::PackageBody => "PACKAGE BODY",
         ObjectSourceKind::Type => "TYPE",
@@ -437,6 +461,31 @@ fn executable_oracle_view_ddl(schema: Option<&str>, name: &str, source: &str) ->
     }
 
     format!("CREATE OR REPLACE VIEW {} AS\n{}", postgres_qualified_name(schema, name), ensure_semicolon(trimmed))
+}
+
+fn executable_oracle_routine_ddl(source: &str) -> String {
+    let trimmed = source.trim();
+    if Regex::new(r"(?i)^(?:PROCEDURE|FUNCTION)\b").unwrap().is_match(trimmed) {
+        return ensure_semicolon(&format!("CREATE OR REPLACE {trimmed}"));
+    }
+    ensure_semicolon(trimmed)
+}
+
+fn executable_mysql_view_ddl(source: &str) -> String {
+    let trimmed = source.trim();
+    let statement_start = leading_sql_statement_start(trimmed);
+    let executable = &trimmed[statement_start..];
+    let create_view = Regex::new(
+        r"(?is)^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*(?:UNDEFINED|MERGE|TEMPTABLE)\s+)?(?:DEFINER\s*=\s*(?:(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)\s*@\s*(?:`(?:``|[^`])+`|'(?:''|[^'])+'|[^\s]+)|CURRENT_USER(?:\(\))?)\s+)?(?:SQL\s+SECURITY\s+(?:DEFINER|INVOKER)\s+)?VIEW\s+",
+    )
+    .unwrap();
+    if create_view.is_match(executable) {
+        let create = Regex::new(r"(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?").unwrap();
+        let replaced = create.replace(executable, "ALTER ");
+        return ensure_semicolon(&format!("{}{}", &trimmed[..statement_start], replaced));
+    }
+
+    ensure_semicolon(trimmed)
 }
 
 fn executable_informix_view_statements(schema: Option<&str>, name: &str, source: &str) -> Vec<String> {
@@ -858,7 +907,10 @@ fn routine_name_changed(source_name: &str, saved_name: &str) -> bool {
 }
 
 fn replace_sqlserver_create_with_alter(source: &str) -> String {
-    Regex::new(r"(?i)^(?:CREATE\s+(?:OR\s+ALTER\s+)?|ALTER\s+)").unwrap().replace(source, "ALTER ").to_string()
+    let statement_start = leading_sql_statement_start(source);
+    let executable = &source[statement_start..];
+    let create = Regex::new(r"(?i)^CREATE\s+(?:OR\s+ALTER\s+)?").unwrap();
+    format!("{}{}", &source[..statement_start], create.replace(executable, "ALTER "))
 }
 
 fn build_sqlserver_alter_view_sql(schema: Option<&str>, name: &str, source: &str) -> String {
@@ -893,6 +945,8 @@ fn parse_object_source_kind(value: &str) -> Option<ObjectSourceKind> {
         Some(ObjectSourceKind::Trigger)
     } else if value.eq_ignore_ascii_case("SEQUENCE") {
         Some(ObjectSourceKind::Sequence)
+    } else if value.eq_ignore_ascii_case("SYNONYM") {
+        Some(ObjectSourceKind::Synonym)
     } else if value.eq_ignore_ascii_case("PACKAGE") {
         Some(ObjectSourceKind::Package)
     } else if value.eq_ignore_ascii_case("PACKAGE BODY") || value.eq_ignore_ascii_case("PACKAGE_BODY") {
@@ -918,6 +972,19 @@ mod tests {
             name: "refresh_cache".to_string(),
             source: source.to_string(),
         }
+    }
+
+    fn assert_sqlserver_editable_and_executable(object_type: ObjectSourceKind, source: &str, expected: &str) {
+        let input = EditableObjectSourceSqlInput {
+            database_type: DatabaseType::SqlServer,
+            object_type,
+            schema: Some("dbo".to_string()),
+            name: "usp_demo".to_string(),
+            source: source.to_string(),
+        };
+
+        assert_eq!(build_editable_object_source(input.clone()), expected);
+        assert_eq!(build_executable_object_source_sql(input).unwrap(), expected);
     }
 
     fn informix_view_statements(name: &str, source: &str) -> Vec<String> {
@@ -1000,6 +1067,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sql, "ALTER FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1 END;");
+    }
+
+    #[test]
+    fn sqlserver_commented_procedure_source_preserves_comments_and_uses_alter() {
+        let source = "-- =============================================\n-- Author: DBX\n-- Description: issue 2269 reproduction\n-- =============================================\n\nCREATE PROCEDURE [dbo].[usp_demo]\nAS\nBEGIN\n    SELECT 1;\nEND;";
+        let expected = "-- =============================================\n-- Author: DBX\n-- Description: issue 2269 reproduction\n-- =============================================\n\nALTER PROCEDURE [dbo].[usp_demo]\nAS\nBEGIN\n    SELECT 1;\nEND;";
+
+        assert_sqlserver_editable_and_executable(ObjectSourceKind::Procedure, source, expected);
+    }
+
+    #[test]
+    fn sqlserver_block_commented_function_source_preserves_comment_and_uses_alter() {
+        let source = "/* keep this function header */\nCREATE OR ALTER FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1 END;";
+        let expected =
+            "/* keep this function header */\nALTER FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1 END;";
+
+        assert_sqlserver_editable_and_executable(ObjectSourceKind::Function, source, expected);
+    }
+
+    #[test]
+    fn sqlserver_commented_alter_source_remains_unchanged() {
+        let source = "-- keep this note\nALTER PROCEDURE dbo.usp_demo AS SELECT 1;";
+
+        assert_sqlserver_editable_and_executable(ObjectSourceKind::Procedure, source, source);
+    }
+
+    #[test]
+    fn sqlserver_unclosed_block_comment_source_remains_unchanged() {
+        let source = "/* unclosed header\nCREATE PROCEDURE dbo.usp_demo AS SELECT 1;";
+
+        assert_sqlserver_editable_and_executable(ObjectSourceKind::Procedure, source, source);
+    }
+
+    #[test]
+    fn sqlserver_leading_whitespace_before_procedure_uses_alter() {
+        let source = "\n \tCREATE PROCEDURE dbo.usp_demo AS SELECT 1;\n";
+
+        assert_sqlserver_editable_and_executable(
+            ObjectSourceKind::Procedure,
+            source,
+            "ALTER PROCEDURE dbo.usp_demo AS SELECT 1;",
+        );
     }
 
     #[test]
@@ -1485,6 +1594,7 @@ mod tests {
             schema: Some("public".to_string()),
             name: "active users".to_string(),
             source: " SELECT id, name FROM users WHERE active ".to_string(),
+            identifier_quote: None,
         });
 
         assert_eq!(
@@ -1500,6 +1610,7 @@ mod tests {
             schema: Some("reporting".to_string()),
             name: "active_users".to_string(),
             source: "CREATE ALGORITHM=UNDEFINED VIEW `active_users` AS SELECT `id` FROM `users`".to_string(),
+            identifier_quote: None,
         });
 
         assert_eq!(sql, "CREATE ALGORITHM=UNDEFINED VIEW `active_users` AS SELECT `id` FROM `users`;");
@@ -1512,9 +1623,36 @@ mod tests {
             schema: Some("reporting".to_string()),
             name: "active_users".to_string(),
             source: "SELECT id FROM users".to_string(),
+            identifier_quote: None,
         });
 
         assert_eq!(sql, "CREATE VIEW `reporting`.`active_users` AS\nSELECT id FROM users;");
+    }
+
+    #[test]
+    fn view_ddl_uses_backtick_quote_when_identifier_quote_reports_mysql_compat() {
+        let sql = build_view_ddl_sql(BuildViewDdlInput {
+            database_type: Some(DatabaseType::Kingbase),
+            schema: Some("audit-schema".to_string()),
+            name: "active_users".to_string(),
+            source: "SELECT id FROM users".to_string(),
+            identifier_quote: Some("`".to_string()),
+        });
+
+        assert_eq!(sql, "CREATE OR REPLACE VIEW `audit-schema`.`active_users` AS\nSELECT id FROM users;");
+    }
+
+    #[test]
+    fn view_ddl_keeps_double_quote_without_mysql_compat_identifier_quote() {
+        let sql = build_view_ddl_sql(BuildViewDdlInput {
+            database_type: Some(DatabaseType::Kingbase),
+            schema: Some("audit-schema".to_string()),
+            name: "active_users".to_string(),
+            source: "SELECT id FROM users".to_string(),
+            identifier_quote: None,
+        });
+
+        assert_eq!(sql, "CREATE OR REPLACE VIEW \"audit-schema\".\"active_users\" AS\nSELECT id FROM users;");
     }
 
     #[test]
@@ -1532,8 +1670,72 @@ mod tests {
     }
 
     #[test]
+    fn oracle_like_bare_procedure_source_saves_as_create_or_replace() {
+        let source = "PROCEDURE refresh_cache AS\nBEGIN\n  DELETE FROM cache_entries;\n  COMMIT;\nEND;";
+
+        for database_type in [DatabaseType::Oracle, DatabaseType::Dameng] {
+            let statements =
+                build_executable_object_source_statements(input(database_type, ObjectSourceKind::Procedure, source))
+                    .unwrap();
+
+            assert_eq!(
+                statements,
+                vec!["CREATE OR REPLACE PROCEDURE refresh_cache AS\nBEGIN\n  DELETE FROM cache_entries;\n  COMMIT;\nEND;"]
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_like_bare_function_source_saves_as_create_or_replace() {
+        for database_type in [DatabaseType::Oracle, DatabaseType::Dameng] {
+            let statements = build_executable_object_source_statements(input(
+                database_type,
+                ObjectSourceKind::Function,
+                "FUNCTION refresh_cache RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;",
+            ))
+            .unwrap();
+
+            assert_eq!(
+                statements,
+                vec!["CREATE OR REPLACE FUNCTION refresh_cache RETURN NUMBER AS\nBEGIN\n  RETURN 1;\nEND;"]
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_routine_create_prefix_is_not_duplicated() {
+        for source in [
+            "CREATE PROCEDURE refresh_cache AS BEGIN NULL; END;",
+            "CREATE OR REPLACE PROCEDURE refresh_cache AS BEGIN NULL; END;",
+        ] {
+            let statements = build_executable_object_source_statements(input(
+                DatabaseType::Oracle,
+                ObjectSourceKind::Procedure,
+                source,
+            ))
+            .unwrap();
+
+            assert_eq!(statements, vec![source]);
+        }
+    }
+
+    #[test]
+    fn non_oracle_bare_routine_source_is_unchanged() {
+        let source = "PROCEDURE refresh_cache AS BEGIN NULL; END;";
+        let statements = build_executable_object_source_statements(input(
+            DatabaseType::Postgres,
+            ObjectSourceKind::Procedure,
+            source,
+        ))
+        .unwrap();
+
+        assert_eq!(statements, vec![source]);
+    }
+
+    #[test]
     fn parses_programmable_metadata_object_kinds() {
         assert_eq!(parse_object_source_kind("TRIGGER"), Some(ObjectSourceKind::Trigger));
+        assert_eq!(parse_object_source_kind("SYNONYM"), Some(ObjectSourceKind::Synonym));
         assert_eq!(parse_object_source_kind("TYPE"), Some(ObjectSourceKind::Type));
         assert_eq!(parse_object_source_kind("TYPE_BODY"), Some(ObjectSourceKind::TypeBody));
         assert_eq!(parse_object_source_kind("PACKAGE BODY"), Some(ObjectSourceKind::PackageBody));
@@ -1643,6 +1845,73 @@ mod tests {
         });
 
         assert_eq!(sql, "CREATE PROCEDURE `refresh_cache`() BEGIN SELECT 1; END;");
+    }
+
+    #[test]
+    fn mysql_view_source_opened_for_editing_uses_alter_view() {
+        let source = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `new_view` AS select `base_plugins`.`id` AS `id` from `base_plugins`";
+        let expected = "ALTER ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `new_view` AS select `base_plugins`.`id` AS `id` from `base_plugins`;";
+        let mut input = EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dol_test".to_string()),
+            name: "new_view".to_string(),
+            source: source.to_string(),
+        };
+
+        let editable = build_editable_object_source(input.clone());
+        assert_eq!(editable, expected);
+        input.source = editable;
+        assert_eq!(build_executable_object_source_sql(input).unwrap(), expected);
+    }
+
+    #[test]
+    fn mysql_new_view_create_source_remains_create() {
+        let source = "CREATE VIEW `new_view` AS SELECT 1 AS `id`";
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dol_test".to_string()),
+            name: "new_view".to_string(),
+            source: source.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, "CREATE VIEW `new_view` AS SELECT 1 AS `id`;");
+    }
+
+    #[test]
+    fn mysql_new_view_create_source_preserves_leading_comments() {
+        let source =
+            "-- keep this view note\n/* and this block */\nCREATE OR REPLACE VIEW `new_view` AS SELECT 1 AS `id`";
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dol_test".to_string()),
+            name: "new_view".to_string(),
+            source: source.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "-- keep this view note\n/* and this block */\nCREATE OR REPLACE VIEW `new_view` AS SELECT 1 AS `id`;"
+        );
+    }
+
+    #[test]
+    fn mysql_view_alter_source_remains_unchanged() {
+        let source = "ALTER ALGORITHM=MERGE VIEW `new_view` AS SELECT 2 AS `id`;";
+        let sql = build_executable_object_source_sql(EditableObjectSourceSqlInput {
+            database_type: DatabaseType::Mysql,
+            object_type: ObjectSourceKind::View,
+            schema: Some("dol_test".to_string()),
+            name: "new_view".to_string(),
+            source: source.to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(sql, source);
     }
 
     #[test]

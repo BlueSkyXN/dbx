@@ -1,7 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import type { ColumnInfo } from "../../apps/desktop/src/types/database.ts";
-import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesTarget, tableDataCopyColumnOptions } from "../../apps/desktop/src/lib/table/tableClipboard.ts";
+import { defaultPasteTableMode, pasteTableModeCopiesData, supportsWholeRowTableDataCopy, tableClipboardMatchesSingleSource, tableClipboardMatchesTarget, tableClipboardMenuState, tableDataCopyColumnOptions } from "../../apps/desktop/src/lib/table/tableClipboard.ts";
 
 test("table clipboard entries must match the paste target context", () => {
   const target = { connectionId: "c1", database: "app", schema: "public" };
@@ -12,6 +12,25 @@ test("table clipboard entries must match the paste target context", () => {
   assert.equal(tableClipboardMatchesTarget([{ connectionId: "c1", database: "app", schema: "audit" }], target), false);
   assert.equal(tableClipboardMatchesTarget([], target), false);
   assert.equal(tableClipboardMatchesTarget([{ connectionId: "c1", database: "app" }], null), false);
+});
+
+test("table clipboard identifies only its exact single source table", () => {
+  const users = { connectionId: "c1", database: "app", schema: "public", tableName: "users" };
+
+  assert.equal(tableClipboardMatchesSingleSource([users], users), true);
+  assert.equal(tableClipboardMatchesSingleSource([users], { ...users, tableName: "orders" }), false);
+  assert.equal(tableClipboardMatchesSingleSource([{ ...users, schema: "audit" }], users), false);
+  assert.equal(tableClipboardMatchesSingleSource([users, { ...users, tableName: "orders" }], users), false);
+});
+
+test("table clipboard menu state supports paste and replacing the copied source", () => {
+  const users = { connectionId: "c1", database: "app", schema: "public", tableName: "users" };
+
+  assert.equal(tableClipboardMenuState([], users), "copy");
+  assert.equal(tableClipboardMenuState([users], users), "paste");
+  assert.equal(tableClipboardMenuState([users], { ...users, tableName: "orders" }), "copy-and-paste");
+  assert.equal(tableClipboardMenuState([{ ...users, schema: "audit" }], users), "copy");
+  assert.equal(tableClipboardMenuState([{ ...users, schema: "audit" }], users, true), "copy-and-paste");
 });
 
 test("whole-row table data copy is enabled for known database types", () => {
@@ -55,6 +74,34 @@ test("table data copy uses only writable columns for first-class databases", () 
   });
   assert.deepEqual(tableDataCopyColumnOptions("mysql", [{ ...columns[0], extra: "auto_increment" }, { ...columns[1] }, { ...columns[2], extra: "STORED GENERATED" }]), {
     columns: ["id", "name"],
+    postgresOverridingSystemValue: false,
+    sqlserverIdentityInsert: false,
+  });
+});
+
+test("table data copy skips only SQL Server rowversion types", () => {
+  const column = (name: string, dataType: string): ColumnInfo => ({
+    name,
+    data_type: dataType,
+    is_nullable: true,
+    column_default: null,
+    is_primary_key: false,
+    extra: null,
+  });
+  const sqlServerColumns = [{ ...column("id", "int"), extra: "identity(1,1)" }, column("name", "nvarchar(64)"), column("legacy_version", "timestamp"), column("row_version", "  ROWVERSION  "), column("fixed_binary", "binary(8)"), column("variable_binary", "varbinary(8)")];
+
+  assert.deepEqual(tableDataCopyColumnOptions("sqlserver", sqlServerColumns), {
+    columns: ["id", "name", "fixed_binary", "variable_binary"],
+    postgresOverridingSystemValue: false,
+    sqlserverIdentityInsert: true,
+  });
+  assert.deepEqual(tableDataCopyColumnOptions("postgres", [column("updated_at", "timestamp")]), {
+    columns: ["updated_at"],
+    postgresOverridingSystemValue: false,
+    sqlserverIdentityInsert: false,
+  });
+  assert.deepEqual(tableDataCopyColumnOptions("mysql", [column("updated_at", "timestamp")]), {
+    columns: ["updated_at"],
     postgresOverridingSystemValue: false,
     sqlserverIdentityInsert: false,
   });

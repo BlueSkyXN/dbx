@@ -27,6 +27,7 @@ export interface SelectionSummary {
   rowCount: number;
   numericCount: number;
   sum: number;
+  average: number | null;
 }
 
 export function parseClipboardTable(text: string): string[][] {
@@ -37,6 +38,13 @@ export function parseClipboardTable(text: string): string[][] {
 
 export function normalizeSelectedColumnIndexes(columnIndexes: Iterable<number>): number[] {
   return [...new Set(columnIndexes)].filter((index) => index >= 0).sort((a, b) => a - b);
+}
+
+export function dedupeColumnIndexes(columnIndexes: Iterable<number>): number[] {
+  // Deduplicate while preserving the first visible occurrence (insertion order)
+  // instead of numeric order. Used by the copy/extractor path so drag-reordered
+  // columns stay in the order the user sees them.
+  return [...new Set(columnIndexes)].filter((index) => index >= 0);
 }
 
 export function normalizeSelectionRange(anchor: CellPosition, focus: CellPosition): CellSelectionRange {
@@ -116,52 +124,25 @@ export function summarizeSelection(selection: SelectionData): SelectionSummary {
     rowCount: selection.rows.length,
     numericCount,
     sum,
+    average: numericCount > 0 && Number.isFinite(sum) ? sum / numericCount : null,
   };
 }
 
-function displayValue(value: GridCellValue): string {
-  if (value === null) return "NULL";
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+export function createPendingSelectionSummary(cellCount: number, rowCount: number): SelectionSummary {
+  return {
+    cellCount,
+    rowCount,
+    numericCount: 0,
+    sum: 0,
+    average: null,
+  };
 }
 
-function csvValue(value: GridCellValue | string): string {
-  const text = typeof value === "string" ? value : displayValue(value);
-  return `"${text.replace(/"/g, '""')}"`;
+export function formatSelectionAggregate(value: number, locales?: Intl.LocalesArgument): string {
+  const normalized = Object.is(value, -0) ? 0 : value;
+  return Number.isInteger(normalized) ? String(normalized) : normalized.toLocaleString(locales, { maximumFractionDigits: 12 });
 }
 
-function sqlValue(value: GridCellValue): string {
-  if (value === null) return "NULL";
-  if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
-  if (typeof value === "number" && Number.isFinite(value)) return String(value);
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-export function formatSelectionAsTsv(selection: SelectionData, includeHeader = false): string {
-  const body = selection.rows.map((row) => row.map(displayValue).join("\t")).join("\n");
-  if (!includeHeader) return body;
-  return [selection.columns.join("\t"), body].filter(Boolean).join("\n");
-}
-
-export function formatSelectionAsCsv(selection: SelectionData): string {
-  const header = selection.columns.map(csvValue).join(",");
-  const body = selection.rows.map((row) => row.map(csvValue).join(",")).join("\n");
-  return [header, body].filter(Boolean).join("\n");
-}
-
-export function formatSelectionAsJson(selection: SelectionData): string {
-  const objects = selection.rows.map((row) => {
-    const item: Record<string, GridCellValue> = {};
-    selection.columns.forEach((column, index) => {
-      item[column] = row[index] ?? null;
-    });
-    return item;
-  });
-  return JSON.stringify(objects, null, 2);
-}
-
-export function formatSelectionAsSqlInList(selection: SelectionData): string {
-  const values = selection.rows.flat().map(sqlValue);
-  return `(${values.join(", ")})`;
+export function formatSelectionAverage(value: number | null | undefined, locales?: Intl.LocalesArgument): string {
+  return typeof value === "number" && Number.isFinite(value) ? formatSelectionAggregate(value, locales) : "—";
 }

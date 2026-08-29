@@ -751,6 +751,30 @@ pub async fn list_subscriptions(
     Ok(Json(result))
 }
 
+pub async fn enrich_subscriptions(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<TopicReq>,
+) -> Result<Json<Vec<dbx_core::mq::SubscriptionInfo>>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_enrich_subscriptions_core(&state.app, &req.connection_id, req.topic)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn get_kafka_consumer_group_snapshot(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<ConnReq>,
+) -> Result<Json<dbx_core::mq::KafkaConsumerGroupSnapshot>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_get_kafka_consumer_group_snapshot_core(&state.app, &req.connection_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
 pub async fn create_subscription(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -850,7 +874,7 @@ pub async fn peek_messages(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
     Json(req): Json<PeekMessagesReq>,
-) -> Result<Json<Vec<dbx_core::mq::PeekedMessage>>, AppError> {
+) -> Result<Json<dbx_core::mq::PeekMessagesResult>, AppError> {
     super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
     let result = dbx_core::mq::service::mq_peek_messages_core(
         &state.app,
@@ -1540,10 +1564,13 @@ mod tests {
             password_hash: RwLock::new(None),
             sessions: RwLock::new(HashSet::new()),
             sse_channels: RwLock::new(HashMap::new()),
-            sql_file_executions: RwLock::new(HashMap::new()),
+            transfer_progress_channels: RwLock::new(HashMap::new()),
             table_import_channels: RwLock::new(HashMap::new()),
+            sql_file_executions: RwLock::new(HashMap::new()),
+            nacos_imports: RwLock::new(HashMap::new()),
             login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
             export_files: RwLock::new(HashMap::new()),
+            ssh_prompts: Arc::new(crate::ssh_prompt::SshPromptHub::new()),
         });
         (state, dir)
     }

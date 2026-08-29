@@ -2,16 +2,49 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 import {
   applyMongoGridChangesToDocument,
+  applyMongoGridChangesToDocumentBaseline,
   buildMongoCopyDocumentFromOriginal,
   buildMongoCopyInsertDocument,
   buildMongoInsertDocument,
   buildMongoUpdateDocument,
   formatMongoShellLiteral,
   mongoDocumentDisplayValue,
+  mongoDocumentGridColumnTypes,
   mongoDocumentIdForGrid,
   parseMongoDocumentInputValue,
   serializeMongoDocumentId,
 } from "../../apps/desktop/src/lib/mongo/mongoDocumentValues.ts";
+
+test("infers only consistently numeric Mongo grid columns", () => {
+  const documents = [
+    {
+      native: 1,
+      int32: { $numberInt: "1" },
+      int64: { $numberLong: "9007199254740993" },
+      double: { $numberDouble: "1.5" },
+      decimal: { $numberDecimal: "12.50" },
+      mixedNumeric: 1,
+      numericString: "123",
+      mixed: 1,
+      empty: null,
+    },
+    {
+      native: 2.5,
+      int32: { $numberInt: "2" },
+      int64: { $numberLong: "9007199254740994" },
+      double: { $numberDouble: "2.5" },
+      decimal: { $numberDecimal: "13.50" },
+      mixedNumeric: { $numberLong: "2" },
+      numericString: "456",
+      mixed: "2",
+    },
+  ];
+
+  assert.deepEqual(
+    mongoDocumentGridColumnTypes(documents, ["native", "int32", "int64", "double", "decimal", "mixedNumeric", "numericString", "mixed", "empty", "missing"]),
+    ["number", "int32", "int64", "double", "decimal128", "number", "", "", "", ""],
+  );
+});
 
 test("parses Mongo shell ISODate literals as extended JSON dates", () => {
   assert.deepEqual(parseMongoDocumentInputValue('ISODate("2026-06-10T13:59:31.287Z")'), {
@@ -175,6 +208,20 @@ test("applies Mongo grid edits without converting existing JSON strings", () => 
   });
 });
 
+test("applies sorted Mongo grid edits to a cloned BSON baseline by document id", () => {
+  const currentDocuments = [
+    { _id: { $oid: "507f1f77bcf86cd799439012" }, name: "Linus", counter: { $numberLong: "2" } },
+    { _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Ada", counter: { $numberLong: "1" } },
+  ];
+  const baselineDocuments = [structuredClone(currentDocuments[1]), structuredClone(currentDocuments[0])];
+  const dirtyRows = new Map([[0, new Map<number, string | number | boolean | null>([[1, "Grace"]])]]);
+
+  assert.deepEqual(applyMongoGridChangesToDocumentBaseline(baselineDocuments, currentDocuments, dirtyRows, ["_id", "name", "counter"]), [
+    { _id: { $oid: "507f1f77bcf86cd799439011" }, name: "Ada", counter: { $numberLong: "1" } },
+    { _id: { $oid: "507f1f77bcf86cd799439012" }, name: "Grace", counter: { $numberLong: "2" } },
+  ]);
+});
+
 test("builds Mongo inserts with parsed date values", () => {
   assert.deepEqual(buildMongoInsertDocument(["ignored", 'new Date("2026-06-10T13:59:31.287Z")'], ["_id", "createdAt"]), {
     createdAt: { $date: "2026-06-10T13:59:31.287Z" },
@@ -261,7 +308,22 @@ test("formats extended JSON int64 values as Mongo shell NumberLong literals", ()
   assert.equal(formatMongoShellLiteral({ snowflake: { $numberLong: "9007199254740993" } }), '{"snowflake":NumberLong("9007199254740993")}');
 });
 
+test("formats other extended JSON values through EJSON.deserialize", () => {
+  assert.equal(
+    formatMongoShellLiteral({
+      decimal: { $numberDecimal: "12.34" },
+      payload: { $binary: { base64: "AQI=", subType: "00" } },
+      timestamp: { $timestamp: { t: 42, i: 7 } },
+      pattern: { $regularExpression: { pattern: "^dbx", options: "i" } },
+      canonicalDate: { $date: { $numberLong: "1721779200000" } },
+    }),
+    '{"decimal":EJSON.deserialize({"$numberDecimal":"12.34"}),"payload":EJSON.deserialize({"$binary":{"base64":"AQI=","subType":"00"}}),"timestamp":EJSON.deserialize({"$timestamp":{"t":42,"i":7}}),"pattern":EJSON.deserialize({"$regularExpression":{"pattern":"^dbx","options":"i"}}),"canonicalDate":EJSON.deserialize({"$date":{"$numberLong":"1721779200000"}})}',
+  );
+});
+
 test("keeps normal Mongo values readable and unsafe Int64 editable", () => {
+  assert.equal(mongoDocumentDisplayValue(null), "NULL");
+  assert.equal(mongoDocumentDisplayValue(undefined), undefined);
   assert.equal(mongoDocumentDisplayValue(42), 42);
   assert.equal(mongoDocumentDisplayValue(3.5), 3.5);
   assert.equal(mongoDocumentDisplayValue('ISODate("2026-07-14T00:00:00Z")'), 'ISODate("2026-07-14T00:00:00Z")');
@@ -278,5 +340,23 @@ test("builds edits for Int32, Double, Date, and unsafe Int64", () => {
   ]);
   assert.deepEqual(buildMongoUpdateDocument(changes, ["_id", "int32", "double", "createdAt", "unsafe"]), {
     $set: { int32: 42, double: 3.5, createdAt: { $date: "2026-07-14T00:00:00Z" }, unsafe: { $numberLong: "9007199254740993" } },
+  });
+});
+
+test("keeps explicit Mongo null fields distinct from missing fields during grid edits", () => {
+  const columns = ["_id", "nullable", "missing"];
+
+  assert.deepEqual(buildMongoUpdateDocument(new Map([[1, "NULL"]]), columns, { _id: "1", nullable: null }), {
+    $set: { nullable: null },
+  });
+  assert.deepEqual(buildMongoUpdateDocument(new Map([[1, "NULL"]]), columns, { _id: "1", nullable: "NULL" }), {
+    $set: { nullable: "NULL" },
+  });
+  assert.deepEqual(buildMongoUpdateDocument(new Map([[2, null]]), columns, { _id: "1", nullable: null }), {
+    $unset: { missing: "" },
+  });
+  assert.deepEqual(applyMongoGridChangesToDocument({ _id: "1", nullable: null }, new Map([[1, "NULL"]]), columns), {
+    _id: "1",
+    nullable: null,
   });
 });

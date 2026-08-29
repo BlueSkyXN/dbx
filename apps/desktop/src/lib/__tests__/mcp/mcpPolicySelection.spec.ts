@@ -109,6 +109,46 @@ describe("MCP policy settings state", () => {
     expect(settingsDialogSource).toContain(":aria-checked=\"mcpExecutionMode === 'safe_write'\"");
     expect(settingsDialogSource).toContain("onMcpExecutionModeKeydown($event, 'safe_write')");
   });
+
+  it("keeps MCP client config tabs on a single scrollable row", () => {
+    const tabsStart = settingsDialogSource.indexOf('<Tabs v-model="mcpConfigTab"');
+    const tabsEnd = settingsDialogSource.indexOf("</TabsList>", tabsStart);
+    const tabsSource = settingsDialogSource.slice(tabsStart, tabsEnd);
+
+    expect(tabsStart).toBeGreaterThan(-1);
+    expect(tabsEnd).toBeGreaterThan(tabsStart);
+    expect(tabsSource).toContain("overflow-x-auto");
+    expect(tabsSource).toContain("min-w-0");
+    expect(tabsSource).toContain("max-w-full");
+    expect(tabsSource).toContain("overscroll-x-contain");
+    expect(tabsSource).not.toContain("flex-wrap");
+    expect(tabsSource).not.toContain("grid-cols-");
+    expect(tabsSource.match(/flex-none shrink-0/g)).toHaveLength(12);
+    expect(tabsSource).toContain('<TabsTrigger value="deepseek-harness"');
+    expect(tabsSource).toContain('<TabsTrigger value="codebuddy"');
+    expect(tabsSource).toContain('<TabsTrigger value="zcode"');
+    expect(tabsSource).not.toContain("min-w-0 px-");
+
+    const codeBuddyStart = settingsDialogSource.indexOf('<TabsContent value="codebuddy"', tabsEnd);
+    const codeBuddyEnd = settingsDialogSource.indexOf("</TabsContent>", codeBuddyStart);
+    const codeBuddySource = settingsDialogSource.slice(codeBuddyStart, codeBuddyEnd);
+
+    expect(codeBuddyStart).toBeGreaterThan(tabsEnd);
+    expect(codeBuddyEnd).toBeGreaterThan(codeBuddyStart);
+    expect(codeBuddySource).toContain("settings.mcpCodeBuddyConfigPath");
+    expect(codeBuddySource).toContain("mcpJsonRecommendedConfig");
+    expect(codeBuddySource).toContain("copyMcpText('codebuddy-config', mcpJsonRecommendedConfig)");
+
+    const zCodeStart = settingsDialogSource.indexOf('<TabsContent value="zcode"', tabsEnd);
+    const zCodeEnd = settingsDialogSource.indexOf("</TabsContent>", zCodeStart);
+    const zCodeSource = settingsDialogSource.slice(zCodeStart, zCodeEnd);
+
+    expect(zCodeStart).toBeGreaterThan(tabsEnd);
+    expect(zCodeEnd).toBeGreaterThan(zCodeStart);
+    expect(zCodeSource).toContain("settings.mcpZCodeConfigPath");
+    expect(zCodeSource).toContain("mcpJsonRecommendedConfig");
+    expect(zCodeSource).toContain("copyMcpText('zcode-config', mcpJsonRecommendedConfig)");
+  });
 });
 
 describe("MCP connection search", () => {

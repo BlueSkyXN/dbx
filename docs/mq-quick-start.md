@@ -355,7 +355,7 @@ async fn detect_pulsar_version(client: &reqwest::Client, base_url: &str) -> Puls
 
 ### 启用 MQ 功能
 ```bash
-# 默认已启用（default = ["duckdb-bundled", "mq-admin"]）
+# 默认已启用（default 包含 "duckdb-sidecar" 和 "mq-admin"）
 cargo build --release
 
 # 或显式指定
@@ -364,7 +364,7 @@ cargo build --release --features mq-admin
 
 ### 禁用 MQ 功能
 ```bash
-cargo build --release --no-default-features --features duckdb-bundled
+cargo build -p dbx --release --no-default-features --features duckdb-sidecar,sqlite-sqlcipher,system-fonts
 ```
 
 ### 检查编译
@@ -378,7 +378,7 @@ cargo check --package dbx-web --features mq-admin
 
 ### 添加新的 MQ 系统
 
-Kafka 与 RocketMQ 已实现 Java Agent + Rust 适配器模式。新增 MQ 系统时：
+Kafka 使用 Java Agent，RocketMQ 使用 Go 原生 Agent；两者均通过 Rust 适配器接入。新增 MQ 系统时：
 
 1. 在 `agents/drivers/<name>/` 实现 JSON-RPC Agent（参考 `kafka` / `rocketmq`）
 2. 在 `crates/dbx-core/src/mq/adapters/` 实现 `MessageQueueAdmin`
@@ -407,9 +407,9 @@ Kafka 与 RocketMQ 已实现 Java Agent + Rust 适配器模式。新增 MQ 系�
 Agent 构建与安装：
 
 ```bash
-cd agents
-./gradlew :rocketmq:shadowJar
-# 将 shadow JAR 安装到 DBX 数据目录 agents/drivers/rocketmq/agent.jar
+cd agents/drivers/rocketmq
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o agent .
+# 将可执行文件安装到 DBX 数据目录 agents/drivers/rocketmq/agent
 ```
 
 Docker 快速启动（NameServer 9876 + Broker 10911，仅用于本地验证）：
@@ -444,8 +444,9 @@ Agent 构建与安装：
 
 ```bash
 cd agents
-./gradlew :rabbitmq:shadowJar
-# 将 shadow JAR 安装到 DBX 数据目录 agents/drivers/rabbitmq/agent.jar
+cd drivers/rabbitmq
+go build -o agent .
+# 将原生 agent 安装到 DBX 数据目录 agents/drivers/rabbitmq/agent
 ```
 
 Docker 快速启动（AMQP 5672 + Management 15672，仅用于本地验证）：
@@ -455,6 +456,8 @@ docker run -d --name dbx-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-managem
 ```
 
 说明：RabbitMQ 适配器将 topic 映射为队列（queue），支持队列列表/声明/删除、清空队列（purge）、消费者列表、消息预览（basic.get + requeue）与发送（basic.publish）；vhost 映射为 namespace，可在控制台查看/创建/删除。AMQP 操作按 vhost 透传（agent 侧 per-vhost 通道缓存），tenant 语义不适用（固定合成 `_rabbitmq`）。
+
+RabbitMQ 的 AMQP 监听端口与 Management HTTP 监听端口是独立配置。使用默认 AMQP 端口时可将 `adminUrl` 留空，由 DBX 使用默认 Management 端口；使用非默认 AMQP 端口时必须填写实际的 Management API URL，例如 AMQP 为 `127.0.0.1:5673`、Management 为 `http://127.0.0.1:15673`。SSH、SOCKS 或 HTTP 隧道会分别转发 AMQP 与 Management 两个端点。
 
 ### Kafka 适配器参考
 
@@ -506,5 +509,3 @@ const response = await mqRawRequest(connectionId, {
 })
 console.log(response.body)
 ```
-
- 

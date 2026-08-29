@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Check, Eye, Loader2, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Timer, Upload } from "@lucide/vue";
+import { Check, ChevronDown, Copy, Download, Eye, Loader2, Map, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Timer, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -8,12 +8,17 @@ import {
   dataGridToolbarIntervalOptions,
   isDataGridToolbarCapabilityDisabled,
   isDataGridToolbarCapabilityVisible,
+  selectDataGridToolbarAddRowItem,
   selectDataGridToolbarAutoRefreshInterval,
+  selectDataGridToolbarCopyItem,
   selectDataGridToolbarExportItem,
   toggleDataGridToolbarAutoRefresh,
+  triggerDataGridToolbarCopy,
   triggerDataGridToolbarAction,
   type DataGridToolbarActionCapability,
+  type DataGridToolbarAddRowCapability,
   type DataGridToolbarAutoRefreshCapability,
+  type DataGridToolbarCopyCapability,
   type DataGridToolbarExportCapability,
   type DataGridToolbarSaveCapability,
 } from "@/lib/dataGrid/dataGridToolbar";
@@ -22,10 +27,13 @@ const props = defineProps<{
   compact?: boolean;
   refresh: DataGridToolbarActionCapability;
   autoRefresh?: DataGridToolbarAutoRefreshCapability;
-  addRow?: DataGridToolbarActionCapability;
+  addRow?: DataGridToolbarAddRowCapability;
+  deleteRow?: DataGridToolbarActionCapability;
+  copyData?: DataGridToolbarCopyCapability;
   exportData?: DataGridToolbarExportCapability;
   transpose?: DataGridToolbarActionCapability;
   tableInfo?: DataGridToolbarActionCapability;
+  layerPreview?: DataGridToolbarActionCapability;
   preview?: DataGridToolbarActionCapability;
   save?: DataGridToolbarSaveCapability;
   rollback?: DataGridToolbarActionCapability;
@@ -85,14 +93,71 @@ function actionLabelClass() {
 
     <slot name="navigation" />
 
-    <Tooltip v-if="isDataGridToolbarCapabilityVisible(addRow)">
+    <div v-if="isDataGridToolbarCapabilityVisible(copyData)" class="flex h-5 shrink-0 items-stretch overflow-hidden rounded-md border border-border">
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="sm" class="h-5 rounded-none border-0 px-1.5 text-xs" :disabled="copyData?.disabled" @click="void triggerDataGridToolbarCopy(copyData)">
+            <Copy class="h-3 w-3" :class="compact ? '' : 'mr-1'" />
+            <span v-if="!compact">{{ copyData?.label }}</span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{{ copyData?.tooltip ?? copyData?.label }}</TooltipContent>
+      </Tooltip>
+      <DropdownMenu>
+        <DropdownMenuTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-5 w-5 rounded-none border-0 border-l border-border" :aria-label="copyData?.label">
+            <ChevronDown class="h-3 w-3" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" class="min-w-52">
+          <template v-for="item in copyData?.items ?? []" :key="item.value">
+            <DropdownMenuSeparator v-if="item.separatorBefore" />
+            <DropdownMenuItem class="gap-2" :disabled="item.disabled" @select="void selectDataGridToolbarCopyItem(copyData, item.value)">
+              <span class="flex-1">{{ item.label }}</span>
+              <Check v-if="copyData?.currentValue === item.value" class="h-3.5 w-3.5 shrink-0 text-primary" />
+            </DropdownMenuItem>
+          </template>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+
+    <div v-if="isDataGridToolbarCapabilityVisible(addRow)" class="flex h-5 shrink-0 items-stretch overflow-hidden rounded-md border border-border">
+      <Tooltip>
+        <TooltipTrigger as-child>
+          <Button variant="ghost" size="sm" class="h-5 rounded-none border-0 px-1.5 text-xs" :disabled="isDataGridToolbarCapabilityDisabled(addRow)" @click="void triggerDataGridToolbarAction(addRow)">
+            <Plus class="h-3 w-3" :class="compact ? '' : 'mr-1'" />
+            <span v-if="!compact">{{ addRow?.label }}</span>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{{ addRow?.tooltip ?? addRow?.label }}</TooltipContent>
+      </Tooltip>
+      <DropdownMenu>
+        <DropdownMenuTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-5 w-5 rounded-none border-0 border-l border-border" :aria-label="addRow?.label" :disabled="isDataGridToolbarCapabilityDisabled(addRow)">
+            <ChevronDown class="h-3 w-3" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" class="min-w-52">
+          <template v-for="item in addRow?.items ?? []" :key="item.value">
+            <DropdownMenuSeparator v-if="item.separatorBefore" />
+            <DropdownMenuItem class="gap-2" :disabled="item.disabled" @select="void selectDataGridToolbarAddRowItem(addRow, item.value)">
+              <Check v-if="item.selected" class="h-3.5 w-3.5 shrink-0 text-primary" />
+              <span v-else class="h-3.5 w-3.5 shrink-0" />
+              <span class="flex-1">{{ item.label }}</span>
+            </DropdownMenuItem>
+          </template>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+
+    <Tooltip v-if="isDataGridToolbarCapabilityVisible(deleteRow)">
       <TooltipTrigger as-child>
-        <Button variant="ghost" size="sm" :class="actionButtonClass" :disabled="isDataGridToolbarCapabilityDisabled(addRow)" @click="void triggerDataGridToolbarAction(addRow)">
-          <Plus class="data-grid-topbar-action-icon h-3 w-3" />
-          <span class="data-grid-topbar-action-label" :class="actionLabelClass()">{{ addRow?.label }}</span>
+        <Button variant="ghost" size="sm" :class="actionButtonClass" :disabled="isDataGridToolbarCapabilityDisabled(deleteRow)" @click="void triggerDataGridToolbarAction(deleteRow)">
+          <Trash2 class="data-grid-topbar-action-icon h-3 w-3" />
+          <span class="data-grid-topbar-action-label" :class="actionLabelClass()">{{ deleteRow?.label }}</span>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">{{ addRow?.tooltip ?? addRow?.label }}</TooltipContent>
+      <TooltipContent side="bottom">{{ deleteRow?.tooltip ?? deleteRow?.label }}</TooltipContent>
     </Tooltip>
 
     <DropdownMenu v-if="isDataGridToolbarCapabilityVisible(exportData)">
@@ -100,7 +165,7 @@ function actionLabelClass() {
         <TooltipTrigger as-child>
           <DropdownMenuTrigger as-child>
             <Button variant="ghost" size="sm" :class="actionButtonClass" :disabled="exportData?.disabled || !exportData?.items.length">
-              <Upload class="data-grid-topbar-action-icon h-3 w-3" />
+              <Download class="data-grid-topbar-action-icon h-3 w-3" />
               <span class="data-grid-topbar-action-label" :class="actionLabelClass()">{{ exportData?.label }}</span>
             </Button>
           </DropdownMenuTrigger>
@@ -135,6 +200,16 @@ function actionLabelClass() {
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom">{{ tableInfo?.tooltip ?? tableInfo?.label }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip v-if="isDataGridToolbarCapabilityVisible(layerPreview)">
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="sm" :class="actionButtonClass" :disabled="isDataGridToolbarCapabilityDisabled(layerPreview)" @click="void triggerDataGridToolbarAction(layerPreview)">
+          <Map class="data-grid-topbar-action-icon h-3 w-3" />
+          <span class="data-grid-topbar-action-label" :class="actionLabelClass()">{{ layerPreview?.label }}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{{ layerPreview?.tooltip ?? layerPreview?.label }}</TooltipContent>
     </Tooltip>
 
     <Tooltip v-if="isDataGridToolbarCapabilityVisible(preview)">

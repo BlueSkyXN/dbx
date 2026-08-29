@@ -1,31 +1,85 @@
 import type { Text } from "@codemirror/state";
 import type { DatabaseType } from "@/types/database";
+import { readSqlBracedParameterAt, type SqlParameterOptions } from "@/lib/sql/sqlParameters";
 import { executableStatementRanges, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
+import { cursorBelongsToTrailingStatementDelimiter } from "@/lib/sql/statementDelimiter";
 
 export interface ExecutableStatementRangeCache {
   doc: Text;
   databaseType?: DatabaseType;
+  parameterOptions?: SqlParameterOptions;
+  parameterSyntaxKey: string;
   byStart: Map<number, SqlTextRange>;
   byExecutableLineStart: Map<number, SqlTextRange>;
   ranges: SqlTextRange[];
 }
 
-export type ExecutableStatementRangeParser = (sql: string, databaseType?: DatabaseType) => SqlTextRange[];
+export type ExecutableStatementRangeParser = (sql: string, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions) => SqlTextRange[];
 
-export function executableStatementRangeCacheForDoc(cache: ExecutableStatementRangeCache | null, doc: Text, databaseType?: DatabaseType, parse: ExecutableStatementRangeParser = executableStatementRanges): ExecutableStatementRangeCache {
-  if (cache?.doc === doc && cache.databaseType === databaseType) return cache;
+export function executableStatementRangeCacheForDoc(
+  cache: ExecutableStatementRangeCache | null,
+  doc: Text,
+  databaseType?: DatabaseType,
+  parameterOptionsOrParse?: SqlParameterOptions | ExecutableStatementRangeParser,
+  customParse: ExecutableStatementRangeParser = executableStatementRanges,
+): ExecutableStatementRangeCache {
+  const parameterOptions = typeof parameterOptionsOrParse === "function" ? undefined : parameterOptionsOrParse;
+  const parse = typeof parameterOptionsOrParse === "function" ? parameterOptionsOrParse : customParse;
+  const parameterSyntaxKey = parameterOptions?.enabledSyntaxes ? parameterOptions.enabledSyntaxes.join(",") : "*";
+  if (cache?.doc === doc && cache.databaseType === databaseType && cache.parameterSyntaxKey === parameterSyntaxKey) return cache;
 
   const byStart = new Map<number, SqlTextRange>();
   const byExecutableLineStart = new Map<number, SqlTextRange>();
-  const ranges = parse(doc.toString(), databaseType);
+  const sql = doc.toString();
+  const ranges = parse(sql, databaseType, parameterOptions);
   for (const range of ranges) {
     byStart.set(range.from, range);
     const line = doc.lineAt(range.from);
     if (doc.sliceString(line.from, range.from).trim() === "") {
       byExecutableLineStart.set(line.from, range);
     }
+    const executableStart = executableStartAfterLeadingDirective(sql, range, databaseType, parameterOptions);
+    if (executableStart !== null) {
+      byExecutableLineStart.set(doc.lineAt(executableStart).from, range);
+    }
   }
-  return { doc, databaseType, byStart, byExecutableLineStart, ranges };
+  return { doc, databaseType, parameterOptions, parameterSyntaxKey, byStart, byExecutableLineStart, ranges };
+}
+
+function executableStartAfterLeadingDirective(sql: string, range: SqlTextRange, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): number | null {
+  const text = range.sql;
+  const hasExecutableDirective = text.startsWith("/*+") || text.startsWith("/*@") || text.startsWith("/*&") || (databaseType === "mysql" && text.startsWith("/*proxy*/"));
+  if (!hasExecutableDirective) return null;
+
+  let offset = 0;
+  while (offset < text.length) {
+    while (/\s/.test(text[offset] ?? "")) offset += 1;
+
+    if (text.startsWith("/*", offset)) {
+      const close = text.indexOf("*/", offset + 2);
+      if (close < 0) return null;
+      offset = close + 2;
+      continue;
+    }
+
+    if (text.startsWith("--", offset)) {
+      const newline = text.indexOf("\n", offset + 2);
+      if (newline < 0) return null;
+      offset = newline + 1;
+      continue;
+    }
+
+    if (databaseType !== "sqlserver" && text[offset] === "#" && readSqlBracedParameterAt(sql, range.from + offset, parameterOptions)?.syntax !== "mybatis") {
+      const newline = text.indexOf("\n", offset + 1);
+      if (newline < 0) return null;
+      offset = newline + 1;
+      continue;
+    }
+
+    return offset < text.length ? range.from + offset : null;
+  }
+
+  return null;
 }
 
 export function executableStatementRangeStartingAt(cache: ExecutableStatementRangeCache, lineFrom: number): SqlTextRange | null {
@@ -36,7 +90,9 @@ export function executableStatementRangeAtCursor(cache: ExecutableStatementRange
   const pos = Math.max(0, Math.min(cursorPos, cache.doc.length));
   const line = cache.doc.lineAt(pos);
   const lineText = line.text.trim();
-  if (!lineText || lineText.startsWith("--") || lineText.startsWith("#") || isCursorOnLeadingBlockComment(line.text, pos - line.from)) return null;
+  const lineContentStart = line.from + line.text.search(/\S|$/);
+  const startsHashComment = lineText.startsWith("#") && readSqlBracedParameterAt(cache.doc.toString(), lineContentStart, cache.parameterOptions)?.syntax !== "mybatis";
+  if (!lineText || lineText.startsWith("--") || startsHashComment || isCursorOnLeadingBlockComment(line.text, pos - line.from)) return null;
 
   for (let index = 0; index < cache.ranges.length; index += 1) {
     const range = cache.ranges[index];
@@ -47,8 +103,9 @@ export function executableStatementRangeAtCursor(cache: ExecutableStatementRange
     }
 
     const next = cache.ranges[index + 1];
-    if (pos > range.to && (!next || pos < next.from) && range.to >= line.from && range.to <= line.to && cursorRemainsOnRangeLine(cache.doc, range.to, pos)) {
-      return range;
+    if (pos > range.to && (!next || pos < next.from)) {
+      if (cursorBelongsToTrailingStatementDelimiter(cache.doc, range.to, pos)) return range;
+      if (isCursorOnRangeEndLine(cache.doc, pos, range.to)) return range;
     }
   }
 
@@ -67,13 +124,7 @@ function isCursorOnLeadingBlockComment(lineText: string, lineOffset: number): bo
   return lineOffset <= commentEnd + 2;
 }
 
-function cursorRemainsOnRangeLine(doc: Text, rangeTo: number, cursorPos: number): boolean {
-  const between = doc.sliceString(rangeTo, cursorPos);
-  if (between.includes("\n")) return false;
-  const delimiterIndex = between.lastIndexOf(";");
-  if (delimiterIndex === -1) return between.trim() === "";
-
-  const beforeDelimiter = between.slice(0, delimiterIndex);
-  const afterDelimiter = between.slice(delimiterIndex + 1);
-  return beforeDelimiter.trim() === "" && afterDelimiter.trim() === "";
+function isCursorOnRangeEndLine(doc: Text, pos: number, rangeTo: number): boolean {
+  const line = doc.lineAt(pos);
+  return rangeTo >= line.from && rangeTo <= line.to;
 }

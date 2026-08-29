@@ -1,5 +1,5 @@
 import { shallowRef, onBeforeUnmount, getCurrentInstance, type ShallowRef, createApp, watch } from "vue";
-import { EditorState, Compartment } from "@codemirror/state";
+import { EditorSelection, EditorState, Compartment } from "@codemirror/state";
 import { EditorView, keymap, drawSelection, dropCursor, highlightSpecialChars, highlightActiveLine, highlightActiveLineGutter, lineNumbers } from "@codemirror/view";
 import { json } from "@codemirror/lang-json";
 import { search as cmSearch } from "@codemirror/search";
@@ -10,7 +10,7 @@ import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, cellDetailActiveL
 import { shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { CELL_DETAIL_JSON_FORMAT_MAX_LENGTH, isJsonColumnType } from "@/lib/dataGrid/cellDetailPresentation";
-import { clampEditorFontSize, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
+import { clampEditorFontSize, createEditorWheelZoomGestureGuard, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
 import i18n from "@/i18n";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
 import type { EditorTheme } from "@/stores/settingsStore";
@@ -31,6 +31,11 @@ export interface UseCellDetailEditorOptions {
   lineWrapping?: () => boolean;
   /** Add CodeMirror fold controls and keyboard bindings for structured source. */
   folding?: boolean;
+  /**
+   * When false, Mod+F / replace are not bound so a parent (e.g. Redis value viewer)
+   * can own the unified find surface. Default true for grid cell editors.
+   */
+  enableBuiltinFind?: boolean;
   editorTheme: () => EditorTheme;
   appAppearance: () => AppThemeAppearance;
   appPalette: () => AppThemePalette;
@@ -44,6 +49,7 @@ export interface UseCellDetailEditorReturn {
   getValue: () => string;
   openSearch: () => boolean;
   openReplace: () => boolean;
+  selectRange: (from: number, to: number, options?: { focus?: boolean }) => boolean;
   destroy: () => void;
   view: Readonly<ShallowRef<EditorView | null>>;
 }
@@ -88,6 +94,7 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     if (settingsStore.editorSettings.fontSize === fontSize) return;
     settingsStore.updateEditorSettings({ fontSize });
   });
+  const wheelZoomGestureGuard = createEditorWheelZoomGestureGuard();
 
   function syncEditorFontCssVars(fontSize = liveFontSize, fontFamily = options.fontFamily()) {
     if (!wrapperEl) return;
@@ -224,16 +231,21 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
           ...defaultKeymap,
           ...historyKeymap,
           ...(options.folding ? foldKeymap : []),
-          {
-            key: shortcutToCodeMirrorKey(shortcuts.find),
-            preventDefault: true,
-            run: () => openSearch(),
-          },
-          {
-            key: shortcutToCodeMirrorKey(shortcuts.replace),
-            preventDefault: true,
-            run: () => openReplace(),
-          },
+          // Callers may disable find so a parent surface (e.g. RedisValueViewer) owns Mod+F.
+          ...(options.enableBuiltinFind === false
+            ? []
+            : [
+                {
+                  key: shortcutToCodeMirrorKey(shortcuts.find),
+                  preventDefault: true,
+                  run: () => openSearch(),
+                },
+                {
+                  key: shortcutToCodeMirrorKey(shortcuts.replace),
+                  preventDefault: true,
+                  run: () => openReplace(),
+                },
+              ]),
         ]),
         languageComp.of(currentIsJson ? json() : []),
         lineWrappingComp.of(options.lineWrapping?.() ? EditorView.lineWrapping : []),
@@ -267,7 +279,7 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
             return true;
           },
           wheel(event) {
-            if (!event.metaKey && !event.ctrlKey) return false;
+            if (!wheelZoomGestureGuard.accepts(event)) return false;
             event.preventDefault();
             const next = fontSizeFromWheelDelta(liveFontSize, event.deltaY);
             applyLiveFontSize(next);
@@ -339,6 +351,21 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     return (searchInstance as any)?.openReplace?.() ?? false;
   }
 
+  function selectRange(from: number, to: number, options?: { focus?: boolean }): boolean {
+    const editor = view.value;
+    if (!editor || destroyed) return false;
+    const max = editor.state.doc.length;
+    const start = Math.max(0, Math.min(from, max));
+    const end = Math.max(0, Math.min(to, max));
+    editor.dispatch({
+      selection: EditorSelection.range(start, end),
+      scrollIntoView: true,
+    });
+    // Default focus for explicit navigation; callers can pass focus:false while typing in a find box.
+    if (options?.focus !== false) editor.focus();
+    return true;
+  }
+
   function destroy() {
     const alreadyDestroyed = destroyed;
     destroyed = true;
@@ -365,5 +392,5 @@ export function useCellDetailEditor(options: UseCellDetailEditorOptions): UseCel
     });
   }
 
-  return { create, setValue, getValue, openSearch, openReplace, destroy, view };
+  return { create, setValue, getValue, openSearch, openReplace, selectRange, destroy, view };
 }

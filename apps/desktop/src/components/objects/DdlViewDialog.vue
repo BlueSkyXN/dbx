@@ -9,7 +9,7 @@ import { loadEditorTheme, editorFontTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
-import * as api from "@/lib/backend/api";
+import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
@@ -51,26 +51,67 @@ const ddlEditorContainer = ref<HTMLDivElement>();
 const ddlSearchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
 const ddlEditorView = shallowRef<EditorView | null>(null);
 
-/** Fetches the table DDL when the dialog opens. */
+// The CodeMirror editor (if any) that was focused when this dialog opened, so focus can be
+// restored to it on close. Not a ref: read/written outside of render, never needs reactivity.
+let editorRootToRestoreFocus: HTMLElement | null = null;
+
+async function loadDdl(force = false) {
+  ddlError.value = "";
+  ddlLoading.value = true;
+  if (force) destroyDdlEditor();
+  try {
+    const schema = props.schema || props.database;
+    const { ddl } = await loadObjectDdl(
+      {
+        connectionId: props.connectionId,
+        database: props.database,
+        schema,
+        tableName: props.tableName,
+        objectType: props.objectType,
+        catalog: props.catalog,
+      },
+      { force },
+    );
+    ddlContent.value = await formatSqlForDisplay(ddl, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
+  } catch (e: any) {
+    ddlError.value = e?.message || String(e);
+  } finally {
+    ddlLoading.value = false;
+  }
+}
+
+/** Loads the persisted table DDL when the dialog opens. */
 watch(
   () => props.open,
   async (open) => {
     if (!open) return;
+    const active = document.activeElement;
+    editorRootToRestoreFocus = active instanceof HTMLElement ? active.closest(".cm-editor") : null;
     ddlContent.value = "";
-    ddlError.value = "";
-    ddlLoading.value = true;
-    try {
-      const schema = props.schema || props.database;
-      const ddl = await api.getTableDdl(props.connectionId, props.database, schema, props.tableName, props.objectType, props.catalog);
-      ddlContent.value = await formatSqlForDisplay(ddl, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
-    } catch (e: any) {
-      ddlError.value = e?.message || String(e);
-    } finally {
-      ddlLoading.value = false;
-    }
+    await loadDdl();
   },
   { immediate: true },
 );
+
+/**
+ * Restores focus through CodeMirror's own `EditorView.focus()` instead of the browser default.
+ *
+ * Radix's default close-auto-focus calls the plain DOM `.focus()` on whatever was focused before
+ * the dialog opened. In WebKit (the desktop app's webview on macOS), refocusing a contenteditable
+ * this way resets its caret to the very start of the document; CodeMirror then treats that as a
+ * real selection change and scrolls to follow it, snapping a long query editor to the top (#6067).
+ * `EditorView.focus()` avoids this by suppressing its own selection observer while it restores the
+ * DOM selection to match its actual (unmoved) internal state.
+ */
+function onDdlDialogCloseAutoFocus(event: Event) {
+  const target = editorRootToRestoreFocus;
+  editorRootToRestoreFocus = null;
+  if (!target || !target.isConnected) return;
+  event.preventDefault();
+  void import("@codemirror/view").then(({ EditorView }) => {
+    EditorView.findFromDOM(target)?.focus();
+  });
+}
 
 /**
  * Creates a lightweight read-only CodeMirror editor inside the dialog.
@@ -106,6 +147,7 @@ async function initDdlEditor(content: string) {
         },
       }),
       basicSetup,
+      EditorState.allowMultipleSelections.of(true),
       langSql.sql({ dialect }),
       themeExt,
       fontExt,
@@ -171,21 +213,8 @@ onUnmounted(() => {
 });
 
 function retry() {
-  ddlError.value = "";
-  ddlLoading.value = true;
   ddlContent.value = "";
-  const schema = props.schema || props.database;
-  api
-    .getTableDdl(props.connectionId, props.database, schema, props.tableName, props.objectType)
-    .then(async (ddl) => {
-      ddlContent.value = await formatSqlForDisplay(ddl, props.formatDialect ?? props.dialect, settingsStore.editorSettings.sqlFormatter);
-    })
-    .catch((e: any) => {
-      ddlError.value = e?.message || String(e);
-    })
-    .finally(() => {
-      ddlLoading.value = false;
-    });
+  void loadDdl(true);
 }
 
 function onClose() {
@@ -195,7 +224,7 @@ function onClose() {
 
 <template>
   <Dialog :open="props.open" @update:open="onClose">
-    <DialogContent class="sm:max-w-190">
+    <DialogContent class="dbx-ddl-view-dialog sm:max-w-190" @close-auto-focus="onDdlDialogCloseAutoFocus">
       <DialogHeader>
         <DialogTitle>DDL - {{ props.tableName }}</DialogTitle>
       </DialogHeader>
@@ -218,6 +247,10 @@ function onClose() {
       </div>
       <DialogFooter>
         <Button variant="outline" @click="onClose">{{ t("common.close") }}</Button>
+        <Button variant="outline" :disabled="ddlLoading" :title="t('structureEditor.refresh')" @click="loadDdl(true)">
+          <RefreshCw class="h-4 w-4" />
+          {{ t("structureEditor.refresh") }}
+        </Button>
         <Button variant="outline" :disabled="!ddlContent" @click="copyDdlContent">
           <Clipboard class="h-4 w-4" />
           {{ t("grid.copyDdl") }}
@@ -242,5 +275,14 @@ function onClose() {
 
 .ddl-view-editor :deep(.cm-content ::selection) {
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
+}
+
+html.dbx-legacy-webview [data-slot="dialog-content"].dbx-ddl-view-dialog[class~="max-w-sm"] {
+  max-width: 47.5rem !important;
+}
+
+html.dbx-legacy-webview [data-slot="dialog-content"].dbx-ddl-view-dialog [data-slot="dialog-footer"] {
+  flex-direction: row !important;
+  justify-content: flex-end !important;
 }
 </style>

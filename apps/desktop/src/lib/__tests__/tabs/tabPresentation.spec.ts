@@ -1,7 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { connectionGroupDisplayName, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultSourceRange, statementExecutionMarkers, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import {
+  connectionGroupDisplayName,
+  executionSummaryItems,
+  middleEllipsis,
+  queryResultBaseSql,
+  queryResultExecutionSql,
+  resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
+  resultGridInstanceKey,
+  resultSourceRange,
+  statementExecutionMarkers,
+  tabDisplayTitle,
+  tabTooltipLines,
+  tabularResultItems,
+} from "@/lib/tabs/tabPresentation";
+import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 const translations: Record<string, string> = {
@@ -132,7 +147,29 @@ describe("query result labels", () => {
   });
 });
 
+describe("query result grid identity", () => {
+  it("separates rerun payloads while retaining run and result-set identity", () => {
+    const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-1" });
+    const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2, resultGridRevision: "execution-2" });
+
+    expect(resultGridInstanceKey(first)).toBe("tab-1-run-1-2-execution-1");
+    expect(resultGridInstanceKey(rerun)).not.toBe(resultGridInstanceKey(first));
+    expect(resultGridInstanceKey({ ...first, activeResultIndex: 1 })).toBe("tab-1-run-1-1-execution-1");
+    expect(resultGridCacheKey(rerun)).not.toBe(resultGridCacheKey(first));
+    expect(resultGridColumnWidthCacheKey(rerun)).toBe(resultGridColumnWidthCacheKey(first));
+    expect(resultGridColumnWidthCacheKey({ ...first, activeResultIndex: 1 })).not.toBe(resultGridColumnWidthCacheKey(first));
+  });
+});
+
 describe("tab group presentation", () => {
+  it("uses the live database and branch context for Dolt version control tabs", () => {
+    const store = useConnectionStore();
+    store.connections = [{ id: "conn-1", name: "Production Dolt", db_type: "mysql", driver_profile: "dolt", database: "app" } as ConnectionConfig];
+
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control", workspaceBranch: "feature/orders" }), translate)).toBe("Production Dolt VCS@db.feature/orders");
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control" }), translate)).toBe("Production Dolt VCS@db");
+  });
+
   it("adds the full, live group path to tab tooltips", () => {
     const store = useConnectionStore();
     store.connections = [{ id: "conn-1", name: "PostgreSQL", db_type: "postgres", database: "app" } as ConnectionConfig];
@@ -223,7 +260,89 @@ describe("query result source ranges", () => {
   });
 });
 
+describe("execution summary", () => {
+  it("uses the explicit execution marker instead of the result column name", () => {
+    const successfulAlias = { columns: ["Error"], rows: [[2]], affected_rows: 0, execution_time_ms: 1 };
+    const markedFailure = { columns: ["Error"], rows: [["failed"]], affected_rows: 0, execution_time_ms: 1, execution_error: true as const };
+
+    expect(executionSummaryItems({ results: [successfulAlias, markedFailure] }).map(({ status, isError }) => ({ status, isError }))).toEqual([
+      { status: "success", isError: false },
+      { status: "error", isError: true },
+    ]);
+  });
+
+  it("maps out-of-order results to their explicit statement indexes", () => {
+    const items = executionSummaryItems({
+      results: [
+        { columns: ["value"], rows: [["third"]], affected_rows: 0, execution_time_ms: 3, statement_index: 2 },
+        { columns: ["value"], rows: [["first"]], affected_rows: 0, execution_time_ms: 1, statement_index: 0 },
+      ],
+      batchSqlExecution: {
+        executionId: "run-out-of-order",
+        submittedSql: "SELECT 'first'; SELECT 'second'; SELECT 'third'",
+        editorFingerprint: "fingerprint",
+        sourceOffset: 0,
+        completed: 2,
+        total: 3,
+        startedAt: 1,
+        items: [
+          { statementIndex: 0, sql: "SELECT 'first'", from: 0, to: 14, status: "success" },
+          { statementIndex: 1, sql: "SELECT 'second'", from: 16, to: 31, status: "skipped" },
+          { statementIndex: 2, sql: "SELECT 'third'", from: 33, to: 47, status: "success" },
+        ],
+      },
+    });
+
+    expect(items.map((item) => [item.statementIndex, item.result?.rows[0]?.[0]])).toEqual([
+      [0, "first"],
+      [1, undefined],
+      [2, "third"],
+    ]);
+  });
+});
+
 describe("statement execution markers", () => {
+  it("renders a live marker for a single statement", () => {
+    const sql = "SELECT 1";
+    expect(
+      statementExecutionMarkers(sql, undefined, "mysql", sql, "", {
+        executionId: "run-single",
+        submittedSql: sql,
+        editorFingerprint: sqlTextFingerprint(sql),
+        sourceOffset: 0,
+        completed: 0,
+        total: 1,
+        startedAt: 1,
+        items: [{ statementIndex: 0, sql, from: 0, to: sql.length, status: "running" }],
+      }),
+    ).toEqual([{ from: 0, status: "running", successCount: 0, errorCount: 0, runningCount: 1 }]);
+  });
+
+  it("renders running and completed markers from live batch state", () => {
+    const sql = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+    const secondFrom = sql.indexOf("SELECT 2");
+    const thirdFrom = sql.indexOf("SELECT 3");
+    expect(
+      statementExecutionMarkers(sql, undefined, "sqlite", sql, "", {
+        executionId: "run-1",
+        submittedSql: sql,
+        editorFingerprint: sqlTextFingerprint(sql),
+        sourceOffset: 0,
+        completed: 1,
+        total: 3,
+        startedAt: 1,
+        items: [
+          { statementIndex: 0, sql: "SELECT 1", from: 0, to: 8, status: "success" },
+          { statementIndex: 1, sql: "SELECT 2", from: secondFrom, to: secondFrom + 8, status: "running" },
+          { statementIndex: 2, sql: "SELECT 3", from: thirdFrom, to: thirdFrom + 8, status: "pending" },
+        ],
+      }),
+    ).toEqual([
+      { from: 0, status: "success", successCount: 1, errorCount: 0 },
+      { from: secondFrom, status: "running", successCount: 0, errorCount: 0, runningCount: 1 },
+    ]);
+  });
+
   it("projects explicit statement indexes to current editor lines", () => {
     const sql = "SELECT 1;\nSELECT * FROM missing;\nSELECT 3;";
     const secondFrom = sql.indexOf("SELECT *");
@@ -243,7 +362,7 @@ describe("statement execution markers", () => {
     ]);
   });
 
-  it("omits unindexed query-level errors and single-statement executions", () => {
+  it("omits unindexed query-level errors and legacy single-statement results without live state", () => {
     expect(statementExecutionMarkers("SELECT 1; SELECT 2;", [{ columns: ["Error"], rows: [["pool failed"]], affected_rows: 0, execution_time_ms: 1, execution_error: true }], "mysql", "SELECT 1; SELECT 2;")).toEqual([]);
     expect(statementExecutionMarkers("SELECT 1", [{ columns: ["value"], rows: [[1]], affected_rows: 0, execution_time_ms: 1, statement_index: 0, sourceStatement: "SELECT 1", sourceFrom: 0, sourceTo: 8 }], "mysql", "SELECT 1")).toEqual([]);
   });

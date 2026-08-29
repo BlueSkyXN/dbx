@@ -10,7 +10,11 @@ export function hasSchemaOptionsCacheEntry(options: Record<string, string[]>, ke
   return Object.prototype.hasOwnProperty.call(options, key);
 }
 
-export function schemaOptionsForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "driver_profile" | "visible_databases" | "visible_schemas"> | undefined, database = ""): string[] {
+export function schemaOptionsCacheKey(connectionId: string, database: string, showSystemSchemas: boolean): string {
+  return `${connectionId}:${database}:${showSystemSchemas ? "show-system" : "hide-system"}`;
+}
+
+export function schemaOptionsForConnection(schemaNames: string[], connection: Pick<ConnectionConfig, "db_type" | "driver_profile" | "visible_databases" | "visible_schemas" | "show_system_schemas"> | undefined, database = ""): string[] {
   // Keep numeric schema suffixes in human order (SCHEMA2 before SCHEMA10), matching the database tree.
   return sortSidebarNames(filterSchemaNamesForConnection(schemaNames, connection, database));
 }
@@ -20,9 +24,10 @@ export function useSchemaOptions() {
 
   const schemaOptions = ref<Record<string, string[]>>({});
   const loadingSchemaOptions = ref<Record<string, boolean>>({});
+  const schemaRequests = new Map<string, Promise<void>>();
 
   function cacheKey(connectionId: string, database: string) {
-    return `${connectionId}:${database}`;
+    return schemaOptionsCacheKey(connectionId, database, connectionStore.getConfig(connectionId)?.show_system_schemas === true);
   }
 
   function isSchemaAware(connectionId: string): boolean {
@@ -36,18 +41,24 @@ export function useSchemaOptions() {
     if (!database && !isSingleDatabase(dbType) && !usesTreeSchemaMode(dbType)) return;
     const key = cacheKey(connectionId, database);
     if (hasSchemaOptionsCacheEntry(schemaOptions.value, key)) return;
-    if (loadingSchemaOptions.value[key]) return;
+    const pending = schemaRequests.get(key);
+    if (pending) return pending;
 
-    loadingSchemaOptions.value[key] = true;
-    try {
-      await connectionStore.ensureConnected(connectionId);
-      schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection, database);
-    } catch (e) {
-      schemaOptions.value[key] = [];
-      throw e;
-    } finally {
-      loadingSchemaOptions.value[key] = false;
-    }
+    const request = (async () => {
+      loadingSchemaOptions.value[key] = true;
+      try {
+        await connectionStore.ensureConnected(connectionId);
+        schemaOptions.value[key] = schemaOptionsForConnection(await api.listSchemas(connectionId, database), connection, database);
+      } catch (e) {
+        schemaOptions.value[key] = [];
+        throw e;
+      } finally {
+        loadingSchemaOptions.value[key] = false;
+        schemaRequests.delete(key);
+      }
+    })();
+    schemaRequests.set(key, request);
+    return request;
   }
 
   function getSchemaOptionsForDb(connectionId: string, database: string): string[] {

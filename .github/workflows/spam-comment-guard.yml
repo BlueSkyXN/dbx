@@ -1,7 +1,8 @@
 name: Spam Comment Guard
 
 on:
-  workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 # 用 PROJECT_AUTOMATION_TOKEN（owner PAT）调 DELETE，GITHUB_TOKEN 本身无需写权限
 permissions:

@@ -13,6 +13,10 @@ pub struct DocumentQueryResult {
     // unchanged and only send the flag when Elasticsearch reports a lower bound.
     #[serde(default = "default_total_is_exact", skip_serializing_if = "is_true")]
     pub total_is_exact: bool,
+    /// Opaque document-store cursor for APIs such as DynamoDB that do not
+    /// support offset pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 fn default_total_is_exact() -> bool {
@@ -35,6 +39,7 @@ mod tests {
             extended_documents: None,
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         };
 
         let serialized = serde_json::to_value(result).unwrap();
@@ -46,5 +51,19 @@ mod tests {
         }))
         .unwrap();
         assert!(deserialized.total_is_exact);
+    }
+
+    #[test]
+    fn inexact_results_preserve_the_explicit_flag() {
+        let deserialized: DocumentQueryResult = serde_json::from_value(serde_json::json!({
+            "documents": [],
+            "total": 10_000_000,
+            "total_is_exact": false,
+        }))
+        .unwrap();
+        assert!(!deserialized.total_is_exact);
+
+        let serialized = serde_json::to_value(deserialized).unwrap();
+        assert_eq!(serialized.get("total_is_exact"), Some(&serde_json::json!(false)));
     }
 }

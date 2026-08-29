@@ -29,7 +29,8 @@ test("tracks database export progress and cancels through database export API", 
   });
 
   assert.equal(task.kind, "database-export");
-  assert.equal(task.tableName, "users");
+  assert.equal(task.tableName, "app");
+  assert.equal(task.currentObject, "users");
   assert.equal(task.objectIndex, 2);
   assert.equal(task.totalObjects, 5);
   assert.equal(tracker.activeCount.value, 1);
@@ -209,6 +210,35 @@ test("marks data transfer failed only on terminal error summary", () => {
   assert.equal(task.status, "Error");
   assert.equal(task.errorMessage, "1 table(s) failed: users");
   assert.equal(task.tableIndex, 2);
+  assert.deepEqual(task.transferFailures, [{ table: "users", error: "permission denied" }]);
+});
+
+test("keeps distinct table failures and updates duplicate table errors", () => {
+  const tracker = useExportTracker();
+  const task = tracker.addDataTransferTask("transfer-failure-details", "source → target", 2);
+
+  for (const [table, error] of [
+    ["users", "permission denied"],
+    ["orders", "target table missing"],
+    ["users", "permission denied by policy"],
+  ] as const) {
+    tracker.updateDataTransferTask(task.exportId, {
+      transferId: task.exportId,
+      table,
+      tableIndex: 0,
+      totalTables: 2,
+      rowsTransferred: 0,
+      totalRows: null,
+      status: "error",
+      error,
+      terminal: false,
+    });
+  }
+
+  assert.deepEqual(task.transferFailures, [
+    { table: "users", error: "permission denied by policy" },
+    { table: "orders", error: "target table missing" },
+  ]);
 });
 
 test("keeps data transfer row counts when terminal summary does not include rows", () => {

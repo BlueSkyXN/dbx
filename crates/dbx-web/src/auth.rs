@@ -79,7 +79,7 @@ pub async fn login(State(state): State<Arc<WebState>>, Json(body): Json<LoginReq
                 let remaining = (locked_until - std::time::Instant::now()).as_secs();
                 return Ok((
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": format!("请 {remaining} 秒后再试")})),
+                    Json(serde_json::json!({"error": format!("Please try again in {remaining}s")})),
                 )
                     .into_response());
             }
@@ -196,13 +196,15 @@ pub async fn change_password(
 pub async fn logout(State(state): State<Arc<WebState>>, req: Request<axum::body::Body>) -> Response {
     if let Some(token) = extract_session_token(&req) {
         state.sessions.write().await.remove(&token);
+        // 登出只清除当前登录会话的临时密码，不影响其他会话与桌面端凭据。
+        state.app.session_credentials.clear_owner(&token);
     }
     let cookie = format!("dbx_session=; Path={}; HttpOnly; Max-Age=0", session_cookie_path(&state));
     (StatusCode::OK, [("set-cookie", cookie.as_str())], Json(serde_json::json!({"ok": true}))).into_response()
 }
 
-fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
-    let cookie_header = req.headers().get("cookie")?.to_str().ok()?;
+pub fn session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_header = headers.get("cookie")?.to_str().ok()?;
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some(value) = pair.strip_prefix("dbx_session=") {
@@ -212,6 +214,10 @@ fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_session_token<B>(req: &Request<B>) -> Option<String> {
+    session_token_from_headers(req.headers())
 }
 
 pub async fn auth_middleware(
@@ -239,9 +245,17 @@ pub async fn auth_middleware(
     }
 
     // Check session token
-    if let Some(token) = extract_session_token(&req) {
-        if state.sessions.read().await.contains(&token) {
-            return next.run(req).await;
+    let token = extract_session_token(&req);
+    if let Some(ref token) = token {
+        if state.sessions.read().await.contains(token) {
+            // 在下游处理器及其 await 到的池创建路径上注入当前登录会话的 owner 作用域，
+            // 使 save_password=false 连接的临时密码按会话隔离（见 SessionCredentialStore）。
+            let owner = token.clone();
+            return dbx_core::session_credentials::with_credential_owner(
+                Some(owner),
+                async move { next.run(req).await },
+            )
+            .await;
         }
     }
 

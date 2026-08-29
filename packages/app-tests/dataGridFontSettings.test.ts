@@ -14,9 +14,21 @@ test("applies the configured result grid font to DOM and canvas renderers", () =
 });
 
 test("invalidates grid measurements and canvas rendering when the result font changes", () => {
-  assert.match(dataGridSource, /columnHeaderMeasurementKey = computed\(\(\) => \[tableFontSize\.value, tableFontFamily\.value\]\)/);
+  assert.match(dataGridSource, /columnHeaderMeasurementKey = computed\(\(\) => \[tableFontSize\.value, tableFontFamily\.value, dataGridFontReadyTick\.value\]\)/);
   assert.match(dataGridSource, /columnHeaderMeasureContext\.font = `600 \$\{tableFontSize\.value\}px \$\{tableFontFamily\.value\}`/);
-  assert.match(dataGridSource, /canvasRenderStyleKey = computed\(\(\) => `[^`]*\$\{tableFontFamily\.value\}:\$\{tableFontSize\.value\}`\)/);
+  assert.match(dataGridSource, /canvasRenderStyleKey = computed\(\(\) => `[^`]*\$\{tableFontFamily\.value\}:\$\{tableFontSize\.value\}:\$\{!!saveError\.value\}/);
+});
+
+test("invalidates canvas rendering when the data type color scheme changes", () => {
+  // The canvas caches its resolved paint theme by this key, so a recolor that is
+  // not represented here would leave the grid painted with the previous palette.
+  assert.match(dataGridSource, /canvasRenderStyleKey = computed\(\(\) => `[^`]*\$\{dataGridTypeColorKey\.value\}`\)/);
+  assert.match(dataGridSource, /resolveActiveDataGridTypeColors\(settings\.dataGridTypeColorSchemes, settings\.activeDataGridTypeColorSchemeId\)/);
+});
+
+test("waits only for the configured result font before remeasuring headers", () => {
+  assert.match(dataGridSource, /document\.fonts\.load\(`600 \$\{fontSize\}px \$\{fontFamily\}`\)/);
+  assert.doesNotMatch(dataGridSource, /document\.fonts\.addEventListener\("loadingdone"/);
 });
 
 test("places the result grid font beside the interface font in appearance settings", () => {
@@ -36,15 +48,16 @@ test("keeps appearance section spacing and help icons aligned without stacked ma
   assert.match(settingsDialogSource, /<div class="flex min-w-0 items-center gap-1">\s*<Label class="min-w-0 whitespace-normal leading-tight">\{\{ t\("settings\.dataGridFontFamily"\) \}\}<\/Label>/);
 });
 
-test("matches the result grid font selector styling with date and time selectors", () => {
+test("matches the result grid font selector styling with appearance form controls", () => {
   const selectorStart = settingsDialogSource.indexOf(`:model-value="editTableFontFamily"`);
   const selectorEnd = settingsDialogSource.indexOf(`</SearchableSelect>`, selectorStart);
   const selectorSource = settingsDialogSource.slice(selectorStart, selectorEnd);
 
   assert.ok(selectorStart >= 0);
   assert.ok(selectorEnd > selectorStart);
-  assert.match(selectorSource, /trigger-variant="outline"/);
-  assert.match(selectorSource, /trigger-class="h-9 w-full max-w-none justify-between"/);
+  // SearchableSelect defaults to outline; appearance fonts share the h-8 control chrome class.
+  assert.match(selectorSource, /:trigger-class="appearanceFontSearchTriggerClass"/);
+  assert.match(settingsDialogSource, /const fontSearchTriggerClass =\s*"h-8 w-full max-w-none justify-between/);
 });
 
 test("uses a table font label in view options without changing the settings label", () => {

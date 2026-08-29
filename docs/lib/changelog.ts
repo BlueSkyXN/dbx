@@ -1,4 +1,4 @@
-import { requestJson } from "@/lib/httpJson";
+import { requestJson } from "./httpJson";
 
 export type ChangelogItem = {
   title: string;
@@ -15,6 +15,7 @@ export type ChangelogRelease = {
   tag: string;
   name: string;
   date: string;
+  markdown?: string;
   sections: ChangelogSection[];
 };
 
@@ -23,111 +24,70 @@ export type ChangelogData = {
   releases: ChangelogRelease[];
 };
 
-type GitHubRelease = {
-  tag_name: string;
-  name: string | null;
-  published_at: string | null;
-  body: string | null;
-  draft: boolean;
-  prerelease: boolean;
+export type ChangelogIndexEntry = {
+  tag: string;
+  name: string;
+  date: string;
+};
+
+export type ChangelogIndex = {
+  updatedAt: string;
+  releases: ChangelogIndexEntry[];
+};
+
+export type ChangelogBootstrap = {
+  index: ChangelogIndexEntry[];
+  initialRelease: ChangelogRelease | null;
+  // index-cn.json 与 releases-cn/ 尚未发布到 R2 时，退回全量 releases JSON，
+  // 并把全量数据交给客户端按需取用，避免逐版本请求 404。
+  fallbackReleases: ChangelogRelease[] | null;
 };
 
 const DEFAULT_BASE_URL = "https://dl.dbxio.com/changelog";
-const GITHUB_RELEASES_URL = "https://api.github.com/repos/t8y2/dbx/releases?per_page=30";
 
-const SECTION_MAP: Record<string, string> = {
-  新功能: "added",
-  Added: "added",
-  改进: "improved",
-  Improved: "improved",
-  修复: "fixed",
-  Fixed: "fixed",
-  变更: "changed",
-  Changed: "changed",
-  移除: "removed",
-  Removed: "removed",
-};
+function changelogBaseUrl() {
+  return (typeof process !== "undefined" && (process.env.NEXT_PUBLIC_CHANGELOG_BASE_URL || process.env.CHANGELOG_BASE_URL)) || DEFAULT_BASE_URL;
+}
 
 export function changelogUrl(lang: "en" | "cn") {
-  const baseUrl = (typeof process !== "undefined" && (process.env.NEXT_PUBLIC_CHANGELOG_BASE_URL || process.env.CHANGELOG_BASE_URL)) || DEFAULT_BASE_URL;
+  return `${changelogBaseUrl()}/releases-${lang}.json`;
+}
 
-  return `${baseUrl}/releases-${lang}.json`;
+export function changelogIndexUrl(lang: "en" | "cn") {
+  return `${changelogBaseUrl()}/index-${lang}.json`;
+}
+
+export function changelogReleaseUrl(lang: "en" | "cn", tag: string) {
+  return `${changelogBaseUrl()}/releases-${lang}/${tag}.json`;
 }
 
 export async function fetchChangelog(lang: "en" | "cn"): Promise<ChangelogData> {
-  // 浏览器端同样优先走 R2 的翻译版 JSON（英文版由 sync-changelog 翻译生成）；
-  // 之前客户端直接 fallback 到 GitHub 原文（中文），会导致英文页面 hydrate 后被中文覆盖。
-  const url = changelogUrl(lang);
+  return requestJson<ChangelogData>(changelogUrl(lang), { cache: "force-cache" });
+}
 
+export async function fetchChangelogIndex(lang: "en" | "cn"): Promise<ChangelogIndex> {
+  return requestJson<ChangelogIndex>(changelogIndexUrl(lang), { cache: "force-cache" });
+}
+
+export async function fetchChangelogRelease(lang: "en" | "cn", tag: string): Promise<ChangelogRelease> {
+  return requestJson<ChangelogRelease>(changelogReleaseUrl(lang, tag), { cache: "force-cache" });
+}
+
+export async function loadChangelogBootstrap(lang: "en" | "cn"): Promise<ChangelogBootstrap> {
   try {
-    return await requestJson<ChangelogData>(url);
+    const index = await fetchChangelogIndex(lang);
+    if (index.releases.length > 0) {
+      const initialRelease = await fetchChangelogRelease(lang, index.releases[0].tag);
+      return { index: index.releases, initialRelease, fallbackReleases: null };
+    }
   } catch {
-    return fetchGitHubChangelog();
-  }
-}
-
-function stripDownloadSection(body: string) {
-  const markers = ["### 下载安装", "### Download", "### 系统要求", "### System Requirements"];
-  let idx = body.length;
-
-  for (const marker of markers) {
-    const markerIndex = body.indexOf(marker);
-    if (markerIndex !== -1 && markerIndex < idx) {
-      idx = markerIndex;
-    }
+    // fall through to the full listing
   }
 
-  return body.slice(0, idx).trim();
-}
-
-function parseReleaseBody(body: string) {
-  const sections: ChangelogSection[] = [];
-  let current: ChangelogSection | null = null;
-
-  for (const line of stripDownloadSection(body).split("\n")) {
-    const headerMatch = line.match(/^###\s+(.+)/);
-    if (headerMatch) {
-      const title = headerMatch[1].trim();
-      current = { type: SECTION_MAP[title] || "other", title, items: [] };
-      sections.push(current);
-      continue;
-    }
-
-    if (!current) continue;
-
-    const itemMatch = line.match(/^-\s+\*\*(.+?)\*\*\s*[—–-]\s*(.+)/);
-    if (itemMatch) {
-      current.items.push({ title: itemMatch[1].trim(), desc: itemMatch[2].trim() });
-      continue;
-    }
-
-    const plainMatch = line.match(/^-\s+(.+)/);
-    if (plainMatch) {
-      current.items.push({ title: plainMatch[1].trim(), desc: "" });
-    }
-  }
-
-  return sections.filter((section) => section.items.length > 0);
-}
-
-export async function fetchGitHubChangelog(): Promise<ChangelogData> {
-  try {
-    const releases = await requestJson<GitHubRelease[]>(GITHUB_RELEASES_URL, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-
-    return {
-      updatedAt: new Date().toISOString(),
-      releases: releases
-        .filter((release) => !release.draft && !release.prerelease && !release.tag_name.startsWith("agents-"))
-        .map((release) => ({
-          tag: release.tag_name,
-          name: release.name || release.tag_name,
-          date: (release.published_at || "").slice(0, 10),
-          sections: parseReleaseBody(release.body || ""),
-        })),
-    };
-  } catch {
-    return { updatedAt: "", releases: [] };
-  }
+  const full = await fetchChangelog(lang);
+  return {
+    index: full.releases.map(({ tag, name, date }) => ({ tag, name, date })),
+    initialRelease: full.releases[0] ?? null,
+    fallbackReleases: full.releases,
+  };
 }

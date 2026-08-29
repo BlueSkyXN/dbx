@@ -1,14 +1,17 @@
 name: Notifications
 
 on:
-  workflow_dispatch:
+  # issues:
+  #   types: [opened]
+  pull_request_target:
+    types: [opened, closed]
+  release:
+    types: [published]
 
 jobs:
   notify:
     runs-on: ubuntu-latest
-    if: |
-      (github.event_name != 'pull_request_target' || github.repository == 't8y2/dbx') &&
-      (github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease))
+    if: ${{ github.event_name != 'release' || (!github.event.release.draft && !github.event.release.prerelease) }}
     steps:
       - name: Build message
         id: msg
@@ -52,7 +55,7 @@ jobs:
               tag = os.environ["RELEASE_TAG"]
               name = os.environ["RELEASE_NAME"]
               url = os.environ["RELEASE_URL"]
-              body = os.environ.get("RELEASE_BODY", "")[:800]
+              body = os.environ.get("RELEASE_BODY", "")
 
               import re
               body = re.sub(r'#{1,6}\s*', '', body)
@@ -190,8 +193,9 @@ jobs:
           # ${AI_ANALYSIS}"
           # fi
 
-          MSG=$(echo "$MSG_CONTENT" | jq -Rs .)
-          ssh "root@${HOST}" "curl -s -X POST http://localhost:6185/api/v1/im/message \
+          PAYLOAD=$(jq -nc --arg msg "$MSG_CONTENT" \
+            '{"umo": "default:GroupMessage:1087880322", "message": $msg}')
+          printf '%s' "$PAYLOAD" | ssh "root@${HOST}" "curl -fsS -X POST http://localhost:6185/api/v1/im/message \
             -H 'Authorization: Bearer ${ASTRBOT_API_KEY}' \
             -H 'Content-Type: application/json' \
-            -d '{\"umo\": \"default:GroupMessage:1087880322\", \"message\": ${MSG}}'"
+            --data-binary @-"

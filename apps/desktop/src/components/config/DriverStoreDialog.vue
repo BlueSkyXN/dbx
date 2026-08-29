@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, nextTick, type Ref } from "vue";
+import { ref, reactive, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
-import { Activity, ExternalLink, Cpu, FolderOpen, FolderSync, MemoryStick, Search, Square, Trash2, Download, RotateCcw, Loader2, RefreshCw, Check, Clock3, FileUp } from "@lucide/vue";
+import { Activity, ExternalLink, Cpu, FolderOpen, FolderSync, MemoryStick, Search, Square, Trash2, Download, RotateCcw, Loader2, RefreshCw, Check, Clock3, FileArchive, FileUp, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,22 +10,47 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import DriverInstallProgressCircle from "@/components/config/DriverInstallProgressCircle.vue";
+import AgentOfflineExportDialog from "@/components/config/AgentOfflineExportDialog.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { uuid } from "@/lib/common/utils";
 import { countAvailableDriverUpdates } from "@/lib/connection/agentDriverUpdateBadge";
 import type { JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, JdbcPluginStatus } from "@/types/database";
 import * as api from "@/lib/backend/api";
-import type { AgentDriverInfo, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/backend/api";
+import type { AgentDriverInfo, AgentOfflineExportPreview, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/backend/api";
 import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealthClass, runtimeStatusClass, runtimeStatusDotClass } from "@/lib/connection/driverRuntimePresentation";
-import { addDriverInstallQueue, driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, updateDriverInstallProgress, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
-import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/database/prestoSqlBuiltinDriver";
+import {
+  addDriverInstallQueue,
+  driverInstallProgressChannel,
+  driverInstallProgressPercent,
+  isDriverInstallCanceledError,
+  isDriverInstallCancellationTarget,
+  isDriverInstallProgressForOperation,
+  isDriverInstallProgressTarget,
+  removeDriverInstallQueue,
+  takeNextDriverInstallQueue,
+  updatePerDriverProgress,
+  type DriverInstallProgress,
+} from "@/lib/connection/driverInstallProgressUi";
+import { installRegisteredManagedJdbcDriver, isManagedJdbcDriver, managedJdbcDriverRows, uninstallRegisteredManagedJdbcDriver } from "@/lib/database/managedJdbcDrivers";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
 import { isOfflineDriverPackage, webDriverImportAccept } from "@/lib/driverStore/driverImportSelection";
+import { translateBackendError } from "@/i18n/backend-errors";
+import { runAgentOfflineExportAction } from "@/lib/driverStore/agentOfflineExportFlow";
+import { DRIVER_CATEGORIES, getCategoryForAgentDriver, assertAgentDriverCategoriesComplete } from "@/lib/connection/driver-category-definitions";
+import { selectUpdatableDrivers, selectStableDrivers, hasAnyUpdatableDriverMatching } from "@/lib/connection/driverListFilter";
 
 const { t } = useI18n();
 const { toast } = useToast();
 const isWeb = !isTauriRuntime();
+
+// Backend errors arrive as plain strings, so translate them before they are
+// interpolated into an already-localized wrapper message.
+function backendError(e: unknown): string {
+  const message = e instanceof Error ? e.message : ((e as { message?: string } | null)?.message ?? String(e));
+  return translateBackendError(t, message);
+}
 
 const props = withDefaults(
   defineProps<{
@@ -154,7 +179,7 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
     const { relaunch } = await import("@tauri-apps/plugin-process");
     relaunch();
   } catch (e: any) {
-    toast(t("driverStore.driverStoreDirMigrationFailed", { error: e?.message || String(e) }), 5000);
+    toast(t("driverStore.driverStoreDirMigrationFailed", { error: backendError(e) }), 5000);
   } finally {
     driverStoreDirMigrating.value = null;
   }
@@ -164,21 +189,31 @@ async function applyDriverStoreDir(kind: DriverStoreDirKind, newDir: string | nu
 
 const drivers = ref<AgentDriverInfo[]>([]);
 const agentDriverSearch = ref("");
+const selectedDriverCategory = ref<string>("all");
 const installing = ref<string | null>(null);
 const upgradingAll = ref(false);
-const upgradingCurrent = ref("");
-const upgradingIndex = ref(0);
+const preparingUpgradeAll = ref(false);
+const upgradingCompletedCount = ref(0);
 const upgradingTotal = ref(0);
 const queuedDriverInstalls = ref<string[]>([]);
 const reinstallingJre = ref<string | null>(null);
+const activeAgentOperationId = ref<string | null>(null);
+const cancellableAgentInstallDbType = ref<string | null>(null);
 const refreshing = ref(false);
-const agentProgress = ref<DriverInstallProgress | null>(null);
+const agentProgressByDbType = reactive<Record<string, DriverInstallProgress | null | undefined>>({});
 const jdbcPluginProgress = ref<DriverInstallProgress | null>(null);
 const javaRuntimeConfig = ref<JavaRuntimeConfig>({ mode: "managed", custom_java_path: null });
 const customJavaPath = ref("");
 const savingJavaRuntime = ref(false);
 const driverStoreUsage = ref<DriverStoreUsage | null>(null);
 const clearingDownloadCache = ref(false);
+const offlineExportDialogOpen = ref(false);
+const offlineExportPreview = ref<AgentOfflineExportPreview | null>(null);
+const offlineExportLoading = ref(false);
+const offlineExporting = ref(false);
+const offlineExportError = ref("");
+const uninstallingDriver = ref<string | null>(null);
+const uninstallingJre = ref<string | null>(null);
 const runtimeSummary = ref<DriverRuntimeSummary | null>(null);
 const runtimeLoading = ref(false);
 const runtimeError = ref("");
@@ -188,7 +223,7 @@ const DRIVER_RUNTIME_POLL_MS = 5000;
 const OFFLINE_DRIVER_DOWNLOAD_URL = "https://dbxio.com/cn/drivers";
 
 let unlisten: (() => void) | null = null;
-const lastAgentProgressPercent = ref<number | null>(null);
+const lastAgentProgressPercent: Record<string, number> = {};
 const lastJdbcPluginProgressPercent = ref<number | null>(null);
 
 const installedJres = computed(() => {
@@ -201,7 +236,7 @@ const installedJres = computed(() => {
   return [...jreMap.entries()].map(([key, installed]) => ({ key, installed })).sort((a, b) => b.key.localeCompare(a.key));
 });
 
-function formatProgressText(p: DriverInstallProgress | null, includeBatch: boolean): string {
+function formatProgressText(p: DriverInstallProgress | null | undefined): string {
   if (!p) return "";
   if (p.step === "jre-extract") return t("driverStore.progressJreExtract");
   if (p.step === "jdbc-plugin-extract") return t("driverStore.progressJdbcPluginExtract");
@@ -210,27 +245,49 @@ function formatProgressText(p: DriverInstallProgress | null, includeBatch: boole
   const pct = Math.round(((p.downloaded ?? 0) / p.total) * 100);
   const dl = formatSize(p.downloaded ?? 0);
   const total = formatSize(p.total);
-  const prefix = includeBatch && upgradingAll.value && upgradingCurrent.value ? `[${upgradingIndex.value}/${upgradingTotal.value}] ${upgradingCurrent.value} - ` : "";
-  return `${prefix}${label}  ${dl} / ${total}  (${pct}%)`;
+  return `${label}  ${dl} / ${total}  (${pct}%)`;
 }
 
-const agentProgressText = computed(() => formatProgressText(agentProgress.value, true));
-const jdbcPluginProgressText = computed(() => formatProgressText(jdbcPluginProgress.value, false));
+function getAgentProgressText(dbType: string): string {
+  return formatProgressText(agentProgressByDbType[dbType]);
+}
 
-function progressNumber(progress: DriverInstallProgress | null, lastProgressPercent: Ref<number | null>): number | null {
+function getJdbcPluginProgressTitle(fallback: string): string {
+  return jdbcPluginProgressText.value || fallback;
+}
+
+function getAgentProgressTitle(dbType: string, fallback: string): string {
+  return getAgentProgressText(dbType) || formatProgressText(agentProgressByDbType[dbType]) || fallback;
+}
+
+const jdbcPluginProgressText = computed(() => formatProgressText(jdbcPluginProgress.value));
+
+function getAgentProgressPercent(dbType: string): number | null {
+  const progress = agentProgressByDbType[dbType];
   const next = driverInstallProgressPercent(progress);
   if (next !== null) {
-    lastProgressPercent.value = next;
+    lastAgentProgressPercent[dbType] = next;
   }
-  return next ?? lastProgressPercent.value;
+  return next ?? lastAgentProgressPercent[dbType] ?? null;
 }
 
-const agentProgressNumber = computed(() => progressNumber(agentProgress.value, lastAgentProgressPercent));
-const jdbcPluginProgressNumber = computed(() => progressNumber(jdbcPluginProgress.value, lastJdbcPluginProgressPercent));
+const jdbcPluginProgressNumber = computed(() => {
+  const next = driverInstallProgressPercent(jdbcPluginProgress.value);
+  if (next !== null) {
+    lastJdbcPluginProgressPercent.value = next;
+  }
+  return next ?? lastJdbcPluginProgressPercent.value;
+});
 
 function resetAgentInstallProgress() {
-  agentProgress.value = null;
-  lastAgentProgressPercent.value = null;
+  for (const key of Object.keys(agentProgressByDbType)) {
+    delete agentProgressByDbType[key];
+  }
+  for (const key of Object.keys(lastAgentProgressPercent)) {
+    delete lastAgentProgressPercent[key];
+  }
+  jreReinstallProgress.value = null;
+  lastJreReinstallPercent.value = null;
 }
 
 function resetJdbcPluginInstallProgress() {
@@ -281,7 +338,16 @@ function isDriverProgressActive(dbType: string): boolean {
   return isDriverInstallProgressTarget(dbType, {
     installing: installing.value,
     upgradingAll: upgradingAll.value,
-    progress: agentProgress.value,
+    progressMap: agentProgressByDbType,
+  });
+}
+
+function isDriverInstallCancellable(dbType: string): boolean {
+  return isDriverInstallCancellationTarget(dbType, {
+    activeOperationId: activeAgentOperationId.value,
+    cancellableDbType: cancellableAgentInstallDbType.value,
+    upgradingAll: upgradingAll.value,
+    progressMap: agentProgressByDbType,
   });
 }
 
@@ -289,19 +355,25 @@ function driverRequiresJavaRuntime(driver: AgentDriverInfo): boolean {
   return driver.requires_java_runtime ?? Boolean(driver.jre);
 }
 
-function agentProgressTitle(fallback: string): string {
-  return agentProgressText.value || fallback;
+// JRE reinstall is single-threaded, so a simpler model suffices.
+const jreReinstallProgress = ref<DriverInstallProgress | null>(null);
+const lastJreReinstallPercent = ref<number | null>(null);
+
+function getJreReinstallPercent(): number | null {
+  const next = driverInstallProgressPercent(jreReinstallProgress.value);
+  if (next !== null) lastJreReinstallPercent.value = next;
+  return next ?? lastJreReinstallPercent.value;
 }
 
-function jdbcPluginProgressTitle(fallback: string): string {
-  return jdbcPluginProgressText.value || fallback;
+function getJreReinstallTitle(fallback: string): string {
+  return formatProgressText(jreReinstallProgress.value) || fallback;
 }
 
-function isPrestoSqlBuiltinDriver(dbType: string): boolean {
-  return dbType === PRESTOSQL_DRIVER_DB_TYPE;
+function isManagedJdbcBuiltinDriver(dbType: string): boolean {
+  return isManagedJdbcDriver(dbType);
 }
 
-const builtinDriverRows = computed<AgentDriverInfo[]>(() => [...drivers.value, prestoSqlBuiltinDriverRow(jdbcMavenBundles.value)]);
+const builtinDriverRows = computed<AgentDriverInfo[]>(() => [...drivers.value, ...managedJdbcDriverRows(jdbcMavenBundles.value, jdbcPluginStatus.value)]);
 
 function driverLabel(dbType: string): string {
   return builtinDriverRows.value.find((d) => d.db_type === dbType)?.label ?? dbType;
@@ -336,6 +408,14 @@ function removeQueuedDriverInstall(dbType: string) {
 async function refreshAgents() {
   updateAgentDrivers(await api.listInstalledAgents());
   void loadDriverStoreUsage();
+  // DEV: validate category coverage
+  if (import.meta.env.DEV) {
+    try {
+      assertAgentDriverCategoriesComplete(drivers.value.map((d) => d.db_type));
+    } catch (e) {
+      console.warn("[DriverStore] Agent driver category mapping incomplete:", e);
+    }
+  }
 }
 
 async function forceRefresh() {
@@ -378,7 +458,7 @@ async function saveJavaRuntimeConfig() {
     customJavaPath.value = config.custom_java_path ?? "";
     toast(t("driverStore.javaRuntimeSaved"));
   } catch (e: any) {
-    toast(t("driverStore.javaRuntimeSaveFailed", { error: e }));
+    toast(t("driverStore.javaRuntimeSaveFailed", { error: backendError(e) }));
   } finally {
     savingJavaRuntime.value = false;
   }
@@ -397,7 +477,8 @@ async function chooseCustomJavaPath() {
 }
 
 async function installDriver(dbType: string) {
-  if (installing.value !== null || upgradingAll.value) {
+  if (agentPackageBusy.value) return;
+  if (installing.value !== null || preparingUpgradeAll.value || upgradingAll.value) {
     queueDriverInstall(dbType);
     return;
   }
@@ -410,13 +491,14 @@ async function runDriverInstall(dbType: string) {
   installing.value = dbType;
   resetAgentInstallProgress();
   try {
-    if (isPrestoSqlBuiltinDriver(dbType)) {
-      if (!jdbcPluginStatus.value?.installed || !jdbcPluginStatus.value.compatible) {
-        jdbcPluginStatus.value = await api.installJdbcPlugin();
+    const managedResult = await installRegisteredManagedJdbcDriver(dbType, jdbcMavenBundles.value, jdbcPluginStatus.value, api);
+    if (managedResult) {
+      if (managedResult.pluginStatus) {
+        jdbcPluginStatus.value = managedResult.pluginStatus;
         emitDriverUpdateCount();
       }
-      jdbcDrivers.value = await api.installPrestoSqlJdbcDriver();
-      jdbcMavenBundles.value = await api.listJdbcMavenBundles();
+      if (managedResult.drivers) jdbcDrivers.value = managedResult.drivers;
+      jdbcMavenBundles.value = managedResult.bundles;
       void loadDriverStoreUsage();
       toast(t("driverStore.driverInstallSuccess", { label }));
       return;
@@ -426,19 +508,28 @@ async function runDriverInstall(dbType: string) {
       toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
       return;
     }
-    await api.installAgent(dbType);
+    const operationId = uuid();
+    activeAgentOperationId.value = operationId;
+    cancellableAgentInstallDbType.value = dbType;
+    await api.installAgent(dbType, operationId);
     await refreshAgents();
     toast(t("driverStore.driverInstallSuccess", { label }));
   } catch (e: any) {
-    toast(t("driverStore.driverInstallFailed", { label, error: e }));
+    if (isDriverInstallCanceledError(e)) {
+      toast(t("driverStore.driverInstallCancelled", { label }));
+      return;
+    }
+    toast(t("driverStore.driverInstallFailed", { label, error: backendError(e) }));
   } finally {
     installing.value = null;
+    activeAgentOperationId.value = null;
+    cancellableAgentInstallDbType.value = null;
     resetAgentInstallProgress();
   }
 }
 
 async function runQueuedDriverInstalls() {
-  if (installing.value !== null || upgradingAll.value) return;
+  if (agentPackageBusy.value || installing.value !== null || preparingUpgradeAll.value || upgradingAll.value) return;
 
   const result = takeNextDriverInstallQueue(queuedDriverInstalls.value, canInstallOrUpdateDriver);
   queuedDriverInstalls.value = result.queue;
@@ -449,9 +540,8 @@ async function runQueuedDriverInstalls() {
 }
 
 async function upgradeAll() {
-  upgradingAll.value = true;
-  queuedDriverInstalls.value = [];
-  resetAgentInstallProgress();
+  if (agentPackageBusy.value || preparingUpgradeAll.value || upgradingAll.value) return;
+  preparingUpgradeAll.value = true;
   try {
     const updatableDbTypes = drivers.value.filter((driver) => driver.update_available).map((driver) => driver.db_type);
     const blockers = await api.checkAgentUpdateBlockers(updatableDbTypes);
@@ -459,8 +549,20 @@ async function upgradeAll() {
       toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
       return;
     }
-    const result = await api.upgradeAllAgents();
+    // Do not expose Cancel until the backend operation has registered its token.
+    // Otherwise a cancel during this client-side blocker check is silently lost.
+    upgradingAll.value = true;
+    activeAgentOperationId.value = uuid();
+    upgradingCompletedCount.value = 0;
+    upgradingTotal.value = updatableDbTypes.length;
+    queuedDriverInstalls.value = [];
+    resetAgentInstallProgress();
+    const result = await api.upgradeAllAgents(activeAgentOperationId.value);
     await refreshAgents();
+    if (result.cancelled > 0 && result.failed.length === 0) {
+      toast(t("driverStore.upgradeAllCancelled", { count: result.cancelled }));
+      return;
+    }
     if (result.failed.length > 0) {
       const failedLabels = result.failed.map((item) => drivers.value.find((driver) => driver.db_type === item.db_type)?.label ?? item.db_type).join(", ");
       toast(t("driverStore.upgradeAllPartial", { count: result.upgraded, failed: failedLabels }));
@@ -468,43 +570,128 @@ async function upgradeAll() {
       toast(t("driverStore.upgradeAllSuccess", { count: result.upgraded }));
     }
   } catch (e: any) {
-    toast(t("driverStore.upgradeAllFailed", { error: e }));
+    if (isDriverInstallCanceledError(e)) {
+      toast(t("driverStore.upgradeAllCancelled", { count: 0 }));
+      return;
+    }
+    toast(t("driverStore.upgradeAllFailed", { error: backendError(e) }));
   } finally {
+    preparingUpgradeAll.value = false;
     upgradingAll.value = false;
-    upgradingCurrent.value = "";
-    upgradingIndex.value = 0;
+    activeAgentOperationId.value = null;
+    upgradingCompletedCount.value = 0;
     upgradingTotal.value = 0;
     resetAgentInstallProgress();
   }
 }
 
-async function uninstallDriver(dbType: string) {
-  const label = driverLabel(dbType);
+/** Abort a single driver's install, whether started alone or inside a batch. */
+async function cancelDriverInstall(dbType: string) {
+  if (!isDriverInstallCancellable(dbType) || !activeAgentOperationId.value) return;
   try {
-    if (isPrestoSqlBuiltinDriver(dbType)) {
-      const bundle = prestoSqlMavenBundle(jdbcMavenBundles.value);
-      if (!bundle) return;
-      jdbcDrivers.value = await api.deleteJdbcMavenBundle(bundle.id);
-      jdbcMavenBundles.value = await api.listJdbcMavenBundles();
+    await api.cancelAgentInstall(dbType, activeAgentOperationId.value);
+  } catch {
+    // A cancel that arrives after the download finished is a no-op.
+  }
+}
+
+/** Abort the whole batch upgrade: in-flight downloads stop, queued ones never start. */
+async function cancelUpgradeAll() {
+  try {
+    await api.cancelAgentUpgradeAll(activeAgentOperationId.value ?? undefined);
+  } catch {
+    // The batch may have just finished; treat a failed cancel as a no-op.
+  }
+}
+
+async function uninstallDriver(dbType: string) {
+  if (agentPackageBusy.value) return;
+  const label = driverLabel(dbType);
+  uninstallingDriver.value = dbType;
+  try {
+    const managedResult = await uninstallRegisteredManagedJdbcDriver(dbType, jdbcMavenBundles.value, api);
+    if (managedResult) {
+      if (managedResult.drivers) jdbcDrivers.value = managedResult.drivers;
+      jdbcMavenBundles.value = managedResult.bundles;
       void loadDriverStoreUsage();
       toast(t("driverStore.driverUninstallSuccess", { label }));
+      return;
+    }
+    const blockers = await api.checkAgentUpdateBlockers([dbType]);
+    if (blockers.length > 0) {
+      toast(t("driverStore.driverUpdateBlocked", { labels: blockers.map((blocker) => blocker.label).join(", ") }));
       return;
     }
     await api.uninstallAgent(dbType);
     await refreshAgents();
     toast(t("driverStore.driverUninstallSuccess", { label }));
   } catch (e: any) {
-    toast(t("driverStore.driverUninstallFailed", { label, error: e }));
+    toast(t("driverStore.driverUninstallFailed", { label, error: backendError(e) }));
+  } finally {
+    uninstallingDriver.value = null;
   }
 }
 
 const importingZip = ref(false);
+const importingDriver = ref<string | null>(null);
+const agentImportBusy = computed(() => importingZip.value || importingDriver.value !== null);
+const agentPackageBusy = computed(() => agentImportBusy.value || offlineExportLoading.value || offlineExporting.value || uninstallingDriver.value !== null || uninstallingJre.value !== null);
+const agentExportImportBlocked = computed(() => agentPackageBusy.value || installing.value !== null || preparingUpgradeAll.value || upgradingAll.value || reinstallingJre.value !== null || queuedDriverInstalls.value.length > 0);
+
+async function openOfflineExportDialog() {
+  if (isWeb || agentExportImportBlocked.value) return;
+  offlineExportDialogOpen.value = true;
+  offlineExportLoading.value = true;
+  offlineExportPreview.value = null;
+  offlineExportError.value = "";
+  try {
+    offlineExportPreview.value = await api.previewAgentOfflineExport();
+  } catch (error) {
+    offlineExportError.value = t("driverStore.offlineExportPreviewFailed", { error: backendError(error) });
+  } finally {
+    offlineExportLoading.value = false;
+  }
+}
+
+async function exportOfflinePackage(driverKeys: string[]) {
+  if (isWeb || agentExportImportBlocked.value || driverKeys.length === 0) return;
+  const platform = offlineExportPreview.value?.platform ?? "current-platform";
+  await runAgentOfflineExportAction({
+    driverKeys,
+    setBusy: (busy) => {
+      offlineExporting.value = busy;
+    },
+    chooseDestination: async () => {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      return save({
+        title: t("driverStore.offlineExportChooseDestination"),
+        defaultPath: `dbx-agents-offline-${platform}.zip`,
+        filters: [{ name: "ZIP", extensions: ["zip"] }],
+      });
+    },
+    exportPackage: api.exportAgentsOffline,
+    onSuccess: ({ destination, result }) => {
+      offlineExportDialogOpen.value = false;
+      toast(
+        t("driverStore.offlineExportSuccess", {
+          drivers: result.driverCount,
+          jres: result.jreCount,
+          size: formatBytes(result.bytes),
+          file: destination.split(/[/\\]/).pop() || destination,
+        }),
+      );
+    },
+    onError: (error) => {
+      toast(t("driverStore.offlineExportFailed", { error: backendError(error) }), 8000);
+    },
+  });
+}
 
 function chooseWebOfflineZip(): Promise<File | null> {
   return new Promise((resolve) => {
     const input = document.createElement("input");
     input.type = "file";
-    input.accept = ".zip";
+    input.accept = ".zip,.tar.zst";
     input.onchange = () => resolve(input.files?.[0] ?? null);
     input.click();
   });
@@ -539,7 +726,7 @@ function chooseWebFile(accept: string): Promise<File | null> {
 }
 
 async function importOfflineZip() {
-  if (importingZip.value) return;
+  if (agentExportImportBlocked.value) return;
   let selected: string | File | null = null;
   if (isWeb) {
     selected = await chooseWebOfflineZip();
@@ -548,28 +735,31 @@ async function importOfflineZip() {
     const path = await open({
       title: t("driverStore.chooseOfflineDriverPackage"),
       multiple: false,
-      filters: [{ name: "ZIP", extensions: ["zip"] }],
+      filters: [{ name: "Driver package", extensions: ["zip", "zst"] }],
     });
     selected = typeof path === "string" ? path : null;
   }
   if (!selected) return;
   importingZip.value = true;
+  activeAgentOperationId.value = uuid();
   resetAgentInstallProgress();
   try {
-    const count = await api.importAgentsFromZip(selected);
-    await refreshAgents();
+    const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+    await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
     toast(t("driverStore.offlineImportSuccess", { count }));
   } catch (e: any) {
-    toast(t("driverStore.offlineImportFailed", { error: e }));
+    toast(t("driverStore.offlineImportFailed", { error: backendError(e) }));
   } finally {
     importingZip.value = false;
+    activeAgentOperationId.value = null;
     resetAgentInstallProgress();
   }
 }
 
 async function importDriverFile(driver: AgentDriverInfo) {
+  if (agentPackageBusy.value) return;
   const dbType = driver.db_type;
-  if (isPrestoSqlBuiltinDriver(dbType)) {
+  if (isManagedJdbcBuiltinDriver(dbType)) {
     await importJdbcDrivers();
     return;
   }
@@ -583,13 +773,30 @@ async function importDriverFile(driver: AgentDriverInfo) {
   const isWindows = navigator.userAgent.toLowerCase().includes("windows");
   const installSelectedFile = async (selected: string | File) => {
     if (isOfflineDriverPackage(selected)) {
-      const count = await api.importAgentsFromZip(selected);
-      await refreshAgents();
-      toast(t("driverStore.offlineImportSuccess", { count }));
+      activeAgentOperationId.value = uuid();
+      resetAgentInstallProgress();
+      try {
+        const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+        await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
+        toast(t("driverStore.offlineImportSuccess", { count }));
+      } finally {
+        activeAgentOperationId.value = null;
+        resetAgentInstallProgress();
+      }
     } else {
       await api.importAgentDriver(dbType, selected);
       await refreshAgents();
       toast(t("driverStore.driverImportSuccess", { label }));
+    }
+  };
+  const runSelectedFileImport = async (selected: string | File) => {
+    importingDriver.value = dbType;
+    try {
+      await installSelectedFile(selected);
+    } catch (e: any) {
+      toast(t("driverStore.driverImportFailed", { label, error: backendError(e) }));
+    } finally {
+      importingDriver.value = null;
     }
   };
   if (isWeb) {
@@ -597,49 +804,48 @@ async function importDriverFile(driver: AgentDriverInfo) {
     // a browser accept filter that would make the correct file unselectable.
     const file = await chooseWebFile(webDriverImportAccept(requiresJavaRuntime, isWindows));
     if (!file) return;
-    try {
-      await installSelectedFile(file);
-    } catch (e: any) {
-      toast(t("driverStore.driverImportFailed", { label, error: e }));
-    }
+    await runSelectedFileImport(file);
     return;
   }
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({
     title: t("driverStore.chooseDriverJar"),
     multiple: false,
-    filters: requiresJavaRuntime ? [{ name: "Driver package or JAR", extensions: ["zip", "jar"] }] : isWindows ? [{ name: "Driver package or executable", extensions: ["zip", "exe"] }] : undefined,
+    filters: requiresJavaRuntime ? [{ name: "Driver package or JAR", extensions: ["zip", "zst", "jar"] }] : isWindows ? [{ name: "Driver package or executable", extensions: ["zip", "zst", "exe"] }] : undefined,
   });
   if (typeof selected !== "string") return;
-  try {
-    await installSelectedFile(selected);
-  } catch (e: any) {
-    toast(t("driverStore.driverImportFailed", { label, error: e }));
-  }
+  await runSelectedFileImport(selected);
 }
 
 async function reinstallJre(jreKey: string) {
+  if (agentPackageBusy.value) return;
   reinstallingJre.value = jreKey;
+  activeAgentOperationId.value = uuid();
   resetAgentInstallProgress();
   try {
-    await api.reinstallJre(jreKey);
+    await api.reinstallJre(jreKey, activeAgentOperationId.value);
     await refreshAgents();
     toast(t("driverStore.jreReinstallSuccess", { jre: jreKey }));
   } catch (e: any) {
-    toast(t("driverStore.jreReinstallFailed", { jre: jreKey, error: e }));
+    toast(t("driverStore.jreReinstallFailed", { jre: jreKey, error: backendError(e) }));
   } finally {
     reinstallingJre.value = null;
+    activeAgentOperationId.value = null;
     resetAgentInstallProgress();
   }
 }
 
 async function uninstallJre(jreKey: string) {
+  if (agentPackageBusy.value) return;
+  uninstallingJre.value = jreKey;
   try {
     await api.uninstallJre(jreKey);
     await refreshAgents();
     toast(t("driverStore.jreUninstallSuccess", { jre: jreKey }));
   } catch (e: any) {
     toast(String(e));
+  } finally {
+    uninstallingJre.value = null;
   }
 }
 
@@ -702,39 +908,86 @@ type JdbcDriverListItem =
       bundle: JdbcMavenBundleInfo;
     };
 
-const filteredAgentDrivers = computed(() => {
-  const query = agentDriverSearch.value.trim().toLowerCase();
-  if (!query) return builtinDriverRows.value;
-  return builtinDriverRows.value.filter((driver) => [driver.label, driver.db_type, driver.version, driver.installed_version, driverRequiresJavaRuntime(driver) ? driver.jre : ""].filter(Boolean).join(" ").toLowerCase().includes(query));
+// Resolved category list with i18n
+const driverCategories = computed(() =>
+  DRIVER_CATEGORIES.map((cat) => ({
+    key: cat.key,
+    title: t(cat.titleKey),
+  })),
+);
+
+const driverSearchQuery = computed(() => agentDriverSearch.value.trim().toLowerCase());
+const isDriverSearchActive = computed(() => !!driverSearchQuery.value);
+
+// Category label helper (for search results badges) — defined before searchedDrivers
+function driverCategoryLabel(dbType: string): string {
+  const catKey = getCategoryForAgentDriver(dbType);
+  if (catKey === "all") return t("driverStore.driverCategoryAll");
+  const catDef = DRIVER_CATEGORIES.find((c) => c.key === catKey);
+  return catDef ? t(catDef.titleKey) : t("driverStore.driverCategoryAll");
+}
+
+// Search only stable drivers — updatable drivers already appear in the global update section.
+const stableBuiltinDrivers = computed(() => selectStableDrivers(builtinDriverRows.value));
+
+// Filter stable drivers through search (or pass all through if no search)
+const searchedDrivers = computed(() => {
+  const query = driverSearchQuery.value;
+  if (!query) return stableBuiltinDrivers.value;
+  return stableBuiltinDrivers.value.filter((driver) => [driver.label, driver.db_type, driver.version, driver.installed_version, driverRequiresJavaRuntime(driver) ? driver.jre : "", driverCategoryLabel(driver.db_type)].filter(Boolean).join(" ").toLowerCase().includes(query));
 });
 
-/** filteredAgentDrivers reordered: updatable drivers first, then the rest (installed + not-installed). */
-const orderedFilteredDrivers = computed(() => {
-  const updatable: AgentDriverInfo[] = [];
-  const stable: AgentDriverInfo[] = [];
-  for (const driver of filteredAgentDrivers.value) {
-    if (driver.update_available) {
-      updatable.push(driver);
-    } else {
-      stable.push(driver);
-    }
+// When search is active: group by category
+const searchedDriversByCategory = computed(() => {
+  if (!isDriverSearchActive.value) return [];
+  const grouped = new Map<string, AgentDriverInfo[]>();
+  for (const driver of searchedDrivers.value) {
+    const cat = getCategoryForAgentDriver(driver.db_type);
+    if (!grouped.has(cat)) grouped.set(cat, []);
+    grouped.get(cat)!.push(driver);
   }
-  return [...updatable, ...stable];
+  return [...grouped.entries()].map(([catKey, drivers]) => {
+    const catDef = DRIVER_CATEGORIES.find((c) => c.key === catKey);
+    return {
+      key: catKey,
+      title: catKey === "all" ? t("driverStore.driverCategoryAll") : catDef ? t(catDef.titleKey) : t("driverStore.driverCategoryAll"),
+      drivers,
+    };
+  });
 });
 
-/** Number of updatable drivers in the currently filtered list. */
-const filteredUpdatableCount = computed(() => {
-  let count = 0;
-  for (const driver of orderedFilteredDrivers.value) {
-    if (driver.update_available) count++;
-    else break;
-  }
-  return count;
+// When search is NOT active: filter by selected category
+const categoryFilteredDrivers = computed(() => {
+  if (isDriverSearchActive.value || selectedDriverCategory.value === "all") return searchedDrivers.value;
+  return searchedDrivers.value.filter((driver) => getCategoryForAgentDriver(driver.db_type) === selectedDriverCategory.value);
 });
 
-/** Filtered driver rows split: updatable-only and stable-only (no <template> needed in markup). */
-const filteredUpdatableDrivers = computed(() => orderedFilteredDrivers.value.slice(0, filteredUpdatableCount.value));
-const filteredStableDrivers = computed(() => orderedFilteredDrivers.value.slice(filteredUpdatableCount.value));
+// Global updatable drivers — always shown above category navigation, regardless of filter.
+const globalUpdatableDrivers = computed(() => selectUpdatableDrivers(builtinDriverRows.value));
+
+// Whether any global updatable driver matches the current search query or
+// selected category.  Used to decide whether the empty‑state message should be
+// suppressed: the global update section always renders *all* updatable drivers
+// (unfiltered), so the empty‑state must only be hidden when at least one of
+// those drivers is actually relevant to the user's current view.
+const hasMatchingUpdatableDrivers = computed(() =>
+  hasAnyUpdatableDriverMatching(globalUpdatableDrivers.value, {
+    searchQuery: driverSearchQuery.value,
+    selectedCategory: selectedDriverCategory.value,
+    driverMatchesSearch: (driver, query) => [driver.label, driver.db_type, driver.version, driver.installed_version, driverRequiresJavaRuntime(driver) ? driver.jre : "", driverCategoryLabel(driver.db_type)].filter(Boolean).join(" ").toLowerCase().includes(query),
+    driverCategory: (driver) => getCategoryForAgentDriver(driver.db_type),
+  }),
+);
+
+// Category-filtered drivers, excluding those already shown in the global update banner.
+const categoryStableDrivers = computed(() => selectStableDrivers(categoryFilteredDrivers.value));
+
+// Category selection handler
+function selectDriverCategory(key: string) {
+  selectedDriverCategory.value = key;
+  // Clear search when switching categories
+  agentDriverSearch.value = "";
+}
 
 const highlightedFocusKey = ref<string | null>(null);
 let focusHighlightTimer: ReturnType<typeof setTimeout> | undefined;
@@ -752,6 +1005,7 @@ watch(
       // Wait until the requested driver row is loaded before scrolling to it.
       if (!focus.driver || !builtinDriverRows.value.some((driver) => driver.db_type === focus.driver)) return;
       agentDriverSearch.value = "";
+      selectedDriverCategory.value = "all";
     }
     const key = focusElementKey(focus);
     highlightedFocusKey.value = key;
@@ -892,7 +1146,7 @@ async function stopRuntime(runtime: DriverRuntimeInfo) {
     await loadDriverRuntimeSummary(false);
     toast(t("driverStore.runtimeStopSuccess", { label: runtime.label }));
   } catch (e: any) {
-    toast(t("driverStore.runtimeStopFailed", { label: runtime.label, error: e }));
+    toast(t("driverStore.runtimeStopFailed", { label: runtime.label, error: backendError(e) }));
   } finally {
     runtimeBusy.value = null;
   }
@@ -905,7 +1159,7 @@ async function restartRuntime(runtime: DriverRuntimeInfo) {
     await loadDriverRuntimeSummary(false);
     toast(t("driverStore.runtimeRestartSuccess", { label: runtime.label }));
   } catch (e: any) {
-    toast(t("driverStore.runtimeRestartFailed", { label: runtime.label, error: e }));
+    toast(t("driverStore.runtimeRestartFailed", { label: runtime.label, error: backendError(e) }));
   } finally {
     runtimeBusy.value = null;
   }
@@ -947,7 +1201,7 @@ async function clearDownloadCache() {
     await loadDriverStoreUsage();
     toast(t("driverStore.downloadCacheClearSuccess"));
   } catch (e: any) {
-    toast(t("driverStore.downloadCacheClearFailed", { error: e?.message || String(e) }), 5000);
+    toast(t("driverStore.downloadCacheClearFailed", { error: backendError(e) }), 5000);
   } finally {
     clearingDownloadCache.value = false;
   }
@@ -1133,25 +1387,36 @@ onMounted(async () => {
 
   unlisten = await api.listenAgentInstallProgress((payload) => {
     const incoming = payload as DriverInstallProgress;
+    if (!isDriverInstallProgressForOperation(incoming, activeAgentOperationId.value)) return;
     const channel = driverInstallProgressChannel(incoming);
-    const jdbcProgressBelongsToPrestoSql = channel === "jdbc-plugin" && installing.value === PRESTOSQL_DRIVER_DB_TYPE && !isInstallingJdbcPlugin.value;
-    if (jdbcProgressBelongsToPrestoSql) {
-      // PrestoSQL is shown as a built-in driver but installs through the JDBC plugin pipeline.
-      agentProgress.value = updateDriverInstallProgress(agentProgress.value, incoming, "jdbc-plugin");
-    } else {
-      agentProgress.value = updateDriverInstallProgress(agentProgress.value, incoming, "agent");
-      jdbcPluginProgress.value = updateDriverInstallProgress(jdbcPluginProgress.value, incoming, "jdbc-plugin");
+    const jdbcProgressBuiltinDriver = channel === "jdbc-plugin" && installing.value && isManagedJdbcBuiltinDriver(installing.value) && !isInstallingJdbcPlugin.value ? installing.value : null;
+    if (jdbcProgressBuiltinDriver) {
+      // Built-in JDBC profiles are shown alongside Agent drivers but install
+      // through the JDBC plugin pipeline. Route plugin events into their row.
+      updatePerDriverProgress(agentProgressByDbType, { ...incoming, db_type: jdbcProgressBuiltinDriver });
+    } else if (channel === "agent") {
+      if (incoming.db_type) {
+        updatePerDriverProgress(agentProgressByDbType, incoming);
+        // Track completions for the batch counter.
+        if (incoming.step === "done" && upgradingAll.value) {
+          upgradingCompletedCount.value++;
+        }
+      } else {
+        // No db_type — single operation (e.g. JRE reinstall).
+        jreReinstallProgress.value = incoming.step === "done" ? null : incoming;
+      }
+      jdbcPluginProgress.value = null; // clear any stale jdbc-only progress
+    } else if (channel === "jdbc-plugin") {
+      jdbcPluginProgress.value = incoming.step === "done" ? null : incoming;
     }
-    if (payload.db_type && payload.total_drivers) {
-      upgradingCurrent.value = drivers.value.find((d) => d.db_type === payload.db_type)?.label ?? payload.db_type;
-      upgradingIndex.value = payload.current ?? 0;
-      upgradingTotal.value = payload.total_drivers ?? 0;
+    if (payload.total_drivers && !upgradingTotal.value) {
+      upgradingTotal.value = payload.total_drivers;
     }
     // During a batch upgrade, refresh the list as soon as each driver finishes
     // (step="done") so its "Update" button disappears immediately instead of
     // staying disabled until the whole batch completes (step="all-done").
     // Single-driver installs (upgradingAll=false) are refreshed by runDriverInstall.
-    if (upgradingAll.value && payload.step === "done" && channel === "agent") {
+    if (upgradingAll.value && payload.step === "done" && channel === "agent" && payload.db_type) {
       void refreshAgents();
     }
   });
@@ -1205,9 +1470,15 @@ watch(driverStoreTab, (tab) => {
                   </SelectContent>
                 </Select>
               </div>
-              <Button variant="ghost" size="sm" class="h-7 rounded-md text-xs gap-1 text-muted-foreground" :disabled="importingZip" @click="importOfflineZip">
-                <FileUp class="h-3.5 w-3.5" />
-                {{ importingZip ? t("driverStore.importing") : t("driverStore.importOfflinePackage") }}
+              <Button v-if="driverStoreTab === 'agent' && !isWeb" data-testid="agent-offline-export-button" variant="ghost" size="sm" class="h-7 rounded-md text-xs gap-1 text-muted-foreground" :disabled="agentExportImportBlocked" @click="openOfflineExportDialog">
+                <Loader2 v-if="offlineExportLoading || offlineExporting" class="h-3.5 w-3.5 animate-spin" />
+                <FileArchive v-else class="h-3.5 w-3.5" />
+                {{ offlineExporting ? t("driverStore.offlineExporting") : t("driverStore.offlineExport") }}
+              </Button>
+              <Button v-if="driverStoreTab === 'agent'" data-testid="agent-offline-import-button" variant="ghost" size="sm" class="h-7 rounded-md text-xs gap-1 text-muted-foreground" :disabled="agentExportImportBlocked" @click="importOfflineZip">
+                <Loader2 v-if="agentImportBusy" class="h-3.5 w-3.5 animate-spin" />
+                <FileUp v-else class="h-3.5 w-3.5" />
+                {{ agentImportBusy ? t("driverStore.importing") : t("driverStore.importOfflinePackage") }}
               </Button>
               <Button variant="ghost" size="sm" class="h-7 rounded-md text-xs gap-1 text-muted-foreground" :disabled="refreshing" @click="forceRefresh">
                 <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': refreshing }" />
@@ -1256,16 +1527,16 @@ watch(driverStoreTab, (tab) => {
                     </span>
                     <Check v-if="jre.installed" class="h-4 w-4 text-green-600" />
                     <span v-else class="text-xs text-muted-foreground">{{ t("driverStore.notInstalled") }}</span>
-                    <DriverInstallProgressCircle v-if="reinstallingJre === jre.key" :percent="agentProgressNumber" :title="agentProgressTitle(jre.installed ? t('driverStore.reinstalling') : t('driverStore.installing'))" />
-                    <Button v-else-if="!jre.installed" type="button" variant="default" size="sm" class="h-8 rounded-md text-xs" :disabled="reinstallingJre !== null || installing !== null" @click="reinstallJre(jre.key)">
+                    <DriverInstallProgressCircle v-if="reinstallingJre === jre.key" :percent="getJreReinstallPercent()" :title="getJreReinstallTitle(jre.installed ? t('driverStore.reinstalling') : t('driverStore.installing'))" />
+                    <Button v-else-if="!jre.installed" type="button" variant="default" size="sm" class="h-8 rounded-md text-xs" :disabled="reinstallingJre !== null || installing !== null || agentPackageBusy" @click="reinstallJre(jre.key)">
                       <Download class="h-3.5 w-3.5 mr-1" />
                       {{ t("driverStore.install") }}
                     </Button>
-                    <Button v-else-if="jre.installed" type="button" variant="outline" size="sm" class="h-8 rounded-md text-xs" :disabled="reinstallingJre !== null || installing !== null" @click="reinstallJre(jre.key)">
+                    <Button v-else-if="jre.installed" type="button" variant="outline" size="sm" class="h-8 rounded-md text-xs" :disabled="reinstallingJre !== null || installing !== null || agentPackageBusy" @click="reinstallJre(jre.key)">
                       <RotateCcw class="h-3.5 w-3.5 mr-1" />
                       {{ t("driverStore.reinstall") }}
                     </Button>
-                    <Button v-if="jre.installed" type="button" variant="ghost" size="sm" class="h-8 rounded-md text-xs text-muted-foreground hover:text-destructive" :disabled="reinstallingJre !== null || installing !== null" @click="uninstallJre(jre.key)">
+                    <Button v-if="jre.installed" type="button" variant="ghost" size="sm" class="h-8 rounded-md text-xs text-muted-foreground hover:text-destructive" :disabled="reinstallingJre !== null || installing !== null || agentPackageBusy" @click="uninstallJre(jre.key)">
                       {{ t("driverStore.uninstall") }}
                     </Button>
                   </div>
@@ -1278,27 +1549,26 @@ watch(driverStoreTab, (tab) => {
               <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
               <Input v-model="agentDriverSearch" class="h-8 pl-8 text-xs" :placeholder="t('driverStore.searchDrivers')" />
             </div>
-            <div v-if="drivers.length === 0" class="py-12 text-center text-sm text-muted-foreground">
-              {{ t("common.loading") }}
-            </div>
-            <div v-else-if="filteredAgentDrivers.length === 0" class="py-12 text-center text-sm text-muted-foreground">
-              {{ t("driverStore.noMatchingDrivers") }}
-            </div>
-            <div v-else class="driver-store-agent-list rounded-lg border divide-y">
-              <!-- Updates Available header -->
-              <div v-if="filteredUpdatableDrivers.length > 0" class="flex items-center justify-between px-4 py-2.5 bg-amber-500/10">
+            <!-- Global update section — always above category navigation -->
+            <div v-if="globalUpdatableDrivers.length > 0" class="rounded-lg border divide-y">
+              <div class="flex items-center justify-between bg-amber-500/10 px-4 py-2.5">
                 <div class="min-w-0">
-                  <div class="text-sm font-semibold">{{ t("driverStore.updatesAvailableTitle") }} ({{ filteredUpdatableCount }})</div>
+                  <div class="text-sm font-semibold">{{ t("driverStore.updatesAvailableTitle") }} ({{ globalUpdatableDrivers.length }})</div>
                   <p class="text-xs text-muted-foreground">{{ t("driverStore.updatesAvailableDescription") }}</p>
                 </div>
-                <Button size="sm" class="h-7 rounded-md text-xs shrink-0 ml-3" :disabled="installing !== null || upgradingAll" @click="upgradeAll">
-                  <Loader2 v-if="upgradingAll" class="h-3 w-3 animate-spin mr-1" />
-                  <Download v-else class="h-3 w-3 mr-1" />
-                  {{ upgradingAll ? t("driverStore.upgradingProgress", { current: upgradingIndex, total: upgradingTotal }) : t("driverStore.upgradeAll") }}
-                </Button>
+                <div class="flex shrink-0 items-center gap-2">
+                  <Button size="sm" class="h-7 rounded-md text-xs shrink-0 ml-3" :disabled="installing !== null || preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="upgradeAll">
+                    <Loader2 v-if="upgradingAll" class="h-3 w-3 animate-spin mr-1" />
+                    <Download v-else class="h-3 w-3 mr-1" />
+                    {{ upgradingAll ? t("driverStore.upgradingProgress", { current: upgradingCompletedCount, total: upgradingTotal }) : t("driverStore.upgradeAll") }}
+                  </Button>
+                  <Button v-if="upgradingAll" type="button" variant="outline" size="icon-sm" class="h-7 w-7 rounded-md shrink-0 text-muted-foreground hover:text-destructive" :title="t('driverStore.cancelUpgradeAll')" :aria-label="t('driverStore.cancelUpgradeAll')" @click="cancelUpgradeAll">
+                    <X class="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
               <div
-                v-for="driver in filteredUpdatableDrivers"
+                v-for="driver in globalUpdatableDrivers"
                 :key="driver.db_type"
                 :data-driver-store-focus="`driver:${driver.db_type}`"
                 class="driver-store-agent-row flex items-center gap-3 px-4 py-2 transition hover:bg-muted/30"
@@ -1318,25 +1588,43 @@ watch(driverStoreTab, (tab) => {
                   <span v-if="formatSize(driver.size)" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{{ formatSize(driver.size) }}</span>
                 </div>
                 <div class="driver-store-agent-actions flex shrink-0 items-center gap-2">
-                  <Button v-if="!driver.installed && isDriverQueued(driver.db_type)" size="sm" variant="outline" class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15" :disabled="upgradingAll" @click="removeQueuedDriverInstall(driver.db_type)">
+                  <Button
+                    v-if="!driver.installed && isDriverQueued(driver.db_type)"
+                    size="sm"
+                    variant="outline"
+                    class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
+                    :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
+                    @click="removeQueuedDriverInstall(driver.db_type)"
+                  >
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.installing'))" />
-                  <Button v-else-if="!driver.installed" size="sm" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
+                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.installing'))" /><Button
+                    v-if="!driver.installed && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                    :title="t('driverStore.cancelInstall')"
+                    :aria-label="t('driverStore.cancelInstall')"
+                    @click="cancelDriverInstall(driver.db_type)"
+                    ><X class="h-3.5 w-3.5"
+                  /></Button>
+                  <Button v-else-if="!driver.installed && !isDriverProgressActive(driver.db_type)" size="sm" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
                     <Download class="h-3 w-3 mr-1" />
                     {{ t("driverStore.install") }}
                   </Button>
                   <Button
-                    v-if="!driver.installed && !isPrestoSqlBuiltinDriver(driver.db_type) && !isDriverProgressActive(driver.db_type) && !isDriverQueued(driver.db_type)"
+                    v-if="!driver.installed && !isManagedJdbcBuiltinDriver(driver.db_type) && !isDriverProgressActive(driver.db_type) && !isDriverQueued(driver.db_type)"
                     size="sm"
                     variant="ghost"
-                    class="h-7 w-7 rounded-md text-xs text-muted-foreground"
-                    :title="t('driverStore.importLocalJar')"
-                    :disabled="upgradingAll || installing !== null"
+                    class="driver-store-local-import-button h-7 w-7 rounded-md text-xs text-muted-foreground"
+                    :title="importingDriver === driver.db_type ? t('driverStore.importing') : t('driverStore.importLocalJar')"
+                    :disabled="preparingUpgradeAll || upgradingAll || installing !== null || agentPackageBusy"
                     @click="importDriverFile(driver)"
                   >
-                    <FileUp class="h-3.5 w-3.5" />
+                    <Loader2 v-if="importingDriver === driver.db_type" class="h-3.5 w-3.5 animate-spin" />
+                    <FileUp v-else class="h-3.5 w-3.5" />
                   </Button>
                   <Check v-if="driver.installed && !(driver.update_available && isDriverProgressActive(driver.db_type))" class="h-4 w-4 text-green-600" />
                   <Button
@@ -1344,85 +1632,287 @@ watch(driverStoreTab, (tab) => {
                     size="sm"
                     variant="outline"
                     class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
-                    :disabled="upgradingAll"
+                    :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
                     @click="removeQueuedDriverInstall(driver.db_type)"
                   >
                     <Clock3 class="h-3 w-3 mr-1" />
                     {{ t("driverStore.queued") }}
                   </Button>
-                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.updating'))" />
-                  <Button v-else-if="driver.installed && driver.update_available" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
-                    {{ t("driverStore.update") }}
-                  </Button>
-                  <Button v-if="driver.installed" variant="ghost" size="sm" class="h-7 rounded-md text-xs text-muted-foreground hover:text-destructive" :disabled="installing !== null || upgradingAll || isDriverQueued(driver.db_type)" @click="uninstallDriver(driver.db_type)">
-                    {{ t("driverStore.uninstall") }}
-                  </Button>
-                </div>
-              </div>
-              <!-- Section divider between updatable and stable -->
-              <div v-if="filteredUpdatableDrivers.length > 0 && filteredStableDrivers.length > 0" class="px-4 py-1.5 bg-muted/20 text-xs font-medium text-muted-foreground">
-                {{ t("driverStore.allDriversTitle") }}
-              </div>
-              <div
-                v-for="driver in filteredStableDrivers"
-                :key="driver.db_type"
-                :data-driver-store-focus="`driver:${driver.db_type}`"
-                class="driver-store-agent-row flex items-center gap-3 px-4 py-2 transition hover:bg-muted/30"
-                :class="{ 'driver-store-focus-highlight': highlightedFocusKey === `driver:${driver.db_type}` }"
-              >
-                <span class="flex h-8 w-8 items-center justify-center rounded-md bg-muted/60 shrink-0">
-                  <DatabaseIcon :db-type="driver.db_type" class="h-4 w-4" />
-                </span>
-                <div class="driver-store-agent-name min-w-0 flex-1">
-                  <div class="text-sm font-medium">{{ driver.label }}</div>
-                </div>
-                <div class="driver-store-agent-meta flex shrink-0 items-center gap-1.5">
-                  <span v-if="driverRequiresJavaRuntime(driver) && driver.jre" class="rounded-full px-2 py-0.5 text-[11px]" :class="driver.jre !== '21' ? 'bg-blue-500/10 text-blue-600' : 'bg-muted text-muted-foreground'">JRE {{ driver.jre }}</span>
-                  <span v-if="driver.installed" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.installed_version }}</span>
-                  <span v-if="driver.installed && driver.update_available" class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-600">→ v{{ driver.version }}</span>
-                  <span v-if="!driver.installed && driver.version" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.version }}</span>
-                  <span v-if="formatSize(driver.size)" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{{ formatSize(driver.size) }}</span>
-                </div>
-                <div class="driver-store-agent-actions flex shrink-0 items-center gap-2">
-                  <Button v-if="!driver.installed && isDriverQueued(driver.db_type)" size="sm" variant="outline" class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15" :disabled="upgradingAll" @click="removeQueuedDriverInstall(driver.db_type)">
-                    <Clock3 class="h-3 w-3 mr-1" />
-                    {{ t("driverStore.queued") }}
-                  </Button>
-                  <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.installing'))" />
-                  <Button v-else-if="!driver.installed" size="sm" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
-                    <Download class="h-3 w-3 mr-1" />
-                    {{ t("driverStore.install") }}
-                  </Button>
-                  <Button
-                    v-if="!driver.installed && !isPrestoSqlBuiltinDriver(driver.db_type) && !isDriverProgressActive(driver.db_type) && !isDriverQueued(driver.db_type)"
-                    size="sm"
+                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.updating'))" /><Button
+                    v-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                    type="button"
                     variant="ghost"
-                    class="h-7 w-7 rounded-md text-xs text-muted-foreground"
-                    :title="t('driverStore.importLocalJar')"
-                    :disabled="upgradingAll || installing !== null"
-                    @click="importDriverFile(driver)"
-                  >
-                    <FileUp class="h-3.5 w-3.5" />
-                  </Button>
-                  <Check v-if="driver.installed && !(driver.update_available && isDriverProgressActive(driver.db_type))" class="h-4 w-4 text-green-600" />
-                  <Button
-                    v-if="driver.installed && driver.update_available && isDriverQueued(driver.db_type)"
-                    size="sm"
-                    variant="outline"
-                    class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
-                    :disabled="upgradingAll"
-                    @click="removeQueuedDriverInstall(driver.db_type)"
-                  >
-                    <Clock3 class="h-3 w-3 mr-1" />
-                    {{ t("driverStore.queued") }}
-                  </Button>
-                  <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="agentProgressNumber" :title="agentProgressTitle(t('driverStore.updating'))" />
-                  <Button v-else-if="driver.installed && driver.update_available" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="upgradingAll" @click="installDriver(driver.db_type)">
+                    size="icon-sm"
+                    class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                    :title="t('driverStore.cancelInstall')"
+                    :aria-label="t('driverStore.cancelInstall')"
+                    @click="cancelDriverInstall(driver.db_type)"
+                    ><X class="h-3.5 w-3.5"
+                  /></Button>
+                  <Button v-else-if="driver.installed && driver.update_available && !isDriverProgressActive(driver.db_type)" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
                     {{ t("driverStore.update") }}
                   </Button>
-                  <Button v-if="driver.installed" variant="ghost" size="sm" class="h-7 rounded-md text-xs text-muted-foreground hover:text-destructive" :disabled="installing !== null || upgradingAll || isDriverQueued(driver.db_type)" @click="uninstallDriver(driver.db_type)">
+                  <Button
+                    v-if="driver.installed"
+                    variant="ghost"
+                    size="sm"
+                    class="h-7 rounded-md text-xs text-muted-foreground hover:text-destructive"
+                    :disabled="installing !== null || preparingUpgradeAll || upgradingAll || agentPackageBusy || isDriverQueued(driver.db_type)"
+                    @click="uninstallDriver(driver.db_type)"
+                  >
                     {{ t("driverStore.uninstall") }}
                   </Button>
+                </div>
+              </div>
+            </div>
+            <!-- Category nav + driver list container -->
+            <div class="min-h-0 flex flex-1 flex-col gap-3 overflow-hidden sm:flex-row sm:gap-0">
+              <!-- Category navigation sidebar -->
+              <nav v-if="!isDriverSearchActive" data-driver-category-nav class="flex shrink-0 gap-1 overflow-x-auto border-b px-0.5 pt-0.5 pb-2 sm:w-40 sm:flex-col sm:overflow-y-auto sm:border-b-0 sm:border-r sm:py-0.5 sm:pr-3.5" :aria-label="t('driverStore.driverCategoryLabel')">
+                <button
+                  type="button"
+                  class="shrink-0 whitespace-nowrap rounded-[4px] px-3 py-2 text-left text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-full"
+                  :class="selectedDriverCategory === 'all' ? 'bg-primary/10 font-medium text-primary' : 'text-muted-foreground hover:bg-muted/70'"
+                  :aria-current="selectedDriverCategory === 'all' ? 'page' : undefined"
+                  @click="selectDriverCategory('all')"
+                >
+                  {{ t("driverStore.driverCategoryAll") }}
+                </button>
+                <button
+                  v-for="cat in driverCategories"
+                  :key="cat.key"
+                  type="button"
+                  class="shrink-0 whitespace-nowrap rounded-[4px] px-3 py-2 text-left text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-full"
+                  :class="selectedDriverCategory === cat.key ? 'bg-primary/10 font-medium text-primary' : 'text-muted-foreground hover:bg-muted/70'"
+                  :aria-current="selectedDriverCategory === cat.key ? 'page' : undefined"
+                  @click="selectDriverCategory(cat.key)"
+                >
+                  {{ cat.title }}
+                </button>
+              </nav>
+
+              <!-- Driver list area -->
+              <div class="driver-store-agent-results min-w-0 flex-1 overflow-y-auto sm:pl-4">
+                <!-- Empty: still loading -->
+                <div v-if="drivers.length === 0" class="py-12 text-center text-sm text-muted-foreground">
+                  {{ t("common.loading") }}
+                </div>
+                <!-- Empty: no search results (suppressed when updatable drivers match the search) -->
+                <div v-else-if="isDriverSearchActive && searchedDrivers.length === 0 && !hasMatchingUpdatableDrivers" class="py-12 text-center text-sm text-muted-foreground">
+                  {{ t("driverStore.noMatchingDrivers") }}
+                </div>
+                <!-- Empty: no drivers in selected category (suppressed when updatable drivers match the category) -->
+                <div v-else-if="!isDriverSearchActive && categoryFilteredDrivers.length === 0 && !hasMatchingUpdatableDrivers" class="py-12 text-center text-sm text-muted-foreground">
+                  {{ t("driverStore.noMatchingDrivers") }}
+                </div>
+
+                <!-- Search results: cross-category view -->
+                <div v-else-if="isDriverSearchActive && searchedDriversByCategory.length > 0" class="space-y-4">
+                  <div v-for="group in searchedDriversByCategory" :key="group.key" class="space-y-2">
+                    <h3 class="px-4 text-sm font-medium text-muted-foreground">{{ group.title }}</h3>
+                    <div class="rounded-lg border divide-y">
+                      <div
+                        v-for="driver in group.drivers"
+                        :key="driver.db_type"
+                        :data-driver-store-focus="`driver:${driver.db_type}`"
+                        class="driver-store-agent-row flex items-center gap-3 px-4 py-2 transition hover:bg-muted/30"
+                        :class="{ 'driver-store-focus-highlight': highlightedFocusKey === `driver:${driver.db_type}` }"
+                      >
+                        <span class="flex h-8 w-8 items-center justify-center rounded-md bg-muted/60 shrink-0">
+                          <DatabaseIcon :db-type="driver.db_type" class="h-4 w-4" />
+                        </span>
+                        <div class="driver-store-agent-name min-w-0 flex-1">
+                          <div class="text-sm font-medium">{{ driver.label }}</div>
+                        </div>
+                        <span class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{{ driverCategoryLabel(driver.db_type) }}</span>
+                        <div class="driver-store-agent-meta flex shrink-0 items-center gap-1.5">
+                          <span v-if="driverRequiresJavaRuntime(driver) && driver.jre" class="rounded-full px-2 py-0.5 text-[11px]" :class="driver.jre !== '21' ? 'bg-blue-500/10 text-blue-600' : 'bg-muted text-muted-foreground'">JRE {{ driver.jre }}</span>
+                          <span v-if="driver.installed" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.installed_version }}</span>
+                          <span v-if="driver.installed && driver.update_available" class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-600">→ v{{ driver.version }}</span>
+                          <span v-if="!driver.installed && driver.version" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.version }}</span>
+                          <span v-if="formatSize(driver.size)" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{{ formatSize(driver.size) }}</span>
+                        </div>
+                        <div class="driver-store-agent-actions flex shrink-0 items-center gap-2">
+                          <Button
+                            v-if="!driver.installed && isDriverQueued(driver.db_type)"
+                            size="sm"
+                            variant="outline"
+                            class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
+                            :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
+                            @click="removeQueuedDriverInstall(driver.db_type)"
+                          >
+                            <Clock3 class="h-3 w-3 mr-1" />
+                            {{ t("driverStore.queued") }}
+                          </Button>
+                          <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.installing'))" /><Button
+                            v-if="!driver.installed && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                            :title="t('driverStore.cancelInstall')"
+                            :aria-label="t('driverStore.cancelInstall')"
+                            @click="cancelDriverInstall(driver.db_type)"
+                            ><X class="h-3.5 w-3.5"
+                          /></Button>
+                          <Button v-else-if="!driver.installed && !isDriverProgressActive(driver.db_type)" size="sm" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
+                            <Download class="h-3 w-3 mr-1" />
+                            {{ t("driverStore.install") }}
+                          </Button>
+                          <Button
+                            v-if="!driver.installed && !isManagedJdbcBuiltinDriver(driver.db_type) && !isDriverProgressActive(driver.db_type) && !isDriverQueued(driver.db_type)"
+                            size="sm"
+                            variant="ghost"
+                            class="driver-store-local-import-button h-7 w-7 rounded-md text-xs text-muted-foreground"
+                            :title="importingDriver === driver.db_type ? t('driverStore.importing') : t('driverStore.importLocalJar')"
+                            :disabled="preparingUpgradeAll || upgradingAll || installing !== null || agentPackageBusy"
+                            @click="importDriverFile(driver)"
+                          >
+                            <Loader2 v-if="importingDriver === driver.db_type" class="h-3.5 w-3.5 animate-spin" />
+                            <FileUp v-else class="h-3.5 w-3.5" />
+                          </Button>
+                          <Check v-if="driver.installed && !(driver.update_available && isDriverProgressActive(driver.db_type))" class="h-4 w-4 text-green-600" />
+                          <Button
+                            v-if="driver.installed && driver.update_available && isDriverQueued(driver.db_type)"
+                            size="sm"
+                            variant="outline"
+                            class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
+                            :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
+                            @click="removeQueuedDriverInstall(driver.db_type)"
+                          >
+                            <Clock3 class="h-3 w-3 mr-1" />
+                            {{ t("driverStore.queued") }}
+                          </Button>
+                          <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.updating'))" /><Button
+                            v-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                            :title="t('driverStore.cancelInstall')"
+                            :aria-label="t('driverStore.cancelInstall')"
+                            @click="cancelDriverInstall(driver.db_type)"
+                            ><X class="h-3.5 w-3.5"
+                          /></Button>
+                          <Button v-else-if="driver.installed && driver.update_available && !isDriverProgressActive(driver.db_type)" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
+                            {{ t("driverStore.update") }}
+                          </Button>
+                          <Button
+                            v-if="driver.installed"
+                            variant="ghost"
+                            size="sm"
+                            class="h-7 rounded-md text-xs text-muted-foreground hover:text-destructive"
+                            :disabled="installing !== null || preparingUpgradeAll || upgradingAll || agentPackageBusy || isDriverQueued(driver.db_type)"
+                            @click="uninstallDriver(driver.db_type)"
+                          >
+                            {{ t("driverStore.uninstall") }}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Normal view: category-filtered stable drivers (updatable drivers are in the global banner above) -->
+                <div v-else class="driver-store-agent-list rounded-lg border divide-y">
+                  <!-- Stable driver rows -->
+                  <div
+                    v-for="driver in categoryStableDrivers"
+                    :key="driver.db_type"
+                    :data-driver-store-focus="`driver:${driver.db_type}`"
+                    class="driver-store-agent-row flex items-center gap-3 px-4 py-2 transition hover:bg-muted/30"
+                    :class="{ 'driver-store-focus-highlight': highlightedFocusKey === `driver:${driver.db_type}` }"
+                  >
+                    <span class="flex h-8 w-8 items-center justify-center rounded-md bg-muted/60 shrink-0">
+                      <DatabaseIcon :db-type="driver.db_type" class="h-4 w-4" />
+                    </span>
+                    <div class="driver-store-agent-name min-w-0 flex-1">
+                      <div class="text-sm font-medium">{{ driver.label }}</div>
+                    </div>
+                    <div class="driver-store-agent-meta flex shrink-0 items-center gap-1.5">
+                      <span v-if="driverRequiresJavaRuntime(driver) && driver.jre" class="rounded-full px-2 py-0.5 text-[11px]" :class="driver.jre !== '21' ? 'bg-blue-500/10 text-blue-600' : 'bg-muted text-muted-foreground'">JRE {{ driver.jre }}</span>
+                      <span v-if="driver.installed" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.installed_version }}</span>
+                      <span v-if="driver.installed && driver.update_available" class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-600">→ v{{ driver.version }}</span>
+                      <span v-if="!driver.installed && driver.version" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.version }}</span>
+                      <span v-if="formatSize(driver.size)" class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{{ formatSize(driver.size) }}</span>
+                    </div>
+                    <div class="driver-store-agent-actions flex shrink-0 items-center gap-2">
+                      <Button
+                        v-if="!driver.installed && isDriverQueued(driver.db_type)"
+                        size="sm"
+                        variant="outline"
+                        class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
+                        :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
+                        @click="removeQueuedDriverInstall(driver.db_type)"
+                      >
+                        <Clock3 class="h-3 w-3 mr-1" />
+                        {{ t("driverStore.queued") }}
+                      </Button>
+                      <DriverInstallProgressCircle v-else-if="!driver.installed && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.installing'))" /><Button
+                        v-if="!driver.installed && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                        :title="t('driverStore.cancelInstall')"
+                        :aria-label="t('driverStore.cancelInstall')"
+                        @click="cancelDriverInstall(driver.db_type)"
+                        ><X class="h-3.5 w-3.5"
+                      /></Button>
+                      <Button v-else-if="!driver.installed && !isDriverProgressActive(driver.db_type)" size="sm" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
+                        <Download class="h-3 w-3 mr-1" />
+                        {{ t("driverStore.install") }}
+                      </Button>
+                      <Button
+                        v-if="!driver.installed && !isManagedJdbcBuiltinDriver(driver.db_type) && !isDriverProgressActive(driver.db_type) && !isDriverQueued(driver.db_type)"
+                        size="sm"
+                        variant="ghost"
+                        class="driver-store-local-import-button h-7 w-7 rounded-md text-xs text-muted-foreground"
+                        :title="importingDriver === driver.db_type ? t('driverStore.importing') : t('driverStore.importLocalJar')"
+                        :disabled="preparingUpgradeAll || upgradingAll || installing !== null || agentPackageBusy"
+                        @click="importDriverFile(driver)"
+                      >
+                        <Loader2 v-if="importingDriver === driver.db_type" class="h-3.5 w-3.5 animate-spin" />
+                        <FileUp v-else class="h-3.5 w-3.5" />
+                      </Button>
+                      <Check v-if="driver.installed && !(driver.update_available && isDriverProgressActive(driver.db_type))" class="h-4 w-4 text-green-600" />
+                      <Button
+                        v-if="driver.installed && driver.update_available && isDriverQueued(driver.db_type)"
+                        size="sm"
+                        variant="outline"
+                        class="h-7 rounded-md border-green-500/30 bg-green-500/10 text-xs text-green-700 hover:bg-green-500/15"
+                        :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy"
+                        @click="removeQueuedDriverInstall(driver.db_type)"
+                      >
+                        <Clock3 class="h-3 w-3 mr-1" />
+                        {{ t("driverStore.queued") }}
+                      </Button>
+                      <DriverInstallProgressCircle v-else-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type)" :percent="getAgentProgressPercent(driver.db_type)" :title="getAgentProgressTitle(driver.db_type, t('driverStore.updating'))" /><Button
+                        v-if="driver.installed && driver.update_available && isDriverProgressActive(driver.db_type) && isDriverInstallCancellable(driver.db_type)"
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        class="h-7 w-7 rounded-md text-muted-foreground hover:text-destructive"
+                        :title="t('driverStore.cancelInstall')"
+                        :aria-label="t('driverStore.cancelInstall')"
+                        @click="cancelDriverInstall(driver.db_type)"
+                        ><X class="h-3.5 w-3.5"
+                      /></Button>
+                      <Button v-else-if="driver.installed && driver.update_available && !isDriverProgressActive(driver.db_type)" size="sm" variant="outline" class="h-7 rounded-md text-xs" :disabled="preparingUpgradeAll || upgradingAll || agentPackageBusy" @click="installDriver(driver.db_type)">
+                        {{ t("driverStore.update") }}
+                      </Button>
+                      <Button
+                        v-if="driver.installed"
+                        variant="ghost"
+                        size="sm"
+                        class="h-7 rounded-md text-xs text-muted-foreground hover:text-destructive"
+                        :disabled="installing !== null || preparingUpgradeAll || upgradingAll || agentPackageBusy || isDriverQueued(driver.db_type)"
+                        @click="uninstallDriver(driver.db_type)"
+                      >
+                        {{ t("driverStore.uninstall") }}
+                      </Button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1440,7 +1930,7 @@ watch(driverStoreTab, (tab) => {
                   </p>
                 </div>
                 <div class="flex shrink-0 items-center gap-3">
-                  <DriverInstallProgressCircle v-if="isInstallingJdbcPlugin" :percent="jdbcPluginProgressNumber" :title="jdbcPluginProgressTitle(t('driverStore.progressDownloadJdbcPlugin'))" />
+                  <DriverInstallProgressCircle v-if="isInstallingJdbcPlugin" :percent="jdbcPluginProgressNumber" :title="getJdbcPluginProgressTitle(t('driverStore.progressDownloadJdbcPlugin'))" />
                   <span v-if="jdbcPluginStatus?.installed" class="text-xs" :class="jdbcPluginStatus.compatible ? 'text-green-600' : 'text-destructive'">
                     {{
                       jdbcPluginStatus.compatible
@@ -1460,10 +1950,17 @@ watch(driverStoreTab, (tab) => {
                   <Button v-else type="button" variant="default" class="rounded-md" :disabled="isInstallingJdbcPlugin" @click="installJdbcPlugin">
                     {{ isInstallingJdbcPlugin ? t("common.loading") : t("settings.jdbcPluginInstall") }}
                   </Button>
-                  <Button v-if="!jdbcPluginStatus?.installed" type="button" variant="outline" class="rounded-md" :disabled="isInstallingJdbcPlugin" @click="installJdbcPluginLocal">
-                    <FolderOpen class="h-3.5 w-3.5 mr-1" />
-                    {{ t("driverStore.localInstall") }}
-                  </Button>
+                  <Tooltip>
+                    <TooltipTrigger as-child>
+                      <Button type="button" variant="outline" class="rounded-md" :disabled="isInstallingJdbcPlugin || isUninstallingJdbcPlugin" @click="installJdbcPluginLocal">
+                        <FolderOpen class="h-3.5 w-3.5 mr-1" />
+                        {{ t("driverStore.localInstall") }}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" class="max-w-100 break-all text-xs">
+                      {{ t("driverStore.localInstallHint") }}
+                    </TooltipContent>
+                  </Tooltip>
                 </div>
               </div>
             </div>
@@ -1727,13 +2224,14 @@ watch(driverStoreTab, (tab) => {
         </Tabs>
       </div>
     </div>
+    <AgentOfflineExportDialog v-model:open="offlineExportDialogOpen" :preview="offlineExportPreview" :loading="offlineExportLoading" :exporting="offlineExporting" :error="offlineExportError" @confirm="exportOfflinePackage" />
   </div>
 </template>
 
 <style>
 .driver-store-focus-highlight {
-  background-color: hsl(var(--primary) / 0.08);
-  box-shadow: inset 0 0 0 1.5px hsl(var(--primary) / 0.45);
+  background-color: color-mix(in srgb, var(--primary) 8%, transparent);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--primary) 45%, transparent);
   border-radius: var(--dbx-radius-fixed-6);
 }
 
@@ -1854,6 +2352,71 @@ watch(driverStoreTab, (tab) => {
 .driver-store-jdbc-row > button {
   width: 2rem !important;
   height: 2rem !important;
+}
+
+html.dbx-legacy-webview .driver-store-tab {
+  margin-top: 1.25rem !important;
+}
+
+html.dbx-legacy-webview .driver-store-agent-tab:not([hidden]),
+html.dbx-legacy-webview .driver-store-jdbc-tab:not([hidden]),
+html.dbx-legacy-webview .driver-store-storage-tab:not([hidden]) {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 1.25rem !important;
+}
+
+html.dbx-legacy-webview .driver-store-agent-tab > :not([hidden]) ~ :not([hidden]),
+html.dbx-legacy-webview .driver-store-jdbc-tab > :not([hidden]) ~ :not([hidden]),
+html.dbx-legacy-webview .driver-store-storage-tab > :not([hidden]) ~ :not([hidden]) {
+  margin-top: 0 !important;
+}
+
+html.dbx-legacy-webview .driver-store-local-import-button {
+  width: 2rem !important;
+  height: 2rem !important;
+  padding: 0 !important;
+}
+
+html.dbx-legacy-webview .driver-store-local-import-button svg {
+  width: 1rem !important;
+  height: 1rem !important;
+}
+
+@media (min-width: 640px) {
+  html.dbx-legacy-webview [data-driver-category-nav] {
+    width: 10rem !important;
+    flex-direction: column !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    border-right-width: 1px !important;
+    border-bottom-width: 0 !important;
+    padding-top: 0.125rem !important;
+    padding-right: 0.875rem !important;
+    padding-bottom: 0.125rem !important;
+  }
+
+  html.dbx-legacy-webview [data-driver-category-nav] > button {
+    width: 100% !important;
+    align-self: stretch !important;
+  }
+
+  html.dbx-legacy-webview [data-driver-category-nav] > button[aria-current="page"] {
+    background-color: rgba(23, 23, 23, 0.08) !important;
+    color: rgb(23, 23, 23) !important;
+  }
+
+  html.dbx-legacy-webview.dark [data-driver-category-nav] > button[aria-current="page"] {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    color: rgb(244, 244, 245) !important;
+  }
+
+  html.dbx-legacy-webview .driver-store-agent-results {
+    width: 0 !important;
+    min-width: 0 !important;
+    flex: 1 1 0% !important;
+    padding-left: 1rem !important;
+  }
 }
 
 @media (max-width: 900px) {

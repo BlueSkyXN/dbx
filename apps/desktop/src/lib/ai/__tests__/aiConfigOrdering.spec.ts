@@ -12,12 +12,25 @@ describe("orderAiConfigsForDisplay", () => {
     const configs: TestConfig[] = [
       { id: "claude-code-1", provider: "claude-code-cli" },
       { id: "claude", provider: "claude" },
+      { id: "anthropic-compatible", provider: "anthropic-compatible" },
       { id: "openai", provider: "openai" },
+      { id: "gemini", provider: "gemini" },
+      { id: "deepseek", provider: "deepseek" },
+      { id: "qwen", provider: "qwen" },
+      { id: "minimax", provider: "minimax" },
+      { id: "ollama", provider: "ollama" },
+      { id: "openai-compatible", provider: "openai-compatible" },
       { id: "codex", provider: "codex-cli" },
+      { id: "opencode", provider: "opencode-cli" },
+      { id: "cursor", provider: "cursor-cli" },
+      { id: "codebuddy", provider: "codebuddy-cli" },
+      { id: "qoder", provider: "qoder-cli" },
+      { id: "grok", provider: "grok-cli" },
+      { id: "pi", provider: "pi-agent-cli" },
       { id: "custom", provider: "custom" },
     ];
 
-    expect(orderAiConfigsForDisplay(configs).map((config) => config.id)).toEqual(["claude", "openai", "claude-code-1", "codex", "custom"]);
+    expect(orderAiConfigsForDisplay(configs).map((config) => config.id)).toEqual(["claude", "openai", "gemini", "deepseek", "qwen", "minimax", "ollama", "anthropic-compatible", "openai-compatible", "claude-code-1", "codex", "opencode", "cursor", "codebuddy", "qoder", "grok", "pi", "custom"]);
   });
 
   it("preserves creation order for configs from the same provider", () => {

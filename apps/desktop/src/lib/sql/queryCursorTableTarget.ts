@@ -2,6 +2,7 @@ import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureS
 import { extractIdentifierPartsAt, isSqlKeyword, sqlObjectNavigationTarget, type SqlObjectNavigationTarget, type SqlObjectNavigationType } from "@/lib/sql/sqlNavigation";
 import type { ActiveTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
 import type { SqlCompletionTable } from "@/lib/sql/sqlCompletion";
+import { sqlSemanticDialectFor } from "@/lib/sql/semantic/dialect";
 import type { DatabaseType, QueryTab, TreeNode } from "@/types/database";
 
 export interface QueryCursorTableCandidate {
@@ -53,7 +54,9 @@ export function queryCursorTableCandidate(tab: QueryTab | undefined | null, data
 }
 
 export function queryTableCandidateAtSqlPosition(input: QueryTableCandidateAtPositionInput): QueryCursorTableCandidate | null {
-  const parts = extractQualifiedIdentifierPartsAt(input.sql, input.position).map((part) => part.value);
+  const dialect = sqlSemanticDialectFor({ databaseType: input.databaseType });
+  // View-data SQL quotes resolved names, so fold only unquoted input exactly as the database does before quoting it again.
+  const parts = extractQualifiedIdentifierPartsAt(input.sql, input.position).map((part) => dialect.normalizeIdentifier(part.value, part.quoted));
   if (parts.length === 0) return null;
 
   const tableName = parts[parts.length - 1];
@@ -73,6 +76,20 @@ export function queryTableCandidateAtSqlPosition(input: QueryTableCandidateAtPos
   }
 
   return { connectionId: input.connectionId, database, schema, tableName };
+}
+
+export function queryTableNavigationTargetAtSqlPosition(input: QueryTableCandidateAtPositionInput, target: SqlObjectNavigationTarget): SqlObjectNavigationTarget {
+  const parts = extractQualifiedIdentifierPartsAt(input.sql, input.position);
+  if (parts.length < 2) return sqlObjectNavigationTarget(target);
+
+  const candidate = queryTableCandidateAtSqlPosition(input);
+  if (!candidate) return sqlObjectNavigationTarget(target);
+
+  return sqlObjectNavigationTarget({
+    ...target,
+    database: candidate.database,
+    schema: candidate.schema,
+  });
 }
 
 export function resolveQueryContextCandidateDatabase(candidate: QueryCursorTableCandidate, databases: readonly string[]): QueryCursorTableCandidate {
@@ -125,6 +142,7 @@ export function queryContextTargetFromCandidate(tab: QueryTab | undefined | null
   return {
     type: "query-context",
     connectionId: tab.connectionId,
+    catalog: tab.catalog,
     database: candidate?.database || tab.database,
     schema: candidate?.schema ?? tab.schema,
   };

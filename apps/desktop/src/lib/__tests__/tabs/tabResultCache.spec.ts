@@ -107,6 +107,81 @@ describe("tab result cache statement execution metadata", () => {
     ]);
   });
 
+  it("preserves result-run statement execution state", () => {
+    const encoded = encodeTabResultSnapshot({
+      resultRuns: [
+        {
+          id: "run-1",
+          title: "Run 1",
+          sequence: 1,
+          sql: "SELECT 1; SELECT bad",
+          createdAt: 1,
+          batchSqlExecution: {
+            executionId: "exec-1",
+            submittedSql: "SELECT 1; SELECT bad",
+            editorFingerprint: "20:0123456789abcdef",
+            sourceOffset: 0,
+            completed: 2,
+            total: 2,
+            startedAt: 1,
+            finishedAt: 2,
+            items: [
+              { statementIndex: 0, sql: "SELECT 1", from: 0, to: 8, status: "success", executionTimeMs: 1 },
+              { statementIndex: 1, sql: "SELECT bad", from: 10, to: 20, status: "error", error: "failed", executionTimeMs: 1 },
+            ],
+          },
+        },
+      ],
+      activeResultRunId: "run-1",
+      cachedAt: 1,
+    });
+
+    expect(decodeTabResultSnapshot(encoded)?.resultRuns?.[0]?.batchSqlExecution).toMatchObject({
+      executionId: "exec-1",
+      completed: 2,
+      total: 2,
+      items: [{ status: "success" }, { status: "error", error: "failed" }],
+    });
+  });
+
+  it("preserves spatial metadata", () => {
+    const encoded = encodeTabResultSnapshot({
+      result: {
+        columns: ["geom"],
+        column_types: ["geometry"],
+        spatial_columns: [{ column_index: 0, srid: 4326 }],
+        spatial_values: [[4326], [3857], [null]],
+        rows: [["POINT(116.397 39.908)"], ["POINT(12957255 4852583)"], [null]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+      cachedAt: 1,
+    });
+
+    const result = decodeTabResultSnapshot(encoded).result;
+    expect(result?.spatial_columns).toEqual([{ column_index: 0, srid: 4326 }]);
+    expect(result?.spatial_values).toEqual([[4326], [3857], [null]]);
+  });
+
+  it("preserves large-value preview metadata", () => {
+    const encoded = encodeTabResultSnapshot({
+      result: {
+        columns: ["id", "payload"],
+        rows: [[1, "preview..."]],
+        large_value_cells: [{ row_index: 0, column_index: 1, original_bytes: 1_000_000 }],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+      resultLocalSortOriginalRows: [[1, "preview..."]],
+      resultLocalSortOriginalLargeValueCells: [{ row_index: 0, column_index: 1, original_bytes: 1_000_000 }],
+      cachedAt: 1,
+    });
+
+    const restored = decodeTabResultSnapshot(encoded);
+    expect(restored?.result?.large_value_cells).toEqual([{ row_index: 0, column_index: 1, original_bytes: 1_000_000 }]);
+    expect(restored?.resultLocalSortOriginalLargeValueCells).toEqual([{ row_index: 0, column_index: 1, original_bytes: 1_000_000 }]);
+  });
+
   it("restores multi-result, pagination, local-sort, and editable metadata fixtures", () => {
     const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(queryResultLifecycleSnapshot()));
 
@@ -116,6 +191,60 @@ describe("tab result cache statement execution metadata", () => {
     expect(restored?.resultTotalRowCount).toBe(301);
     expect(restored?.tableMeta?.primaryKeys).toEqual(["id"]);
     expect(restored?.querySourceColumns).toEqual(["id", "name"]);
+  });
+
+  it("restores multi-source column comments and their source identity from the snapshot", () => {
+    const snapshot = {
+      result: {
+        columns: ["id", "user_id", "id_1", "name"],
+        rows: [[1, 100, 7, "Alice"]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+      resultRuns: [
+        {
+          id: "run-join",
+          title: "Run 1",
+          sequence: 1,
+          sql: "SELECT a.id, a.user_id, b.id, b.name FROM orders a JOIN users b ON a.user_id = b.id",
+          createdAt: 1,
+          result: {
+            columns: ["id", "user_id", "id_1", "name"],
+            rows: [[1, 100, 7, "Alice"]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+          resultColumnComments: ["订单ID", "下单用户", "用户ID", "用户名"],
+          queryDisplaySourceColumns: [
+            { sourceKey: "a", sourceColumn: "id" },
+            { sourceKey: "a", sourceColumn: "user_id" },
+            { sourceKey: "b", sourceColumn: "id" },
+            { sourceKey: "b", sourceColumn: "name" },
+          ],
+        },
+      ],
+      activeResultRunId: "run-join",
+      resultColumnComments: ["订单ID", "下单用户", "用户ID", "用户名"],
+      queryDisplaySourceColumns: [
+        { sourceKey: "a", sourceColumn: "id" },
+        { sourceKey: "a", sourceColumn: "user_id" },
+        { sourceKey: "b", sourceColumn: "id" },
+        { sourceKey: "b", sourceColumn: "name" },
+      ],
+      cachedAt: 1,
+    };
+
+    const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(snapshot));
+
+    expect(restored?.resultColumnComments).toEqual(["订单ID", "下单用户", "用户ID", "用户名"]);
+    expect(restored?.queryDisplaySourceColumns).toEqual([
+      { sourceKey: "a", sourceColumn: "id" },
+      { sourceKey: "a", sourceColumn: "user_id" },
+      { sourceKey: "b", sourceColumn: "id" },
+      { sourceKey: "b", sourceColumn: "name" },
+    ]);
+    expect(restored?.resultRuns?.[0]?.resultColumnComments).toEqual(["订单ID", "下单用户", "用户ID", "用户名"]);
+    expect(restored?.resultRuns?.[0]?.queryDisplaySourceColumns?.[2]).toEqual({ sourceKey: "b", sourceColumn: "id" });
   });
 
   it("treats corrupt and unsupported snapshots as missing", () => {

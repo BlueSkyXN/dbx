@@ -1,5 +1,6 @@
 import { sqlSemanticDialectFor, type SqlSemanticDialectAdapter } from "@/lib/sql/semantic/dialect";
 import { findActiveSqlStatementSpan, isSuppressedSqlSemanticContext, tokenIsIdentifier, tokenizeSqlSemantic, unquoteSqlSemanticIdentifier } from "@/lib/sql/semantic/tokens";
+import { resolveSqlStatementWindow } from "@/lib/sql/sqlSyntaxTreeWindow";
 import type {
   SqlSemanticBuildOptions,
   SqlSemanticClauseSpans,
@@ -21,10 +22,11 @@ const TABLE_FUNCTION_NAMES = new Set(["table", "xmltable", "json_table", "the", 
 const JOIN_MODIFIERS = new Set(["left", "right", "inner", "outer", "cross", "full", "natural"]);
 const CLAUSE_BOUNDARIES = new Set(["where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "on", "set", "values", "returning"]);
 const FROM_CLAUSE_BOUNDARIES = new Set([...CLAUSE_BOUNDARIES, "window", "qualify", "fetch", "for", "connect", "start", "model"].filter((item) => item !== "on"));
-const ALIAS_BLACKLIST = new Set([...CLAUSE_BOUNDARIES, "join", "straight_join", "left", "right", "inner", "outer", "cross", "full", "natural", "as", "select", "from", "with"]);
+const ALIAS_BLACKLIST = new Set([...FROM_CLAUSE_BOUNDARIES, "on", "join", "straight_join", "left", "right", "inner", "outer", "cross", "full", "natural", "as", "select", "from", "with"]);
 const TABLE_TARGET_MODIFIERS = new Set(["lateral", "only"]);
 const TABLE_FUNCTION_INTRODUCERS = new Set(["from", "join", "straight_join", "apply"]);
 const TOP_LEVEL_STATEMENT_WORDS = new Set(["select", "insert", "delete", "merge", "create", "alter", "drop", "truncate", "call", "exec", "execute", "grant", "revoke"]);
+const SQLSERVER_DEFAULT_SCHEMA = "dbo";
 const SQLSERVER_UPDATE_STATISTICS_SCOPES = new Set(["all", "index", "table"]);
 
 interface ParseState {
@@ -32,6 +34,12 @@ interface ParseState {
   tokens: SqlSemanticToken[];
   statement: SqlSemanticStatement;
   cteSources: SqlSemanticRowSource[];
+}
+
+interface QuerySourceRange {
+  depth: number;
+  startIndex: number;
+  endIndex: number;
 }
 
 interface TrailingIdentifier {
@@ -85,9 +93,12 @@ function readQualifiedName(tokens: readonly SqlSemanticToken[], startIndex: numb
       break;
     }
     index += 2;
-    if (dialect.id === "sqlserver") {
+    if (dialect.id === "sqlserver" && tokens[index]?.text === ".") {
+      const omittedSchema = tokens[index];
+      parts.push({ raw: "", name: SQLSERVER_DEFAULT_SCHEMA, span: omittedSchema.span });
       while (tokens[index]?.text === ".") index += 1;
     }
+    if (!tokenIsIdentifier(tokens[index])) return null;
   }
   if (parts.length === 0) return null;
   return {
@@ -431,10 +442,8 @@ function parseRowSource(state: ParseState, target: number, introducer: string, s
   return parseTableFunctionSource(state, target, introducer, sourceIndex) ?? parseTableSource(state, target, introducer, sourceIndex);
 }
 
-function parseRowSources(state: ParseState): SqlSemanticRowSource[] {
-  const sources: SqlSemanticRowSource[] = [...state.cteSources];
-  const rootDepth = state.tokens.reduce((min, item) => Math.min(min, item.depth), Number.POSITIVE_INFINITY);
-  const sourceDepth = Number.isFinite(rootDepth) ? rootDepth : 0;
+function parseRowSourcesAtDepth(state: ParseState, sourceDepth: number, sourceIndexOffset = 0): SqlSemanticRowSource[] {
+  const sources: SqlSemanticRowSource[] = [];
   let inSelectFromClause = false;
   for (let index = 0; index < state.tokens.length; index += 1) {
     const item = state.tokens[index];
@@ -445,7 +454,7 @@ function parseRowSources(state: ParseState): SqlSemanticRowSource[] {
       else if (inSelectFromClause && FROM_CLAUSE_BOUNDARIES.has(item.normalized)) inSelectFromClause = false;
     }
     if (inSelectFromClause && item.text === ",") {
-      const parsed = parseRowSource(state, index + 1, "from", sources.length);
+      const parsed = parseRowSource(state, index + 1, "from", sourceIndexOffset + sources.length);
       if (parsed) {
         sources.push(parsed.source);
         index = parsed.nextIndex - 1;
@@ -461,7 +470,7 @@ function parseRowSources(state: ParseState): SqlSemanticRowSource[] {
     while (JOIN_MODIFIERS.has(state.tokens[target]?.normalized ?? "")) target += 1;
     target = sqlServerMaintenanceTableTarget(state.tokens, target, normalized, state.dialect);
     for (;;) {
-      const parsed = parseRowSource(state, target, normalized, sources.length);
+      const parsed = parseRowSource(state, target, normalized, sourceIndexOffset + sources.length);
       if (!parsed) break;
       sources.push(parsed.source);
       index = parsed.nextIndex - 1;
@@ -472,6 +481,50 @@ function parseRowSources(state: ParseState): SqlSemanticRowSource[] {
     }
   }
   return dedupeSources(sources);
+}
+
+function querySourceRanges(tokens: readonly SqlSemanticToken[], cursor: number): QuerySourceRange[] {
+  const rootDepth = tokens.reduce((min, item) => Math.min(min, item.depth), Number.POSITIVE_INFINITY);
+  const fallbackDepth = Number.isFinite(rootDepth) ? rootDepth : 0;
+  const cursorDepth = [...tokens].reverse().find((item) => item.span.start < cursor)?.depth ?? fallbackDepth;
+  const starts = new Map<number, number>();
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const item = tokens[index];
+    if (!item || item.span.start >= cursor) break;
+    if (item.kind === "word" && item.normalized === "select" && item.depth <= cursorDepth) {
+      starts.set(item.depth, index);
+    }
+  }
+  if (!starts.has(fallbackDepth)) starts.set(fallbackDepth, 0);
+
+  return [...starts.entries()]
+    .sort(([left], [right]) => right - left)
+    .map(([depth, startIndex]) => {
+      let endIndex = tokens.length;
+      if (depth > fallbackDepth) {
+        for (let index = startIndex + 1; index < tokens.length; index += 1) {
+          if ((tokens[index]?.depth ?? depth) < depth) {
+            endIndex = index;
+            break;
+          }
+        }
+      }
+      return { depth, startIndex, endIndex };
+    });
+}
+
+function parseRowSources(state: ParseState, cursor: number): SqlSemanticRowSource[] {
+  const ranges = querySourceRanges(state.tokens, cursor);
+  const sources: SqlSemanticRowSource[] = [];
+  for (const range of ranges) {
+    const scopedState = {
+      ...state,
+      tokens: state.tokens.slice(range.startIndex, range.endIndex),
+    };
+    sources.push(...parseRowSourcesAtDepth(scopedState, range.depth, sources.length));
+  }
+  return dedupeSources([...sources, ...state.cteSources]);
 }
 
 function dedupeSources(sources: SqlSemanticRowSource[]): SqlSemanticRowSource[] {
@@ -548,18 +601,52 @@ function trailingIdentifier(tokens: readonly SqlSemanticToken[], cursor: number,
 }
 
 function previousWord(tokens: readonly SqlSemanticToken[], cursor: number): string {
-  const before = tokens.filter((item) => item.span.end <= cursor && item.kind === "word");
-  return before[before.length - 1]?.normalized ?? "";
+  const before = tokens.filter((item) => item.span.end <= cursor && item.kind !== "comment");
+  return nearestPreviousSyntaxWord(before);
 }
 
 function wordBeforePosition(tokens: readonly SqlSemanticToken[], position: number): string {
-  const before = tokens.filter((item) => item.span.end <= position && item.kind === "word");
-  return before[before.length - 1]?.normalized ?? "";
+  const before = tokens.filter((item) => item.span.end <= position && item.kind !== "comment");
+  return nearestPreviousSyntaxWord(before);
+}
+
+function wordBeforeTrailingIdentifier(tokens: readonly SqlSemanticToken[], cursor: number, trailing: TrailingIdentifier): string {
+  const before = tokens.filter((item) => item.span.end <= cursor && item.kind !== "comment");
+  let index = before.length - 1;
+  let identifiersToSkip = trailing.qualifierParts.length + (trailing.prefix ? 1 : 0);
+  while (index >= 0 && identifiersToSkip > 0) {
+    if (before[index]?.text === ".") {
+      index -= 1;
+      continue;
+    }
+    if (!tokenIsIdentifier(before[index])) break;
+    identifiersToSkip -= 1;
+    index -= 1;
+  }
+  return nearestPreviousSyntaxWord(before.slice(0, index + 1));
+}
+
+/**
+ * Scans backward from the end of `before` for the nearest unquoted syntax word.
+ * A quoted identifier is a barrier: its object name must not participate in
+ * keyword comparisons even when it is named `from`, `join`, or `update`.
+ */
+function nearestPreviousSyntaxWord(tokens: readonly SqlSemanticToken[]): string {
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const item = tokens[index];
+    if (!item) continue;
+    if (item.kind === "word") return item.normalized;
+    if (item.kind === "quoted_identifier") return "";
+    if (item.text === "." || item.kind === "comment") continue;
+    break;
+  }
+  return "";
 }
 
 function isTableListContinuation(tokens: readonly SqlSemanticToken[], position: number): boolean {
   const before = tokens.filter((item) => item.span.end <= position && item.kind !== "comment");
-  const commaIndex = before.length - 1;
+  let commaIndex = before.length - 1;
+  while (commaIndex >= 0 && (tokenIsIdentifier(before[commaIndex]) || before[commaIndex]?.text === ".")) commaIndex -= 1;
   const comma = before[commaIndex];
   if (comma?.text !== ",") return false;
   const depth = comma.depth;
@@ -589,7 +676,8 @@ function sourceForQualifier(sources: readonly SqlSemanticRowSource[], qualifierP
 
 function starQualifierParts(before: readonly SqlSemanticToken[], starIndex: number, dialect: SqlSemanticDialectAdapter): string[] {
   let index = starIndex - 1;
-  if (before[index]?.text === ".") index -= 1;
+  if (before[index]?.text !== ".") return [];
+  index -= 1;
   const qualifierParts: string[] = [];
   while (index >= 0) {
     const identifier = before[index];
@@ -611,6 +699,7 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
   const before = tokens.filter((item) => item.span.end <= cursor);
   const last = before[before.length - 1];
   const wordBeforeReplacement = wordBeforePosition(tokens, trailing.replacementRange.start);
+  const wordBeforeTrailing = wordBeforeTrailingIdentifier(tokens, cursor, trailing);
   const tableListContinuation = isTableListContinuation(tokens, trailing.replacementRange.start);
 
   if (last?.text === "*" || trailing.prefix === "*") {
@@ -645,7 +734,8 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
       previous === "join" ||
       TABLE_INTRODUCERS.has(previous) ||
       TABLE_INTRODUCERS.has(wordBeforeReplacement) ||
-      (!!targetSource && !targetSource.alias && trailing.replacementRange.start <= targetSource.sourceSpan.end + 1 && TABLE_INTRODUCERS.has(wordBeforePosition(tokens, targetSource.sourceSpan.start))))
+      TABLE_INTRODUCERS.has(wordBeforeTrailing) ||
+      (!!targetSource && !targetSource.alias && trailing.replacementRange.start >= targetSource.sourceSpan.start && trailing.replacementRange.start <= targetSource.sourceSpan.end + 1 && TABLE_INTRODUCERS.has(wordBeforePosition(tokens, targetSource.sourceSpan.start))))
   ) {
     const role = dialect.qualifierRole(trailing.qualifierParts, "table");
     return { kind: role === "catalog" ? "catalog" : "table", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["table", "view"], confidence: "medium" };
@@ -655,7 +745,7 @@ function buildCursorIntent(tokens: readonly SqlSemanticToken[], cursor: number, 
     return { kind: "alias_column", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, targetSourceId: targetSource.id, expectedObjectKinds: ["column"], confidence: "high" };
   }
 
-  if (TABLE_INTRODUCERS.has(previous) || TABLE_INTRODUCERS.has(wordBeforeReplacement) || previous === "from" || previous === "join" || wordBeforeReplacement === "from" || wordBeforeReplacement === "join" || tableListContinuation) {
+  if (TABLE_INTRODUCERS.has(previous) || TABLE_INTRODUCERS.has(wordBeforeReplacement) || TABLE_INTRODUCERS.has(wordBeforeTrailing) || previous === "from" || previous === "join" || wordBeforeReplacement === "from" || wordBeforeReplacement === "join" || tableListContinuation) {
     return { kind: previous === "join" ? "table" : "table", prefix: trailing.prefix, replacementRange: trailing.replacementRange, qualifierParts: trailing.qualifierParts, expectedObjectKinds: ["table", "view"], confidence: "high" };
   }
 
@@ -696,8 +786,16 @@ function buildScope(statement: SqlSemanticStatement, rowSources: SqlSemanticRowS
 export function buildSqlSemanticModel(sql: string, cursor: number, options: SqlSemanticBuildOptions = {}): SqlSemanticModel {
   const safeCursor = Math.max(0, Math.min(cursor, sql.length));
   const dialect = sqlSemanticDialectFor(options);
-  const allTokens = tokenizeSqlSemantic(sql, dialect.id);
-  const statementSpan = findActiveSqlStatementSpan(sql, allTokens, safeCursor);
+  const window = resolveSqlStatementWindow(sql, safeCursor, options.editorState, dialect.id);
+  const windowSql = sql.slice(window.from, window.to);
+  const windowCursor = safeCursor - window.from;
+  const localTokens = tokenizeSqlSemantic(windowSql, dialect.id);
+  const localStatementSpan = findActiveSqlStatementSpan(windowSql, localTokens, windowCursor);
+  const allTokens = localTokens.map((token) => ({
+    ...token,
+    span: { start: token.span.start + window.from, end: token.span.end + window.from },
+  }));
+  const statementSpan = { start: localStatementSpan.start + window.from, end: localStatementSpan.end + window.from };
   const tokens = significantTokens(allTokens.filter((item) => item.span.end > statementSpan.start && item.span.start < statementSpan.end));
   const kind = statementKind(tokens);
   const statement: SqlSemanticStatement = {
@@ -708,7 +806,7 @@ export function buildSqlSemanticModel(sql: string, cursor: number, options: SqlS
   const suppressed = isSuppressedSqlSemanticContext(allTokens, safeCursor);
   const parseState: ParseState = { dialect, tokens, statement, cteSources: [] };
   parseState.cteSources = parseCteSources(parseState);
-  const rowSources = parseRowSources(parseState);
+  const rowSources = parseRowSources(parseState, safeCursor);
   const projections = parseSelectProjections(tokens, dialect);
   const cursorIntent = buildCursorIntent(tokens, safeCursor, rowSources, dialect, suppressed, kind);
   const scopes = [buildScope(statement, rowSources, projections, tokens)];

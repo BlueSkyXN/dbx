@@ -42,6 +42,14 @@ test("serializes unsaved query tabs with editor context", () => {
   ]);
 });
 
+test("round-trips query transaction mode", () => {
+  const saved = serializeOpenTabs([queryTab({ autoCommit: false })]);
+  const restored = restoreOpenTabsState(JSON.stringify(saved), "tab-1");
+
+  assert.equal(saved[0]?.autoCommit, false);
+  assert.equal(restored.tabs[0]?.autoCommit, false);
+});
+
 test("serializes object source query tabs with save context", () => {
   const saved = serializeOpenTabs([
     queryTab({
@@ -171,6 +179,7 @@ test("serializes query result run metadata without row payloads", () => {
           sequence: 1,
           sql: "select 1",
           createdAt: 100,
+          pinned: true,
           result: {
             columns: ["id"],
             rows: [[1]],
@@ -192,6 +201,7 @@ test("serializes query result run metadata without row payloads", () => {
       sequence: 1,
       sql: "select 1",
       createdAt: 100,
+      pinned: true,
       activeResultIndex: undefined,
       resultCacheKey: "tab:tab-1:run:run-1",
       resultEvicted: true,
@@ -213,6 +223,7 @@ test("restores query result run metadata as disk-backed runtime state", () => {
           sequence: 1,
           sql: "select 1",
           createdAt: 100,
+          pinned: true,
           resultCacheKey: "tab:tab-1:run:run-1",
           resultEvicted: true,
         },
@@ -226,6 +237,7 @@ test("restores query result run metadata as disk-backed runtime state", () => {
   assert.equal(restored.tabs[0]?.resultRuns?.[0]?.id, "run-1");
   assert.equal(restored.tabs[0]?.resultRuns?.[0]?.resultCacheState, "disk");
   assert.equal(restored.tabs[0]?.resultRuns?.[0]?.result, undefined);
+  assert.equal(restored.tabs[0]?.resultRuns?.[0]?.pinned, true);
 });
 
 test("ignores legacy table data result cache handles on restore", () => {
@@ -340,6 +352,49 @@ test("restores data and structure tabs with table state", () => {
   assert.equal(restored.tabs[0]?.whereInput, "id > 10");
   assert.equal(restored.tabs[0]?.orderByInput, "id DESC");
   assert.equal(restored.tabs[1]?.structureTableName, "users");
+});
+
+test("drops restored non-query tabs for missing connections but keeps query drafts", () => {
+  const raw = serializeOpenTabs([
+    queryTab({
+      id: "query",
+      title: "Draft",
+      connectionId: "missing-conn",
+      database: "app",
+      sql: "select * from users",
+    }),
+    queryTab({
+      id: "data",
+      title: "users",
+      connectionId: "missing-conn",
+      database: "app",
+      mode: "data",
+      sql: "",
+      tableMeta: {
+        schema: "public",
+        tableName: "users",
+        columns: [],
+        primaryKeys: [],
+      },
+    }),
+    queryTab({
+      id: "structure",
+      title: "Edit users",
+      connectionId: "missing-conn",
+      database: "app",
+      mode: "structure",
+      sql: "",
+      structureTableName: "users",
+    }),
+  ]);
+
+  const restored = restoreOpenTabsState(JSON.stringify(raw), "data", { validConnectionIds: ["live-conn"] });
+
+  assert.deepEqual(
+    restored.tabs.map((tab) => ({ id: tab.id, mode: tab.mode })),
+    [{ id: "query", mode: "query" }],
+  );
+  assert.equal(restored.activeTabId, "query");
 });
 
 test("restores MQ tabs with selected tenant context", () => {

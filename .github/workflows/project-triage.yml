@@ -1,6 +1,8 @@
 name: Project Triage
 
 on:
+  issues:
+    types: [opened, reopened, labeled, unlabeled, assigned, unassigned]
   workflow_dispatch:
     inputs:
       backfill:

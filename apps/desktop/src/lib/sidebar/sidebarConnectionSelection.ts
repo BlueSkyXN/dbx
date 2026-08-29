@@ -1,9 +1,15 @@
 import type { TreeNode } from "@/types/database";
+import { copyNameForTreeNode } from "@/lib/sidebar/treeNodeClick";
 
 type ConnectionTreeNode = TreeNode & { connectionId: string };
+type ConnectionGroupTreeNode = TreeNode & { type: "connection-group" };
 
 export function isConnectionNode(node: TreeNode): node is ConnectionTreeNode {
   return node.type === "connection" && !!node.connectionId;
+}
+
+export function isConnectionGroupNode(node: TreeNode): node is ConnectionGroupTreeNode {
+  return node.type === "connection-group";
 }
 
 function selectedConnectionActionTargets(currentNode: TreeNode, selectedNodes: TreeNode[]): ConnectionTreeNode[] {
@@ -23,6 +29,23 @@ export function selectedConnectionDuplicateTargets(currentNode: TreeNode, select
   return selectedConnectionActionTargets(currentNode, selectedNodes);
 }
 
+export function selectedConnectionGroupDeleteTargets(currentNode: TreeNode, selectedNodes: TreeNode[]): ConnectionGroupTreeNode[] {
+  if (!isConnectionGroupNode(currentNode)) return [];
+  const selectedContainsCurrent = selectedNodes.some((node) => node.id === currentNode.id);
+  if (selectedNodes.length > 1 && selectedContainsCurrent && selectedNodes.every(isConnectionGroupNode)) {
+    return selectedNodes;
+  }
+  return [currentNode];
+}
+
+export function selectedConnectionDisconnectTargets(currentNode: TreeNode, selectedNodes: TreeNode[]): ConnectionTreeNode[] {
+  return selectedConnectionActionTargets(currentNode, selectedNodes);
+}
+
+export function selectedConnectionMoveTargets(currentNode: TreeNode, selectedNodes: TreeNode[]): ConnectionTreeNode[] {
+  return selectedConnectionActionTargets(currentNode, selectedNodes);
+}
+
 export function selectedConnectionClipboardTargets(currentNode: TreeNode, selectedNodes: TreeNode[]): ConnectionTreeNode[] {
   return selectedConnectionActionTargets(currentNode, selectedNodes);
 }
@@ -37,6 +60,18 @@ export function selectedConnectionEditTarget(currentNode: TreeNode, selectedNode
 export function selectedConnectionClipboardNodes(selectedNodes: TreeNode[]): ConnectionTreeNode[] {
   if (selectedNodes.length === 0 || !selectedNodes.every(isConnectionNode)) return [];
   return selectedNodes;
+}
+
+export function copySelectedConnectionsToClipboards(selectedNodes: TreeNode[], copyConnectionsToTreeClipboard: (connectionIds: string[]) => number, copyToSystemClipboard: (text: string) => Promise<void>): number {
+  const connectionNodes = selectedConnectionClipboardNodes(selectedNodes);
+  if (connectionNodes.length === 0) return 0;
+
+  const copiedCount = copyConnectionsToTreeClipboard(connectionNodes.map((node) => node.connectionId));
+  if (copiedCount > 0) {
+    // Connection duplication uses the tree clipboard, so keep it available even if OS clipboard access is denied.
+    void copyToSystemClipboard(connectionNodes.map(copyNameForTreeNode).join("\n")).catch(() => {});
+  }
+  return copiedCount;
 }
 
 export function connectionPasteTargetGroupId(node: TreeNode | null | undefined, groupIdForConnection: (connectionId: string) => string | null): string | null {

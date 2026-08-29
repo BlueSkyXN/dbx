@@ -42,8 +42,8 @@ const autoRefresh = ref(false);
 const intervalSeconds = ref(DEFAULT_REFRESH_SECONDS);
 let timer: ReturnType<typeof setInterval> | undefined;
 
-const killTarget = ref<ProcessRow | null>(null);
-const killing = ref(false);
+const cancelTarget = ref<ProcessRow | null>(null);
+const canceling = ref(false);
 const fallbackListSql = ref<string | null>(null);
 
 // Full-text preview for long cells (SQL statement / info), opened by clicking them.
@@ -99,7 +99,13 @@ async function load(options: { silent?: boolean } = {}) {
     await connectionStore.ensureConnected(props.connection.id);
     if (ownSessionId.value === null) {
       try {
-        const idResult = await api.executeQuery(props.connection.id, "", activeDriver.ownSessionSql, undefined, undefined, { maxRows: 1 });
+        let idResult;
+        try {
+          idResult = await api.executeQuery(props.connection.id, "", activeDriver.ownSessionSql, undefined, undefined, { maxRows: 1 });
+        } catch (error) {
+          if (!activeDriver.fallbackOwnSessionSql || !activeDriver.shouldUseFallbackOwnSessionSql?.(error)) throw error;
+          idResult = await api.executeQuery(props.connection.id, "", activeDriver.fallbackOwnSessionSql, undefined, undefined, { maxRows: 1 });
+        }
         const raw = idResult?.rows?.[0]?.[0];
         const parsed = Number(raw);
         if (Number.isFinite(parsed)) ownSessionId.value = parsed;
@@ -131,37 +137,50 @@ function isOwnSession(row: ProcessRow): boolean {
   return ownSessionId.value !== null && row.id === ownSessionId.value;
 }
 
-function requestKill(row: ProcessRow) {
+function requestCancel(row: ProcessRow) {
   if (isOwnSession(row)) return;
-  killTarget.value = row;
+  cancelTarget.value = row;
 }
 
-async function confirmKill() {
-  const target = killTarget.value;
+async function confirmCancel() {
+  const target = cancelTarget.value;
   const activeDriver = driver.value;
   if (!target || !activeDriver) return;
-  killing.value = true;
+  canceling.value = true;
   try {
-    const killSql = activeDriver.buildKillSql(target.id);
+    const cancelSql = activeDriver.buildCancelQuerySql(target.id);
+    let usedFallbackCancelSql = false;
+    const executeCancelSql = async (sql: string) => {
+      const results = await api.executeMulti(props.connection.id, "", sql, undefined, undefined, { maxRows: 1 });
+      const executionError = processListExecutionError(results);
+      if (executionError) throw new Error(executionError);
+      return results;
+    };
     const result = await executeWithProductionSqlGuard({
       connection: props.connection,
       database: "",
-      sql: killSql,
+      sql: cancelSql,
       source: t("production.sourceAdmin"),
-      execute: () => api.executeMulti(props.connection.id, "", killSql, undefined, undefined, { maxRows: 1 }),
+      execute: async () => {
+        try {
+          return await executeCancelSql(cancelSql);
+        } catch (error) {
+          if (!activeDriver.buildFallbackCancelQuerySql || !activeDriver.shouldUseFallbackCancelQuerySql?.(error)) throw error;
+          usedFallbackCancelSql = true;
+          return executeCancelSql(activeDriver.buildFallbackCancelQuerySql(target.id));
+        }
+      },
     });
     if (result === undefined) return;
-    const executionError = processListExecutionError(result);
-    if (executionError) throw new Error(executionError);
-    const killResultError = activeDriver.killResultError?.(result);
-    if (killResultError) throw new Error(killResultError);
+    const cancelResultError = usedFallbackCancelSql ? activeDriver.fallbackCancelQueryResultError?.(result) : activeDriver.cancelQueryResultError?.(result);
+    if (cancelResultError) throw new Error(cancelResultError);
     toast(t("processList.killSuccess", { id: target.id }), 2500);
-    killTarget.value = null;
+    cancelTarget.value = null;
     await load({ silent: true });
   } catch (error: any) {
     toast(t("processList.killFailed", { message: error?.message || String(error) }), 5000);
   } finally {
-    killing.value = false;
+    canceling.value = false;
   }
 }
 
@@ -280,7 +299,7 @@ onBeforeUnmount(stopTimer);
                 class="h-6 gap-1 px-1.5 text-[11px] text-destructive hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
                 :disabled="isOwnSession(row)"
                 :title="isOwnSession(row) ? t('processList.cannotKillSelf') : t('processList.kill')"
-                @click="requestKill(row)"
+                @click="requestCancel(row)"
               >
                 <Ban class="h-3.5 w-3.5" />
                 {{ t("processList.kill") }}
@@ -297,10 +316,10 @@ onBeforeUnmount(stopTimer);
     </div>
 
     <Dialog
-      :open="killTarget !== null"
+      :open="cancelTarget !== null"
       @update:open="
         (open) => {
-          if (!open) killTarget = null;
+          if (!open) cancelTarget = null;
         }
       "
     >
@@ -311,13 +330,13 @@ onBeforeUnmount(stopTimer);
             {{ t("processList.killTitle") }}
           </DialogTitle>
         </DialogHeader>
-        <p v-if="killTarget" class="text-sm text-muted-foreground">
-          {{ t("processList.killConfirm", { id: killTarget.id, user: killTarget.user }) }}
+        <p v-if="cancelTarget" class="text-sm text-muted-foreground">
+          {{ t("processList.killConfirm", { id: cancelTarget.id, user: cancelTarget.user }) }}
         </p>
         <DialogFooter>
-          <Button variant="outline" @click="killTarget = null">{{ t("dangerDialog.cancel") }}</Button>
-          <Button variant="destructive" :disabled="killing" @click="confirmKill">
-            <Loader2 v-if="killing" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          <Button variant="outline" @click="cancelTarget = null">{{ t("dangerDialog.cancel") }}</Button>
+          <Button variant="destructive" :disabled="canceling" @click="confirmCancel">
+            <Loader2 v-if="canceling" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
             {{ t("processList.kill") }}
           </Button>
         </DialogFooter>

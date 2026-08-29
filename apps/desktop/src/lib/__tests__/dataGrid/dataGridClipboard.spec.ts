@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { claimDataGridPaste, clearDataGridClipboardCopy, parseDataGridClipboard, planDataGridPaste, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
+import { claimDataGridPaste, claimDataGridSelectAll, clearDataGridClipboardCopy, parseDataGridClipboard, planDataGridPaste, rememberDataGridClipboardCopy } from "@/lib/dataGrid/dataGridClipboard";
 
 afterEach(() => clearDataGridClipboardCopy());
 
@@ -18,6 +18,32 @@ function pasteEvent(nativeClipboard: boolean) {
     stopPropagation: vi.fn(),
   };
 }
+
+describe("claimDataGridSelectAll", () => {
+  it("blocks native page selection while the grid is loading", () => {
+    const event = pasteEvent(false);
+
+    expect(claimDataGridSelectAll(event, true, false)).toBe("block");
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it("selects grid data after loading", () => {
+    const event = pasteEvent(false);
+
+    expect(claimDataGridSelectAll(event, false, true)).toBe("select");
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it("keeps native selection for editors and empty idle grids", () => {
+    const editorEvent = pasteEvent(true);
+    const emptyGridEvent = pasteEvent(false);
+
+    expect(claimDataGridSelectAll(editorEvent, true, false)).toBe("native");
+    expect(claimDataGridSelectAll(emptyGridEvent, false, false)).toBe("native");
+    expect(editorEvent.preventDefault).not.toHaveBeenCalled();
+    expect(emptyGridEvent.preventDefault).not.toHaveBeenCalled();
+  });
+});
 
 describe("claimDataGridPaste", () => {
   it("keeps native paste behavior for editors inside the grid", () => {
@@ -125,8 +151,15 @@ describe("parseDataGridClipboard", () => {
     ]);
   });
 
+  it("preserves embedded tabs and newlines even without null values", () => {
+    const text = '"left\tinside"\t"line 1\nline 2"';
+    rememberDataGridClipboardCopy(text, [["left\tinside", "line 1\nline 2"]]);
+
+    expect(parseDataGridClipboard(text)).toEqual([["left\tinside", "line 1\nline 2"]]);
+  });
+
   it("restores null positions after copied headers", () => {
-    rememberDataGridClipboardCopy("name\tnote\nAda\tNULL", [["Ada", null]], true);
+    rememberDataGridClipboardCopy("name\tnote\nAda\tNULL", [["Ada", null]], ["name", "note"]);
 
     expect(parseDataGridClipboard("name\tnote\nAda\tNULL")).toEqual([
       ["name", "note"],

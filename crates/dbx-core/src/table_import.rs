@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -14,12 +16,19 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader as XmlReader;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlparser::ast::{
+    DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Insert, ObjectName, ObjectNamePart,
+    SetExpr, Statement, TableObject, UnaryOperator, Value as SqlValue,
+};
+use sqlparser::dialect::{GenericDialect, MsSqlDialect, MySqlDialect, OracleDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::parser::Parser;
 
 use crate::connection::{task_client_session_id, AppState, PoolKind};
 use crate::models::connection::DatabaseType;
 use crate::transfer::{
-    execute_on_pool, generate_insert_typed, generate_insert_typed_sql_batches, get_columns_for_transfer,
-    qualified_table, quote_identifier,
+    escape_value_typed, execute_on_pool, generate_insert_typed_from_value_rows,
+    generate_insert_typed_sql_batches_from_value_rows, get_columns_for_transfer, normalize_integer_literal,
+    normalize_thousands_numeric_literal, qualified_table, quote_identifier, SqlBatchLimits,
 };
 
 pub const DEFAULT_PREVIEW_LIMIT: usize = 50;
@@ -35,8 +44,18 @@ const MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_XLSX_SHARED_STRINGS_BYTES: u64 = 1024 * 1024 * 1024;
 const XLSX_SHARED_STRING_CACHE_ENTRIES: usize = 4096;
 const XLSX_SHARED_STRING_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const XLSX_CANCELLABLE_READ_CHUNK_BYTES: usize = 64 * 1024;
+const XLSX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 // INSERT ALL has a practical statement-size limit on Oracle, even when the requested batch is larger.
 const MAX_ORACLE_IMPORT_BATCH_ROWS: usize = 500;
+const SQLITE_APPEND_COMMIT_ROWS: usize = 10_000;
+const SQLITE_APPEND_COMMIT_SQL_BYTES: usize = 8 * 1024 * 1024;
+const POSTGRES_COPY_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const POSTGRES_COPY_MAX_ROWS: usize = 50_000;
+// Bound the additional memory used while converting one source row into owned
+// NVARCHAR staging values. The source JSON batch remains owned by the parser;
+// the bulk path must never add a second, batch-sized string matrix beside it.
+const SQLSERVER_BULK_ROW_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn table_import_client_session_id(import_id: &str) -> String {
     task_client_session_id("table-import", import_id)
@@ -99,6 +118,7 @@ pub enum TableImportSourceFormat {
     Delimited,
     Json,
     Excel,
+    Sql,
 }
 
 impl TableImportSourceFormat {
@@ -109,6 +129,7 @@ impl TableImportSourceFormat {
             TableImportSourceFormat::Delimited => "txt",
             TableImportSourceFormat::Json => "json",
             TableImportSourceFormat::Excel => "excel",
+            TableImportSourceFormat::Sql => "sql",
         }
     }
 
@@ -171,6 +192,9 @@ pub struct TableImportParseOptions {
     pub sheet_name: Option<String>,
     pub sheet_index: Option<usize>,
     pub json_shape: Option<TableImportJsonShape>,
+    /// SQL 脚本的源方言（目标连接类型）。决定字符串转义、标识符大小写与语句拆分规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_dialect: Option<DatabaseType>,
 }
 
 impl Default for TableImportParseOptions {
@@ -187,6 +211,7 @@ impl Default for TableImportParseOptions {
             sheet_name: None,
             sheet_index: None,
             json_shape: Some(TableImportJsonShape::Auto),
+            sql_dialect: None,
         }
     }
 }
@@ -321,6 +346,7 @@ pub enum ImportFileKind {
     Txt,
     Json,
     Xlsx,
+    Sql,
 }
 
 impl ImportFileKind {
@@ -331,6 +357,7 @@ impl ImportFileKind {
             ImportFileKind::Txt => "txt",
             ImportFileKind::Json => "json",
             ImportFileKind::Xlsx => "xlsx",
+            ImportFileKind::Sql => "sql",
         }
     }
 }
@@ -347,6 +374,8 @@ pub fn import_file_kind(path: &str) -> Result<ImportFileKind, String> {
         Ok(ImportFileKind::Json)
     } else if lower.ends_with(".xlsx") || lower.ends_with(".xlsm") || lower.ends_with(".xls") {
         Ok(ImportFileKind::Xlsx)
+    } else if lower.ends_with(".sql") {
+        Ok(ImportFileKind::Sql)
     } else {
         Err("Unsupported import file type".to_string())
     }
@@ -359,6 +388,7 @@ pub fn source_format_for_path(path: &str) -> Result<TableImportSourceFormat, Str
         ImportFileKind::Txt => TableImportSourceFormat::Delimited,
         ImportFileKind::Json => TableImportSourceFormat::Json,
         ImportFileKind::Xlsx => TableImportSourceFormat::Excel,
+        ImportFileKind::Sql => TableImportSourceFormat::Sql,
     })
 }
 
@@ -378,6 +408,24 @@ pub fn normalize_header(value: &str, index: usize) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn unique_import_headers(headers: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut next_suffix = HashMap::<String, usize>::new();
+    headers
+        .into_iter()
+        .map(|header| {
+            let suffix = next_suffix.entry(header.to_lowercase()).or_default();
+            loop {
+                let candidate = if *suffix == 0 { header.clone() } else { format!("{header}_{suffix}") };
+                *suffix += 1;
+                if seen.insert(candidate.to_lowercase()) {
+                    break candidate;
+                }
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -886,11 +934,12 @@ fn parse_csv_reader_inner<R: IoRead>(
         index += 1;
         let row_number = index;
         if config.row_range.title_row == Some(row_number) {
-            columns = record
-                .iter()
-                .enumerate()
-                .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
-                .collect();
+            columns = unique_import_headers(
+                record
+                    .iter()
+                    .enumerate()
+                    .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index)),
+            );
             continue;
         }
         if row_number < config.row_range.data_start_row {
@@ -1053,6 +1102,479 @@ pub fn parse_json_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImpo
     parse_json_bytes_with_options(bytes, &TableImportParseOptions::default(), preview_limit)
 }
 
+// ---------------------------------------------------------------------------
+// SQL 脚本导入：从 .sql 文件中提取 INSERT / REPLACE 语句的数据行
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SqlInsertTarget {
+    table: String,
+    columns: Vec<String>,
+    columns_generated: bool,
+}
+
+/// 按选择的文本编码解码 SQL 脚本字节（未指定时自动检测），返回脚本文本与实际编码。
+fn decode_sql_script_bytes(
+    bytes: &[u8],
+    requested: Option<TableImportTextEncoding>,
+) -> Result<(String, TableImportTextEncoding), String> {
+    let (encoding, bom_len) = resolve_text_encoding_from_bytes(bytes, requested)?;
+    let charset = encoding.encoding().ok_or_else(|| "SQL import requires a resolved text encoding".to_string())?;
+    let (decoded, _, _) = charset.decode(&bytes[bom_len.min(bytes.len())..]);
+    Ok((decoded.into_owned(), encoding))
+}
+
+/// 源 SQL 方言家族：决定未加引号标识符的大小写折叠规则。
+/// 字符串/表达式/标识符的词法解析已交给 sqlparser（按方言正确解释反斜杠、E'...'、
+/// X'...' 等），这里只按方言决定标识符的显示与比较规则，避免把 PostgreSQL 的
+/// "Foo" 与 foo 错误合并。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlImportDialectFamily {
+    Postgres,
+    MySql,
+    Sqlite,
+    SqlServer,
+    Oracle,
+    Generic,
+}
+
+fn sql_import_dialect_family(db_type: DatabaseType) -> SqlImportDialectFamily {
+    if matches!(
+        db_type,
+        DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Uxdb
+            | DatabaseType::Vastbase
+            | DatabaseType::OpenGauss
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
+            | DatabaseType::Iris
+    ) {
+        SqlImportDialectFamily::Postgres
+    } else if matches!(
+        db_type,
+        DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::ManticoreSearch
+            | DatabaseType::Goldendb
+    ) {
+        SqlImportDialectFamily::MySql
+    } else if matches!(
+        db_type,
+        DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1
+    ) {
+        SqlImportDialectFamily::Sqlite
+    } else if matches!(db_type, DatabaseType::SqlServer) {
+        SqlImportDialectFamily::SqlServer
+    } else if matches!(
+        db_type,
+        DatabaseType::Oracle
+            | DatabaseType::Dameng
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Yashandb
+            | DatabaseType::Oscar
+            | DatabaseType::Xugu
+    ) {
+        SqlImportDialectFamily::Oracle
+    } else {
+        SqlImportDialectFamily::Generic
+    }
+}
+
+fn sql_import_parser_dialect(family: SqlImportDialectFamily) -> Box<dyn sqlparser::dialect::Dialect> {
+    match family {
+        SqlImportDialectFamily::Postgres => Box::new(PostgreSqlDialect {}),
+        SqlImportDialectFamily::MySql => Box::new(MySqlDialect {}),
+        SqlImportDialectFamily::Sqlite => Box::new(SQLiteDialect {}),
+        SqlImportDialectFamily::SqlServer => Box::new(MsSqlDialect {}),
+        SqlImportDialectFamily::Oracle => Box::new(OracleDialect {}),
+        SqlImportDialectFamily::Generic => Box::new(GenericDialect {}),
+    }
+}
+
+/// 标识符的展示名：PostgreSQL 未加引号标识符折叠为小写，加引号保留原样；
+/// 其它方言保留原文大小写。
+fn sql_import_ident_display(ident: &Ident, family: SqlImportDialectFamily) -> String {
+    if family == SqlImportDialectFamily::Postgres && ident.quote_style.is_none() {
+        ident.value.to_lowercase()
+    } else {
+        ident.value.clone()
+    }
+}
+
+/// 判断两组列名是否指向同一列清单。
+/// - PostgreSQL：未加引号已折叠为小写、加引号保留原样，精确比较即可区分 "Foo" 与 foo。
+/// - 其它方言（MySQL/SQLite/…）：列名大小写不敏感。
+fn sql_import_names_match(a: &[String], b: &[String], family: SqlImportDialectFamily) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(left, right)| {
+            if family == SqlImportDialectFamily::Postgres {
+                left == right
+            } else {
+                left.eq_ignore_ascii_case(right)
+            }
+        })
+}
+
+fn sql_import_table_matches(a: &str, b: &str, family: SqlImportDialectFamily) -> bool {
+    if family == SqlImportDialectFamily::Postgres {
+        a == b
+    } else {
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+/// 从 `ObjectName`（可能是 `schema.column`）取出最后一个标识符部分。
+fn sql_import_object_name_ident<'a>(name: &'a ObjectName, what: &str) -> Result<&'a Ident, String> {
+    let Some(last) = name.0.last() else {
+        return Err(format!("SQL import: empty {what} name"));
+    };
+    match last {
+        ObjectNamePart::Identifier(ident) => Ok(ident),
+        ObjectNamePart::Function(_) => Err(format!("SQL import: function-based {what} names are not supported")),
+    }
+}
+
+fn sql_import_number_value(raw: &str, context: &str) -> Result<serde_json::Value, String> {
+    // 优先保留整数精度；小数与科学计数法回退到浮点。
+    if let Ok(integer) = raw.parse::<i64>() {
+        return Ok(serde_json::Value::Number(integer.into()));
+    }
+    if let Ok(float) = raw.parse::<f64>() {
+        if float.is_finite() {
+            if float.fract() == 0.0 && float >= i64::MIN as f64 && float < -(i64::MIN as f64) {
+                let integer = float as i64;
+                if integer as f64 == float {
+                    return Ok(serde_json::Value::Number(integer.into()));
+                }
+            }
+            if let Some(number) = serde_json::Number::from_f64(float) {
+                return Ok(serde_json::Value::Number(number));
+            }
+        }
+    }
+    Err(format!("{context}: unsupported numeric literal '{raw}'"))
+}
+
+fn sql_import_expr_value(expr: &Expr, context: &str) -> Result<serde_json::Value, String> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(raw, _) => sql_import_number_value(raw.as_str(), context),
+            SqlValue::Boolean(flag) => Ok(serde_json::Value::Bool(*flag)),
+            SqlValue::Null => Ok(serde_json::Value::Null),
+            // 二进制/十六进制字面量无法无损地作为文本导入，明确拒绝而非静默改写。
+            SqlValue::HexStringLiteral(_)
+            | SqlValue::SingleQuotedByteStringLiteral(_)
+            | SqlValue::DoubleQuotedByteStringLiteral(_) => {
+                Err(format!("{context}: binary/hex literals (X'..', B'..') are not supported for SQL import"))
+            }
+            SqlValue::Placeholder(_) => Err(format!("{context}: bind placeholders are not supported for SQL import")),
+            // 普通字符串字面量：转义已由 sqlparser 按源方言正确解码。
+            other => match other.clone().into_string() {
+                Some(text) => Ok(serde_json::Value::String(text)),
+                None => Err(format!("{context}: unsupported SQL literal")),
+            },
+        },
+        // 一元正负号作用于数值字面量：`-1.5`、`+3` 等是合法值，不能当表达式拒绝。
+        Expr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Minus => {
+                if let Expr::Value(value) = expr.as_ref() {
+                    if let SqlValue::Number(raw, _) = &value.value {
+                        return sql_import_number_value(&format!("-{raw}"), context);
+                    }
+                }
+                Err(sql_import_unsupported_expression(context))
+            }
+            UnaryOperator::Plus => {
+                if let Expr::Value(value) = expr.as_ref() {
+                    if let SqlValue::Number(raw, _) = &value.value {
+                        return sql_import_number_value(raw.as_str(), context);
+                    }
+                }
+                Err(sql_import_unsupported_expression(context))
+            }
+            _ => Err(sql_import_unsupported_expression(context)),
+        },
+        // `DATE '...'`、`TIMESTAMP '...'`、`TIME '...'` 等标准字面量：值就是引号里的字符串，无损导入。
+        Expr::TypedString(typed) => sql_import_typed_string(typed, context),
+        // 白名单字面量日期函数（TO_DATE/TO_TIMESTAMP/...）：参数全为字符串字面量时按第一个参数导入。
+        Expr::Function(function) => sql_import_literal_temporal_function(function, context),
+        _ => Err(sql_import_unsupported_expression(context)),
+    }
+}
+
+/// `DATE '...'`、`TIMESTAMP '...'`、`TIME '...'` 这类标准字面量：值就是引号里的字符串，
+/// 无损地作为字符串导入。其它 TypedString（如 INTERVAL）语义更复杂，不展开。
+fn sql_import_typed_string(typed: &sqlparser::ast::TypedString, context: &str) -> Result<serde_json::Value, String> {
+    match &typed.data_type {
+        DataType::Date | DataType::Time(..) | DataType::Timestamp(..) => match typed.value.clone().into_string() {
+            Some(text) => Ok(serde_json::Value::String(text)),
+            None => Err(sql_import_unsupported_expression(context)),
+        },
+        _ => Err(sql_import_unsupported_expression(context)),
+    }
+}
+
+/// 白名单“字面量日期函数”：`TO_DATE('2021-09-08 09:06:25', 'YYYY-MM-DD HH24:MI:SS')` 这类调用，
+/// 当参数全部是字符串字面量时，其“值”就是第一个字符串实参表示的日期时间，按该字符串无损导入。
+/// 任何非字面量参数（列引用、表达式、命名参数、ORDER BY 子句等）都不展开，回退到“表达式不支持”，
+/// 避免静默改变语句语义。
+fn sql_import_literal_temporal_function(
+    function: &sqlparser::ast::Function,
+    context: &str,
+) -> Result<serde_json::Value, String> {
+    let name = function.name.to_string().to_ascii_lowercase();
+    if !matches!(name.as_str(), "to_date" | "to_timestamp" | "to_timestamp_tz") {
+        return Err(sql_import_unsupported_expression(context));
+    }
+    let FunctionArguments::List(list) = &function.args else {
+        return Err(sql_import_unsupported_expression(context));
+    };
+    if list.args.is_empty() || !list.clauses.is_empty() || list.duplicate_treatment.is_some() {
+        return Err(sql_import_unsupported_expression(context));
+    }
+
+    let mut first_value: Option<String> = None;
+    for arg in &list.args {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) = arg else {
+            return Err(sql_import_unsupported_expression(context));
+        };
+        let text = value.clone().into_string().ok_or_else(|| sql_import_unsupported_expression(context))?;
+        if first_value.is_none() {
+            first_value = Some(text);
+        }
+    }
+
+    let value = first_value.expect("args non-empty checked above");
+    Ok(serde_json::Value::String(value))
+}
+
+fn sql_import_unsupported_expression(context: &str) -> String {
+    format!(
+        "{context}: expressions (functions, operators, casts, ...) are not supported; \
+         SQL import only accepts literal values so statement semantics are preserved"
+    )
+}
+
+/// 解析单条 INSERT 语句，把值行登记到 `target`/`rows`。
+/// REPLACE、INSERT IGNORE、INSERT ... SELECT、INSERT ... SET、ON CONFLICT 等无法用
+/// 普通 INSERT 无损表达的构造一律拒绝。
+fn parse_sql_insert_statement(
+    insert: &Insert,
+    family: SqlImportDialectFamily,
+    target: &mut Option<SqlInsertTarget>,
+    rows: &mut Vec<Vec<serde_json::Value>>,
+    preview_limit: usize,
+    total_rows: &mut usize,
+) -> Result<(), String> {
+    if insert.replace_into {
+        return Err(
+            "SQL import does not support REPLACE; its delete-then-insert conflict semantics cannot be preserved"
+                .to_string(),
+        );
+    }
+    if insert.ignore {
+        return Err("SQL import does not support INSERT IGNORE".to_string());
+    }
+    if insert.or.is_some() {
+        return Err("SQL import does not support INSERT OR ... conflict clauses".to_string());
+    }
+    if insert.on.is_some() {
+        return Err("SQL import does not support ON DUPLICATE KEY / ON CONFLICT clauses".to_string());
+    }
+    if !insert.assignments.is_empty() {
+        return Err("SQL import does not support INSERT ... SET".to_string());
+    }
+    if insert.returning.is_some() || insert.output.is_some() {
+        return Err("SQL import does not support INSERT ... RETURNING / OUTPUT".to_string());
+    }
+
+    let table_ref = match &insert.table {
+        TableObject::TableName(name) => name,
+        TableObject::TableFunction(_) | TableObject::TableQuery(_) => {
+            return Err("SQL import only supports INSERT into a named table".to_string());
+        }
+    };
+    let table_ident = sql_import_object_name_ident(table_ref, "table")?;
+    let table_name = sql_import_ident_display(table_ident, family);
+
+    if let Some(existing) = target.as_ref() {
+        if !sql_import_table_matches(&existing.table, &table_name, family) {
+            return Err(format!(
+                "SQL import supports one table per file; found '{}' and '{}'",
+                existing.table, table_name
+            ));
+        }
+    }
+
+    let explicit_columns = insert
+        .columns
+        .iter()
+        .map(|column| {
+            sql_import_object_name_ident(column, "column").map(|ident| sql_import_ident_display(ident, family))
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+
+    let Some(source) = insert.source.as_deref() else {
+        return Err("SQL import only supports INSERT ... VALUES".to_string());
+    };
+    let SetExpr::Values(values) = source.body.as_ref() else {
+        return Err("SQL import only supports INSERT ... VALUES; INSERT ... SELECT is not supported".to_string());
+    };
+
+    // 登记/校验列清单：显式列优先，无列清单时延后到首行按值数量推断（保留旧行为），
+    // 列名比较改为按方言规则（区分引号状态）。
+    if !explicit_columns.is_empty() {
+        match target.as_mut() {
+            None => {
+                *target = Some(SqlInsertTarget {
+                    table: table_name.clone(),
+                    columns: explicit_columns,
+                    columns_generated: false,
+                });
+            }
+            Some(existing) => {
+                if !sql_import_names_match(&existing.columns, &explicit_columns, family) {
+                    if existing.columns_generated && existing.columns.len() == explicit_columns.len() {
+                        existing.columns = explicit_columns;
+                        existing.columns_generated = false;
+                    } else {
+                        return Err(format!(
+                            "INSERT statements use different column lists for table '{}'",
+                            existing.table
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for row in &values.rows {
+        let values = &row.content;
+        if target.is_none() {
+            if values.is_empty() {
+                return Err("INSERT statement has an empty value tuple".to_string());
+            }
+            let columns = (0..values.len()).map(|index| format!("column_{}", index + 1)).collect::<Vec<_>>();
+            *target = Some(SqlInsertTarget { table: table_name.clone(), columns, columns_generated: true });
+        }
+        let columns = &target.as_ref().expect("insert target registered above").columns;
+        if values.len() != columns.len() {
+            return Err(format!(
+                "INSERT row has {} values but table '{}' expects {} columns",
+                values.len(),
+                table_name,
+                columns.len()
+            ));
+        }
+        let mut converted = Vec::with_capacity(values.len());
+        for (index, value) in values.iter().enumerate() {
+            let context = format!("SQL import: table '{table_name}', column {}", columns[index]);
+            converted.push(sql_import_expr_value(value, &context)?);
+        }
+        *total_rows += 1;
+        if rows.len() < preview_limit {
+            rows.push(converted);
+        }
+    }
+    Ok(())
+}
+
+/// 跳过空白与 SQL 注释，返回第一个关键字（用于判断语句是否以 INSERT/REPLACE 开头）。
+fn sql_import_leading_keyword(statement: &str) -> Option<String> {
+    let bytes = statement.as_bytes();
+    let mut index = 0usize;
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index + 1 < bytes.len() && bytes[index] == b'-' && bytes[index + 1] == b'-' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if index < bytes.len() && bytes[index] == b'#' {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if index + 1 < bytes.len() && bytes[index] == b'/' && bytes[index + 1] == b'*' {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        break;
+    }
+    let start = index;
+    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    if index == start {
+        return None;
+    }
+    Some(statement[start..index].to_string())
+}
+
+pub fn parse_sql_bytes_with_options(
+    bytes: &[u8],
+    options: &TableImportParseOptions,
+    preview_limit: usize,
+) -> Result<ParsedImportFile, String> {
+    let (text, encoding) = decode_sql_script_bytes(bytes, options.encoding)?;
+    let family = options.sql_dialect.map(sql_import_dialect_family).unwrap_or(SqlImportDialectFamily::Generic);
+    let dialect = sql_import_parser_dialect(family);
+
+    // 复用 sql.rs 的方言感知拆分器：正确处理 MySQL DELIMITER、PostgreSQL 美元引用、
+    // SQL Server GO、Oracle / 等，替代原来按分号裸切的实现。
+    let statements = match options.sql_dialect {
+        Some(db_type) => crate::sql::split_sql_statements_for_database(&text, db_type),
+        None => crate::sql::split_sql_statements(&text),
+    };
+
+    let mut target: Option<SqlInsertTarget> = None;
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut total_rows = 0usize;
+
+    for statement_sql in statements {
+        let parsed = match Parser::parse_sql(dialect.as_ref(), &statement_sql) {
+            Ok(statements) => statements,
+            Err(error) => {
+                // 非 INSERT 语句（DDL、SET、……）不属于数据导入范畴，跳过；
+                // 以 INSERT/REPLACE 开头却解析失败的语句必须报错，不能静默丢弃。
+                let keyword = sql_import_leading_keyword(&statement_sql);
+                let is_insert = keyword
+                    .as_deref()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("REPLACE"));
+                if is_insert {
+                    return Err(format!("SQL import could not parse INSERT statement: {error}"));
+                }
+                continue;
+            }
+        };
+        for statement in parsed {
+            let Statement::Insert(insert) = statement else {
+                continue;
+            };
+            parse_sql_insert_statement(&insert, family, &mut target, &mut rows, preview_limit, &mut total_rows)?;
+        }
+    }
+
+    let target = target.ok_or_else(|| "No INSERT statements found in SQL file".to_string())?;
+    Ok(ParsedImportFile { columns: target.columns, rows, total_rows, effective_encoding: Some(encoding) })
+}
+
+pub fn parse_sql_bytes(bytes: &[u8], preview_limit: usize) -> Result<ParsedImportFile, String> {
+    parse_sql_bytes_with_options(bytes, &TableImportParseOptions::default(), preview_limit)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XlsxTemporalKind {
     Date,
@@ -1125,13 +1647,33 @@ fn xlsx_datetime_label(value: &ExcelDateTime, temporal_kind: Option<XlsxTemporal
     }
 }
 
-fn xlsx_cell_value_with_temporal_kind(cell: &Data, temporal_kind: Option<XlsxTemporalKind>) -> serde_json::Value {
+fn xlsx_string_value(value: &str, empty_string_as_null: bool) -> serde_json::Value {
+    if empty_string_as_null && value.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(value.to_string())
+    }
+}
+
+fn xlsx_number_value(value: f64) -> serde_json::Value {
+    if value.is_finite() && value.fract() == 0.0 && value >= i64::MIN as f64 && value < -(i64::MIN as f64) {
+        let integer = value as i64;
+        if integer as f64 == value {
+            return serde_json::Value::Number(integer.into());
+        }
+    }
+    serde_json::Number::from_f64(value).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+}
+
+fn xlsx_cell_value_with_temporal_kind(
+    cell: &Data,
+    temporal_kind: Option<XlsxTemporalKind>,
+    empty_string_as_null: bool,
+) -> serde_json::Value {
     match cell {
         Data::Empty => serde_json::Value::Null,
-        Data::String(s) => csv_value(s),
-        Data::Float(n) => {
-            serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
+        Data::String(s) => xlsx_string_value(s, empty_string_as_null),
+        Data::Float(n) => xlsx_number_value(*n),
         Data::Int(n) => serde_json::Value::Number((*n).into()),
         Data::Bool(v) => serde_json::Value::Bool(*v),
         Data::DateTime(v) => serde_json::Value::String(xlsx_datetime_label(v, temporal_kind)),
@@ -1173,7 +1715,7 @@ fn xlsx_cell_text_value(cell: &Data, style: Option<&XlsxCellStyle>) -> Option<St
 }
 
 pub fn xlsx_cell_value(cell: &Data) -> serde_json::Value {
-    xlsx_cell_value_with_temporal_kind(cell, None)
+    xlsx_cell_value_with_temporal_kind(cell, None, true)
 }
 
 fn xlsx_cell_label_with_temporal_kind(cell: &Data, temporal_kind: Option<XlsxTemporalKind>) -> String {
@@ -1197,14 +1739,13 @@ pub fn xlsx_cell_label(cell: &Data) -> String {
 fn xlsx_cell_ref_value_with_temporal_kind(
     cell: &DataRef<'_>,
     temporal_kind: Option<XlsxTemporalKind>,
+    empty_string_as_null: bool,
 ) -> serde_json::Value {
     match cell {
         DataRef::Empty => serde_json::Value::Null,
-        DataRef::String(s) => csv_value(s),
-        DataRef::SharedString(s) => csv_value(s),
-        DataRef::Float(n) => {
-            serde_json::Number::from_f64(*n).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
-        }
+        DataRef::String(s) => xlsx_string_value(s, empty_string_as_null),
+        DataRef::SharedString(s) => xlsx_string_value(s, empty_string_as_null),
+        DataRef::Float(n) => xlsx_number_value(*n),
         DataRef::Int(n) => serde_json::Value::Number((*n).into()),
         DataRef::Bool(v) => serde_json::Value::Bool(*v),
         DataRef::DateTime(v) => serde_json::Value::String(xlsx_datetime_label(v, temporal_kind)),
@@ -1230,6 +1771,10 @@ fn xlsx_cell_ref_label_with_temporal_kind(cell: &DataRef<'_>, temporal_kind: Opt
 }
 
 pub fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
+    if is_legacy_xls_path(path) {
+        let workbook = open_workbook_auto(path).map_err(|error| error.to_string())?;
+        return Ok(workbook.sheet_names().to_vec());
+    }
     let file = File::open(path).map_err(|error| error.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|error| error.to_string())?;
     let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
@@ -1534,6 +2079,8 @@ struct XlsxPreviewRawCell {
     style_id: Option<usize>,
     value: String,
     inline_value: String,
+    has_value: bool,
+    has_inline_value: bool,
 }
 
 fn xlsx_dimension_bounds(reference: &str) -> Option<((usize, usize), (usize, usize))> {
@@ -1689,7 +2236,37 @@ fn create_xlsx_spill_file() -> std::io::Result<File> {
     Ok(file)
 }
 
+#[cfg(test)]
 fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) -> Result<XlsxSharedStrings, String> {
+    open_xlsx_shared_strings_with_control(zip, memory_limit, &|| false, &mut |_| Ok(()))
+}
+
+struct XlsxCancellableReader<'a, R> {
+    inner: R,
+    is_cancelled: &'a dyn Fn() -> bool,
+    on_progress: &'a mut dyn FnMut(u64) -> std::io::Result<()>,
+    bytes_read: u64,
+}
+
+impl<R: IoRead> IoRead for XlsxCancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if (self.is_cancelled)() {
+            return Err(std::io::Error::other("Import cancelled"));
+        }
+        let read_len = buffer.len().min(XLSX_CANCELLABLE_READ_CHUNK_BYTES);
+        let bytes_read = self.inner.read(&mut buffer[..read_len])?;
+        self.bytes_read = self.bytes_read.saturating_add(bytes_read as u64);
+        (self.on_progress)(self.bytes_read)?;
+        Ok(bytes_read)
+    }
+}
+
+fn open_xlsx_shared_strings_with_control(
+    zip: &mut zip::ZipArchive<File>,
+    memory_limit: u64,
+    is_cancelled: &dyn Fn() -> bool,
+    on_progress: &mut dyn FnMut(u64) -> std::io::Result<()>,
+) -> Result<XlsxSharedStrings, String> {
     let uncompressed_size = match zip.by_name("xl/sharedStrings.xml") {
         Ok(file) => file.size(),
         Err(zip::result::ZipError::FileNotFound) => return Ok(XlsxSharedStrings::Memory(Vec::new())),
@@ -1713,7 +2290,8 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
     };
 
     let file = zip.by_name("xl/sharedStrings.xml").map_err(|error| error.to_string())?;
-    let mut reader = XmlReader::from_reader(BufReader::new(file));
+    let controlled = XlsxCancellableReader { inner: file, is_cancelled, on_progress, bytes_read: 0 };
+    let mut reader = XmlReader::from_reader(BufReader::new(controlled));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut in_item = false;
@@ -1721,6 +2299,9 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
     let mut phonetic_depth = 0usize;
     let mut current = String::new();
     loop {
+        if is_cancelled() {
+            return Err("Import cancelled".to_string());
+        }
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"si") => {
                 in_item = true;
@@ -1747,7 +2328,9 @@ fn open_xlsx_shared_strings(zip: &mut zip::ZipArchive<File>, memory_limit: u64) 
                 phonetic_depth = 0;
             }
             Ok(Event::Eof) => break,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(if is_cancelled() { "Import cancelled".to_string() } else { error.to_string() });
+            }
             _ => {}
         }
         buffer.clear();
@@ -1764,6 +2347,7 @@ fn xlsx_preview_cell_value(
     shared_strings: &HashMap<usize, String>,
     styles: &[XlsxCellStyle],
     date_1904: bool,
+    empty_string_as_null: bool,
 ) -> serde_json::Value {
     let cell_type = cell.cell_type.as_deref().unwrap_or_default();
     match cell_type {
@@ -1772,9 +2356,12 @@ fn xlsx_preview_cell_value(
             .parse::<usize>()
             .ok()
             .and_then(|index| shared_strings.get(&index))
-            .map_or(serde_json::Value::Null, |value| csv_value(value)),
-        "inlineStr" => csv_value(&cell.inline_value),
-        "str" | "d" | "e" => csv_value(&cell.value),
+            .map_or(serde_json::Value::Null, |value| xlsx_string_value(value, empty_string_as_null)),
+        "inlineStr" if cell.has_inline_value => xlsx_string_value(&cell.inline_value, empty_string_as_null),
+        "inlineStr" => serde_json::Value::Null,
+        "str" if cell.has_value => xlsx_string_value(&cell.value, empty_string_as_null),
+        "str" => serde_json::Value::Null,
+        "d" | "e" => csv_value(&cell.value),
         "b" => serde_json::Value::Bool(matches!(cell.value.trim(), "1" | "true" | "TRUE")),
         _ => {
             let Some(number) = cell.value.trim().parse::<f64>().ok() else {
@@ -1790,7 +2377,7 @@ fn xlsx_preview_cell_value(
                 let value = ExcelDateTime::new(number, date_type, date_1904);
                 return serde_json::Value::String(xlsx_datetime_label(&value, Some(kind)));
             }
-            serde_json::Number::from_f64(number).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+            xlsx_number_value(number)
         }
     }
 }
@@ -1833,6 +2420,7 @@ fn parse_xlsx_preview_file_with_options(
     let styles_xml = read_xlsx_zip_text(&mut zip, "xl/styles.xml").unwrap_or_default();
     let styles = parse_xlsx_styles(&styles_xml);
     let date_1904 = xlsx_workbook_uses_1904_date_system(&workbook_xml);
+    let empty_string_as_null = options.empty_string_as_null.unwrap_or(true);
     let row_range = effective_import_row_range(options)?;
     let preview_limit = preview_limit.max(1);
     let preview_last_row = row_range.data_start_row.saturating_add(preview_limit.saturating_sub(1));
@@ -1906,10 +2494,18 @@ fn parse_xlsx_preview_file_with_options(
                     };
                 }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => {
+                    current_cell.has_value = true;
                     in_value = true;
                 }
+                Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => {
+                    current_cell.has_value = true;
+                }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                    current_cell.has_inline_value = true;
                     in_inline_text = inline_phonetic_depth == 0;
+                }
+                Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                    current_cell.has_inline_value = true;
                 }
                 Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
                     inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
@@ -1989,16 +2585,14 @@ fn parse_xlsx_preview_file_with_options(
     let column_count = end_column.saturating_sub(start_column).saturating_add(1);
     let mut columns = if let Some(title_row) = row_range.title_row {
         let absolute_title_row = start_row.saturating_add(title_row.saturating_sub(1));
-        (0..column_count)
-            .map(|index| {
-                let column = start_column + index;
-                let value = raw_cells
-                    .get(&(absolute_title_row, column))
-                    .map(|cell| xlsx_preview_cell_value(cell, &shared_strings, &styles, date_1904))
-                    .unwrap_or(serde_json::Value::Null);
-                normalize_header(&xlsx_preview_cell_label(&value), index)
-            })
-            .collect::<Vec<_>>()
+        unique_import_headers((0..column_count).map(|index| {
+            let column = start_column + index;
+            let value = raw_cells
+                .get(&(absolute_title_row, column))
+                .map(|cell| xlsx_preview_cell_value(cell, &shared_strings, &styles, date_1904, empty_string_as_null))
+                .unwrap_or(serde_json::Value::Null);
+            normalize_header(&xlsx_preview_cell_label(&value), index)
+        }))
     } else {
         Vec::new()
     };
@@ -2021,7 +2615,9 @@ fn parse_xlsx_preview_file_with_options(
                 .map(|index| {
                     raw_cells
                         .get(&(absolute_row, start_column + index))
-                        .map(|cell| xlsx_preview_cell_value(cell, &shared_strings, &styles, date_1904))
+                        .map(|cell| {
+                            xlsx_preview_cell_value(cell, &shared_strings, &styles, date_1904, empty_string_as_null)
+                        })
                         .unwrap_or(serde_json::Value::Null)
                 })
                 .collect::<Vec<_>>()
@@ -2070,11 +2666,9 @@ where
     for (index, source_row) in range.rows().enumerate() {
         let row_number = index + 1;
         if row_range.title_row == Some(row_number) {
-            return source_row
-                .iter()
-                .enumerate()
-                .map(|(index, cell)| normalize_header(&cell_label(cell, None), index))
-                .collect();
+            return unique_import_headers(
+                source_row.iter().enumerate().map(|(index, cell)| normalize_header(&cell_label(cell, None), index)),
+            );
         }
         let row_is_within_range = match row_range.last_data_row {
             Some(last) => row_number <= last,
@@ -2187,6 +2781,7 @@ fn xlsx_stream_cell_value(
     styles: &[XlsxCellStyle],
     date_1904: bool,
     format_as_text: bool,
+    empty_string_as_null: bool,
 ) -> Result<serde_json::Value, String> {
     if format_as_text && cell.cell_type.as_deref().unwrap_or_default().is_empty() {
         if let Ok(number) = cell.value.trim().parse::<f64>() {
@@ -2197,12 +2792,14 @@ fn xlsx_stream_cell_value(
         }
     }
     if cell.cell_type.as_deref() != Some("s") {
-        return Ok(xlsx_preview_cell_value(cell, &HashMap::new(), styles, date_1904));
+        return Ok(xlsx_preview_cell_value(cell, &HashMap::new(), styles, date_1904, empty_string_as_null));
     }
     let Some(index) = cell.value.parse::<usize>().ok() else {
         return Ok(serde_json::Value::Null);
     };
-    Ok(shared_strings.get(index)?.map_or(serde_json::Value::Null, |value| csv_value(&value)))
+    Ok(shared_strings
+        .get(index)?
+        .map_or(serde_json::Value::Null, |value| xlsx_string_value(&value, empty_string_as_null)))
 }
 
 fn xlsx_cell_ref_text_value(cell: &DataRef<'_>, style: Option<&XlsxCellStyle>) -> Option<String> {
@@ -2352,11 +2949,12 @@ impl XlsxStreamRowsState {
             if self.columns.is_empty() {
                 let column_count = self.declared_column_count.unwrap_or(values.len()).max(values.len());
                 values.resize(column_count, serde_json::Value::Null);
-                self.columns = values
-                    .iter()
-                    .enumerate()
-                    .map(|(index, value)| normalize_header(&xlsx_preview_cell_label(value), index))
-                    .collect();
+                self.columns = unique_import_headers(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| normalize_header(&xlsx_preview_cell_label(value), index)),
+                );
             }
             return Ok(());
         }
@@ -2417,6 +3015,7 @@ impl XlsxStreamRowsState {
     }
 }
 
+#[cfg(test)]
 fn stream_xlsx_rows_to_channel(
     path: &str,
     options: &TableImportParseOptions,
@@ -2426,9 +3025,33 @@ fn stream_xlsx_rows_to_channel(
     scan_full_worksheet: bool,
     sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
 ) -> Result<(), String> {
+    stream_xlsx_rows_to_channel_with_control(
+        path,
+        options,
+        batch_size,
+        expected_columns,
+        text_source_columns,
+        scan_full_worksheet,
+        sender,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_xlsx_rows_to_channel_with_control(
+    path: &str,
+    options: &TableImportParseOptions,
+    batch_size: usize,
+    expected_columns: Option<Vec<String>>,
+    text_source_columns: HashSet<String>,
+    scan_full_worksheet: bool,
+    sender: tokio::sync::mpsc::Sender<Result<XlsxStreamMessage, String>>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), String> {
     // This producer runs on a blocking thread and communicates in bounded batches. The small
     // channel capacity applies backpressure when database writes are slower than XML parsing.
     let total_bytes = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or_default();
+    let empty_string_as_null = options.empty_string_as_null.unwrap_or(true);
     let mut zip = zip::ZipArchive::new(File::open(path).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     let workbook_xml = read_xlsx_zip_text(&mut zip, "xl/workbook.xml")?;
@@ -2450,7 +3073,35 @@ fn stream_xlsx_rows_to_channel(
     let date_1904 = xlsx_workbook_uses_1904_date_system(&workbook_xml);
     let sheet_path = xlsx_sheet_path_for_name(&workbook_xml, &rels_xml, &sheet_name)
         .ok_or_else(|| format!("Workbook sheet not found: {sheet_name}"))?;
-    let mut shared_strings = open_xlsx_shared_strings(&mut zip, MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES)?;
+    let shared_strings_bytes = match zip.by_name("xl/sharedStrings.xml") {
+        Ok(file) => file.size(),
+        Err(zip::result::ZipError::FileNotFound) => 0,
+        Err(error) => return Err(error.to_string()),
+    };
+    let shared_progress_end = if shared_strings_bytes > 0 { total_bytes / 2 } else { 0 };
+    let progress_sender = sender.clone();
+    let mut last_shared_progress = Instant::now() - IMPORT_PROGRESS_INTERVAL;
+    let mut on_shared_progress = |bytes_read: u64| {
+        let progress = bytes_read
+            .saturating_mul(shared_progress_end)
+            .checked_div(shared_strings_bytes.max(1))
+            .unwrap_or_default()
+            .min(shared_progress_end);
+        if last_shared_progress.elapsed() >= IMPORT_PROGRESS_INTERVAL || bytes_read >= shared_strings_bytes {
+            progress_sender
+                .blocking_send(Ok(XlsxStreamMessage::Progress(progress)))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Excel import consumer closed"))?;
+            last_shared_progress = Instant::now();
+        }
+        Ok(())
+    };
+    let is_cancelled = || cancelled.load(Ordering::Acquire);
+    let mut shared_strings = open_xlsx_shared_strings_with_control(
+        &mut zip,
+        MAX_IN_MEMORY_XLSX_SHARED_STRINGS_BYTES,
+        &is_cancelled,
+        &mut on_shared_progress,
+    )?;
     let row_range = effective_import_row_range(options)?;
     let sheet = zip.by_name(&sheet_path).map_err(|error| error.to_string())?;
     let uncompressed_sheet_bytes = sheet.size().max(1);
@@ -2468,12 +3119,17 @@ fn stream_xlsx_rows_to_channel(
     loop {
         // Convert the uncompressed worksheet offset into an approximate archive-byte offset so
         // progress remains monotonic without scanning the ZIP twice.
-        let progress = reader
-            .buffer_position()
-            .saturating_mul(total_bytes)
-            .checked_div(uncompressed_sheet_bytes)
-            .unwrap_or_default()
-            .min(total_bytes);
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Import cancelled".to_string());
+        }
+        let progress = shared_progress_end.saturating_add(
+            reader
+                .buffer_position()
+                .saturating_mul(total_bytes.saturating_sub(shared_progress_end))
+                .checked_div(uncompressed_sheet_bytes)
+                .unwrap_or_default()
+                .min(total_bytes.saturating_sub(shared_progress_end)),
+        );
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(element)) | Ok(Event::Empty(element))
                 if xml_local_name_eq(element.name().as_ref(), b"dimension") =>
@@ -2513,9 +3169,19 @@ fn stream_xlsx_rows_to_channel(
                     ..XlsxPreviewRawCell::default()
                 };
             }
-            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => in_value = true,
+            Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => {
+                current_cell.has_value = true;
+                in_value = true;
+            }
+            Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"v") => {
+                current_cell.has_value = true;
+            }
             Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                current_cell.has_inline_value = true;
                 in_inline_text = inline_phonetic_depth == 0;
+            }
+            Ok(Event::Empty(element)) if xml_local_name_eq(element.name().as_ref(), b"t") => {
+                current_cell.has_inline_value = true;
             }
             Ok(Event::Start(element)) if xml_local_name_eq(element.name().as_ref(), b"rPh") => {
                 inline_phonetic_depth = inline_phonetic_depth.saturating_add(1);
@@ -2534,8 +3200,14 @@ fn stream_xlsx_rows_to_channel(
             Ok(Event::End(element)) if xml_local_name_eq(element.name().as_ref(), b"c") => {
                 if let Some((row, column)) = current_position.take() {
                     let format_as_text = rows.is_text_source_column(row, column, &text_source_columns);
-                    let value =
-                        xlsx_stream_cell_value(&current_cell, &mut shared_strings, &styles, date_1904, format_as_text)?;
+                    let value = xlsx_stream_cell_value(
+                        &current_cell,
+                        &mut shared_strings,
+                        &styles,
+                        date_1904,
+                        format_as_text,
+                        empty_string_as_null,
+                    )?;
                     rows.push_cell(row, column, value, progress)?;
                     current_cell = XlsxPreviewRawCell::default();
                 }
@@ -2551,17 +3223,53 @@ fn stream_xlsx_rows_to_channel(
     rows.finish(total_bytes)
 }
 
+async fn receive_xlsx_stream_message(
+    receiver: &mut tokio::sync::mpsc::Receiver<Result<XlsxStreamMessage, String>>,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    producer_cancelled: &AtomicBool,
+) -> Result<Option<Result<XlsxStreamMessage, String>>, ()> {
+    loop {
+        if is_cancelled(import_id).await {
+            producer_cancelled.store(true, Ordering::Release);
+            return Err(());
+        }
+        if let Ok(message) = tokio::time::timeout(XLSX_CANCEL_POLL_INTERVAL, receiver.recv()).await {
+            return Ok(message);
+        }
+    }
+}
+
+fn xlsx_import_pass_progress(bytes_read: u64, total_bytes: u64, second_pass: bool) -> u64 {
+    let bytes_read = bytes_read.min(total_bytes);
+    let first_pass_bytes = total_bytes / 2;
+    if !second_pass {
+        return bytes_read.saturating_mul(first_pass_bytes).checked_div(total_bytes.max(1)).unwrap_or_default();
+    }
+    first_pass_bytes.saturating_add(
+        bytes_read
+            .saturating_mul(total_bytes.saturating_sub(first_pass_bytes))
+            .checked_div(total_bytes.max(1))
+            .unwrap_or_default(),
+    )
+}
+
 async fn validate_xlsx_worksheet_for_import(
     path: String,
     options: TableImportParseOptions,
     expected_columns: Option<Vec<String>>,
     text_source_columns: HashSet<String>,
-) -> Result<(), String> {
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    mut on_progress: impl FnMut(u64),
+) -> Result<Vec<String>, String> {
     // Drain bounded row batches without writing. Full-sheet mode keeps parsing through the
     // worksheet EOF even when the selected import range ends earlier.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
+    let producer_cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_producer = producer_cancelled.clone();
     let validation = tokio::task::spawn_blocking(move || {
-        stream_xlsx_rows_to_channel(
+        stream_xlsx_rows_to_channel_with_control(
             &path,
             &options,
             DEFAULT_BATCH_SIZE,
@@ -2569,18 +3277,37 @@ async fn validate_xlsx_worksheet_for_import(
             text_source_columns,
             true,
             sender,
+            cancelled_for_producer,
         )
     });
 
-    while let Some(message) = receiver.recv().await {
-        if let Err(error) = message {
-            drop(receiver);
-            let _ = validation.await;
-            return Err(error);
+    let mut columns = None;
+    loop {
+        let message =
+            match receive_xlsx_stream_message(&mut receiver, import_id, is_cancelled, &producer_cancelled).await {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(()) => {
+                    drop(receiver);
+                    let _ = validation.await;
+                    return Err("Import cancelled".to_string());
+                }
+            };
+        match message {
+            Ok(XlsxStreamMessage::Header(header)) => columns = Some(header),
+            Ok(XlsxStreamMessage::Progress(bytes_read)) => on_progress(bytes_read),
+            Ok(XlsxStreamMessage::Rows(_) | XlsxStreamMessage::Done) => {}
+            Err(error) => {
+                producer_cancelled.store(true, Ordering::Release);
+                drop(receiver);
+                let _ = validation.await;
+                return Err(error);
+            }
         }
     }
 
-    validation.await.map_err(|error| error.to_string())?
+    validation.await.map_err(|error| error.to_string())??;
+    columns.ok_or_else(|| "Excel stream ended before providing a header".to_string())
 }
 
 fn parse_xlsx_range<T, Label, Value, TextValue, IsNumeric>(
@@ -2598,31 +3325,28 @@ fn parse_xlsx_range<T, Label, Value, TextValue, IsNumeric>(
 where
     T: CellType,
     Label: Fn(&T, Option<XlsxTemporalKind>) -> String,
-    Value: Fn(&T, Option<XlsxTemporalKind>) -> serde_json::Value,
+    Value: Fn(&T, Option<XlsxTemporalKind>, bool) -> serde_json::Value,
     TextValue: Fn(&T, Option<&XlsxCellStyle>) -> Option<String>,
     IsNumeric: Fn(&T) -> bool,
 {
     let (range_start_row, range_start_column) =
         range.start().map(|(row, column)| (row as usize, column as usize)).unwrap_or_default();
     let row_range = effective_import_row_range(options)?;
+    let empty_string_as_null = options.empty_string_as_null.unwrap_or(true);
     let mut columns = Vec::new();
     let mut rows = Vec::new();
     let mut total_rows = 0;
     for (index, source_row) in range.rows().enumerate() {
         let row_number = index + 1;
         if row_range.title_row == Some(row_number) {
-            columns = source_row
-                .iter()
-                .enumerate()
-                .map(|(index, cell)| {
-                    // Calamine rows are relative to the used range, while XLSX style coordinates are worksheet-absolute.
-                    let cell_position = (range_start_row + row_number, range_start_column + index + 1);
-                    normalize_header(
-                        &cell_label(cell, cell_styles.get(&cell_position).and_then(|style| style.temporal_kind)),
-                        index,
-                    )
-                })
-                .collect();
+            columns = unique_import_headers(source_row.iter().enumerate().map(|(index, cell)| {
+                // Calamine rows are relative to the used range, while XLSX style coordinates are worksheet-absolute.
+                let cell_position = (range_start_row + row_number, range_start_column + index + 1);
+                normalize_header(
+                    &cell_label(cell, cell_styles.get(&cell_position).and_then(|style| style.temporal_kind)),
+                    index,
+                )
+            }));
             continue;
         }
         if row_number < row_range.data_start_row {
@@ -2655,7 +3379,7 @@ where
                             return Ok(serde_json::Value::String(text));
                         }
                     }
-                    Ok(cell_value(cell, style.and_then(|style| style.temporal_kind)))
+                    Ok(cell_value(cell, style.and_then(|style| style.temporal_kind), empty_string_as_null))
                 })
                 .transpose()?
                 .unwrap_or(serde_json::Value::Null);
@@ -2729,6 +3453,16 @@ async fn parse_import_file_with_options_and_text_columns(
         TableImportSourceFormat::Json => {
             let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
             parse_json_bytes_with_options(&bytes, options, preview_limit)
+        }
+        TableImportSourceFormat::Sql => {
+            let path = path.to_string();
+            let options = options.clone();
+            tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                parse_sql_bytes_with_options(&bytes, &options, preview_limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         TableImportSourceFormat::Excel => {
             let path = path.to_string();
@@ -2895,7 +3629,7 @@ fn build_import_insert_batch_from_rows_with_format(
         );
     }
     let plan = compile_import_plan(columns, mappings, target_column_types)?;
-    build_import_insert_batch_with_plan(rows, &plan, table, schema, db_type, date_time_format)
+    build_import_insert_batch_with_plan(rows, &plan, table, schema, db_type, false, date_time_format)
 }
 
 fn build_import_insert_batch_with_plan(
@@ -2904,13 +3638,14 @@ fn build_import_insert_batch_with_plan(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
 ) -> Result<Option<ImportSqlBatch>, String> {
     if rows.is_empty() {
         return Ok(None);
     }
-    let mapped_rows = map_import_rows_with_plan(rows, plan, db_type, date_time_format);
-    let sql = generate_insert_typed(&plan.target_columns, &plan.column_types, &mapped_rows, table, schema, db_type);
+    let value_rows = import_value_rows_sql(rows, plan, db_type, kingbase_oracle_mode, date_time_format);
+    let sql = generate_insert_typed_from_value_rows(&plan.target_columns, &value_rows, table, schema, db_type, None);
     Ok((!sql.trim().is_empty()).then_some(ImportSqlBatch { sql, row_count: rows.len() }))
 }
 
@@ -2920,49 +3655,74 @@ fn build_import_insert_batches_with_plan(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
-) -> Vec<ImportSqlBatch> {
+    hard_sql_bytes: Option<usize>,
+) -> Result<Vec<ImportSqlBatch>, String> {
     if rows.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mapped_rows = map_import_rows_with_plan(rows, plan, db_type, date_time_format);
-    generate_insert_typed_sql_batches(
+    let value_rows = import_value_rows_sql(rows, plan, db_type, kingbase_oracle_mode, date_time_format);
+    let batches = generate_insert_typed_sql_batches_from_value_rows(
         &plan.target_columns,
-        &plan.column_types,
-        &mapped_rows,
+        &value_rows,
         table,
         schema,
         db_type,
-        rows.len(),
-    )
-    .into_iter()
-    .map(|(sql, row_count)| ImportSqlBatch { sql, row_count })
-    .collect()
+        None,
+        SqlBatchLimits::for_database(db_type, rows.len()).with_hard_sql_bytes(hard_sql_bytes),
+    )?;
+    Ok(batches.into_iter().map(|(sql, row_count)| ImportSqlBatch { sql, row_count }).collect())
 }
 
-fn map_import_rows_with_plan(
+fn import_value_rows_sql(
     rows: &[Vec<serde_json::Value>],
     plan: &CompiledImportPlan,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
-) -> Vec<Vec<serde_json::Value>> {
-    rows.iter()
-        .map(|row| {
-            plan.mapped_source_indexes
-                .iter()
-                .enumerate()
-                .map(|(target_index, source_index)| {
-                    let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
-                    normalize_import_value(
-                        &value,
-                        plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
-                        db_type,
-                        date_time_format,
-                    )
-                })
-                .collect::<Vec<_>>()
+) -> Vec<String> {
+    let mut value_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut values = String::with_capacity(plan.mapped_source_indexes.len().saturating_mul(16).saturating_add(2));
+        values.push('(');
+        for (target_index, source_index) in plan.mapped_source_indexes.iter().enumerate() {
+            if target_index > 0 {
+                values.push_str(", ");
+            }
+            let source_value = row.get(*source_index).unwrap_or(&serde_json::Value::Null);
+            let data_type = plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref());
+            let normalized =
+                normalize_import_value_cow(source_value, data_type, db_type, kingbase_oracle_mode, date_time_format);
+            values.push_str(&escape_value_typed(normalized.as_ref(), db_type, data_type));
+        }
+        values.push(')');
+        value_rows.push(values);
+    }
+    value_rows
+}
+
+fn map_import_row_with_plan(
+    row: &[serde_json::Value],
+    plan: &CompiledImportPlan,
+    db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
+    date_time_format: Option<&str>,
+) -> Vec<serde_json::Value> {
+    plan.mapped_source_indexes
+        .iter()
+        .enumerate()
+        .map(|(target_index, source_index)| {
+            let value = row.get(*source_index).cloned().unwrap_or(serde_json::Value::Null);
+            normalize_import_value(
+                &value,
+                plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+                db_type,
+                kingbase_oracle_mode,
+                date_time_format,
+            )
         })
-        .collect::<Vec<_>>()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2975,10 +3735,21 @@ fn build_import_execution_batches(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
+    hard_sql_bytes: Option<usize>,
 ) -> Result<Vec<ImportSqlBatch>, String> {
     if let Some(plan) = plan {
-        return Ok(build_import_insert_batches_with_plan(rows, plan, table, schema, db_type, date_time_format));
+        return build_import_insert_batches_with_plan(
+            rows,
+            plan,
+            table,
+            schema,
+            db_type,
+            kingbase_oracle_mode,
+            date_time_format,
+            hard_sql_bytes,
+        );
     }
     if *db_type == DatabaseType::CloudflareD1 {
         return crate::db::cloudflare_d1::build_import_insert_batches(
@@ -2992,7 +3763,16 @@ fn build_import_execution_batches(
         );
     }
     let plan = compile_import_plan(columns, mappings, target_column_types)?;
-    Ok(build_import_insert_batches_with_plan(rows, &plan, table, schema, db_type, date_time_format))
+    build_import_insert_batches_with_plan(
+        rows,
+        &plan,
+        table,
+        schema,
+        db_type,
+        kingbase_oracle_mode,
+        date_time_format,
+        hard_sql_bytes,
+    )
 }
 
 fn effective_import_batch_size(db_type: &DatabaseType, requested: usize) -> usize {
@@ -3002,22 +3782,26 @@ fn effective_import_batch_size(db_type: &DatabaseType, requested: usize) -> usiz
         DatabaseType::Oracle => MAX_ORACLE_IMPORT_BATCH_ROWS,
         DatabaseType::OceanbaseOracle | DatabaseType::Iris => 1,
         DatabaseType::CloudflareD1 => 100,
+        DatabaseType::SqlServer => 1000,
+        DatabaseType::Sqlite => SQLITE_APPEND_COMMIT_ROWS,
         _ => usize::MAX,
     };
     requested.max(1).min(max_rows)
 }
 
-fn normalize_import_temporal_value(
-    value: &serde_json::Value,
+fn normalize_import_temporal_value_cow<'a>(
+    value: &'a serde_json::Value,
     data_type: Option<&str>,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
-) -> serde_json::Value {
-    let oracle_date_time = matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+) -> Cow<'a, serde_json::Value> {
+    let date_type_preserves_time = (matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+        || (*db_type == DatabaseType::Kingbase && kingbase_oracle_mode))
         && data_type.is_some_and(|data_type| data_type.trim().eq_ignore_ascii_case("date"));
-    crate::temporal_format::normalize_temporal_import_value(
+    crate::temporal_format::normalize_temporal_import_value_cow(
         value,
-        if oracle_date_time { Some("datetime") } else { data_type },
+        if date_type_preserves_time { Some("datetime") } else { data_type },
         date_time_format,
     )
 }
@@ -3083,13 +3867,49 @@ fn textual_source_columns_for_import(
         .collect()
 }
 
+fn normalize_import_value_cow<'a>(
+    value: &'a serde_json::Value,
+    data_type: Option<&str>,
+    db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
+    date_time_format: Option<&str>,
+) -> Cow<'a, serde_json::Value> {
+    let normalized =
+        normalize_import_temporal_value_cow(value, data_type, db_type, kingbase_oracle_mode, date_time_format);
+    // Strip validated thousands separators before integer canonicalization so "1,234.00"
+    // still collapses to a plain integer literal for integer targets.
+    let thousands_canonical =
+        normalized.as_str().and_then(|value| normalize_thousands_numeric_literal(value, db_type, data_type));
+    if let Some(integer_text) = thousands_canonical
+        .as_deref()
+        .or_else(|| normalized.as_str())
+        .and_then(|value| normalize_integer_literal(value, db_type, data_type))
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        // Normalize before both INSERT and COPY paths; COPY does not pass through SQL literal escaping.
+        return Cow::Owned(serde_json::Value::Number(integer_text.into()));
+    }
+    if let Some(number) = normalized.as_number() {
+        if let Some(integer_text) = normalize_integer_literal(&number.to_string(), db_type, data_type)
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            return Cow::Owned(serde_json::Value::Number(integer_text.into()));
+        }
+    }
+    if let Some(canonical) = thousands_canonical {
+        return Cow::Owned(serde_json::Value::String(canonical));
+    }
+    normalized
+}
+
 fn normalize_import_value(
     value: &serde_json::Value,
     data_type: Option<&str>,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
 ) -> serde_json::Value {
-    normalize_import_temporal_value(value, data_type, db_type, date_time_format)
+    normalize_import_value_cow(value, data_type, db_type, kingbase_oracle_mode, date_time_format).into_owned()
 }
 
 pub fn build_import_insert_batches(
@@ -3108,6 +3928,7 @@ pub fn build_import_insert_batches(
         table,
         schema,
         db_type,
+        false,
         batch_size,
         None,
     )
@@ -3121,6 +3942,7 @@ fn build_import_insert_batches_with_format(
     table: &str,
     schema: &str,
     db_type: &DatabaseType,
+    kingbase_oracle_mode: bool,
     batch_size: usize,
     date_time_format: Option<&str>,
 ) -> Result<Vec<ImportSqlBatch>, String> {
@@ -3139,13 +3961,22 @@ fn build_import_insert_batches_with_format(
     let batch_size = effective_import_batch_size(db_type, batch_size);
     let mut batches = Vec::new();
     for rows in data.rows.chunks(batch_size) {
-        batches.extend(build_import_insert_batches_with_plan(rows, &plan, table, schema, db_type, date_time_format));
+        batches.extend(build_import_insert_batches_with_plan(
+            rows,
+            &plan,
+            table,
+            schema,
+            db_type,
+            kingbase_oracle_mode,
+            date_time_format,
+            None,
+        )?);
     }
     Ok(batches)
 }
 
 pub fn truncate_sql(table: &str, schema: &str, db_type: &DatabaseType) -> String {
-    let full_table = qualified_table(table, schema, db_type);
+    let full_table = qualified_table(table, schema, db_type, None);
     match db_type {
         DatabaseType::Sqlite | DatabaseType::CloudflareD1 => format!("DELETE FROM {full_table}"),
         _ => format!("TRUNCATE TABLE {full_table}"),
@@ -3258,7 +4089,11 @@ fn text_data_type(db_type: &DatabaseType) -> &'static str {
         DatabaseType::SqlServer => "NVARCHAR(MAX)",
         DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "CLOB",
         DatabaseType::ClickHouse => "String",
-        DatabaseType::Hive | DatabaseType::Trino | DatabaseType::PrestoSql | DatabaseType::Databricks => "STRING",
+        DatabaseType::Hive
+        | DatabaseType::Kyuubi
+        | DatabaseType::Trino
+        | DatabaseType::PrestoSql
+        | DatabaseType::Databricks => "STRING",
         _ => "TEXT",
     }
 }
@@ -3280,8 +4115,10 @@ fn decimal_data_type(db_type: &DatabaseType) -> &'static str {
         | DatabaseType::Redshift
         | DatabaseType::Kingbase
         | DatabaseType::Highgo
+        | DatabaseType::Uxdb
         | DatabaseType::Kwdb
         | DatabaseType::Vastbase => "DOUBLE PRECISION",
+        DatabaseType::SqlServer => "FLOAT",
         DatabaseType::Sqlite | DatabaseType::Rqlite | DatabaseType::Turso | DatabaseType::CloudflareD1 => "REAL",
         DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "BINARY_DOUBLE",
         DatabaseType::ClickHouse => "Float64",
@@ -3335,6 +4172,7 @@ fn json_data_type(db_type: &DatabaseType) -> &'static str {
         | DatabaseType::OpenGauss
         | DatabaseType::Kingbase
         | DatabaseType::Highgo
+        | DatabaseType::Uxdb
         | DatabaseType::Kwdb
         | DatabaseType::Vastbase => "JSONB",
         DatabaseType::Mysql | DatabaseType::Databend => "JSON",
@@ -3355,7 +4193,10 @@ fn import_data_type(inferred_type: ImportInferredType, db_type: &DatabaseType) -
     .to_string()
 }
 
-fn normalize_import_target_data_type(mapping: &TableImportColumnMapping) -> Result<Option<String>, String> {
+fn normalize_import_target_data_type(
+    mapping: &TableImportColumnMapping,
+    db_type: &DatabaseType,
+) -> Result<Option<String>, String> {
     let Some(raw_data_type) = mapping.target_data_type.as_deref() else {
         return Ok(None);
     };
@@ -3364,7 +4205,29 @@ fn normalize_import_target_data_type(mapping: &TableImportColumnMapping) -> Resu
         return Err(format!("Target data type cannot be empty: {}", mapping.target_column));
     }
     validate_import_target_data_type(data_type)?;
-    Ok(Some(data_type.to_string()))
+    Ok(Some(with_default_length_if_required(data_type, db_type)))
+}
+
+/// MySQL and its wire-compatible engines reject a bare `VARCHAR`/`CHAR` column
+/// (`ERROR 1064: You have an error in your SQL syntax`) -- unlike PostgreSQL,
+/// where an unparameterized `VARCHAR` is valid and means "unlimited". The
+/// import type picker offers these bare names as options (shared with the
+/// table structure editor, which pairs them with a separate length field the
+/// import dialog doesn't have), so a user selecting "VARCHAR" here sends a
+/// type MySQL cannot create a table with. See #7302.
+fn with_default_length_if_required(data_type: &str, db_type: &DatabaseType) -> String {
+    let requires_length = matches!(
+        db_type,
+        DatabaseType::Mysql
+            | DatabaseType::Doris
+            | DatabaseType::StarRocks
+            | DatabaseType::Goldendb
+            | DatabaseType::Sundb
+    );
+    if requires_length && matches!(data_type.to_ascii_uppercase().as_str(), "VARCHAR" | "CHAR") {
+        return format!("{data_type}(255)");
+    }
+    data_type.to_string()
 }
 
 fn validate_import_target_data_type(data_type: &str) -> Result<(), String> {
@@ -3414,7 +4277,7 @@ pub fn build_import_create_table_plan(
     let mapped = mapping_indexes_with_mappings(&data.columns, mappings)?;
     let mut columns = Vec::with_capacity(mapped.len());
     for (source_index, mapping) in mapped {
-        let data_type = match normalize_import_target_data_type(mapping)? {
+        let data_type = match normalize_import_target_data_type(mapping, db_type)? {
             Some(data_type) => data_type,
             None => {
                 let inferred_type = infer_column_type(&data.rows, source_index);
@@ -3427,7 +4290,7 @@ pub fn build_import_create_table_plan(
         return Err("No columns mapped for import".to_string());
     }
 
-    let full_table = qualified_table(table.trim(), schema, db_type);
+    let full_table = qualified_table(table.trim(), schema, db_type, None);
     let column_sql = columns
         .iter()
         .map(|column| format!("{} {}", quote_identifier(&column.name, db_type), column.data_type))
@@ -3544,6 +4407,89 @@ fn postgres_copy_compatible_column_type(data_type: Option<&str>) -> bool {
     !base.starts_with("bytea") && !base.starts_with("bit") && !base.starts_with("varbit")
 }
 
+#[derive(Debug)]
+struct PostgresCopyBatch {
+    sql: String,
+    data: Vec<u8>,
+    row_count: usize,
+}
+
+#[derive(Debug)]
+struct PostgresCopyAccumulator {
+    sql: String,
+    data: Vec<u8>,
+    row_count: usize,
+    target_bytes: usize,
+    max_rows: usize,
+}
+
+impl PostgresCopyAccumulator {
+    fn new(sql: String) -> Self {
+        Self::with_limits(sql, POSTGRES_COPY_TARGET_BYTES, POSTGRES_COPY_MAX_ROWS)
+    }
+
+    fn with_limits(sql: String, target_bytes: usize, max_rows: usize) -> Self {
+        Self {
+            sql,
+            data: Vec::with_capacity(target_bytes.min(1024 * 1024)),
+            row_count: 0,
+            target_bytes: target_bytes.max(1),
+            max_rows: max_rows.max(1),
+        }
+    }
+
+    fn should_flush_before(&self, next_row_bytes: usize) -> bool {
+        !self.is_empty()
+            && (self.data.len().saturating_add(next_row_bytes) > self.target_bytes
+                || self.row_count.saturating_add(1) > self.max_rows)
+    }
+
+    fn append_row(&mut self, row: &[u8]) {
+        self.data.extend_from_slice(row);
+        self.row_count += 1;
+    }
+
+    fn should_flush_after_append(&self) -> bool {
+        !self.is_empty() && (self.data.len() >= self.target_bytes || self.row_count >= self.max_rows)
+    }
+
+    fn take_batch(&mut self) -> Option<PostgresCopyBatch> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(PostgresCopyBatch {
+            sql: self.sql.clone(),
+            data: std::mem::take(&mut self.data),
+            row_count: std::mem::take(&mut self.row_count),
+        })
+    }
+
+    fn recycle_batch_buffer(&mut self, mut data: Vec<u8>) {
+        data.clear();
+        let max_reusable_capacity = self.target_bytes.saturating_mul(2);
+        self.data = if data.capacity() <= max_reusable_capacity {
+            data
+        } else {
+            Vec::with_capacity(self.target_bytes.min(1024 * 1024))
+        };
+    }
+
+    fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+
+    #[cfg(test)]
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    #[cfg(test)]
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[cfg(test)]
 fn build_postgres_copy_text_batch(
     rows: &[Vec<serde_json::Value>],
     plan: &CompiledImportPlan,
@@ -3551,25 +4497,39 @@ fn build_postgres_copy_text_batch(
     schema: &str,
     date_time_format: Option<&str>,
 ) -> Result<(String, Vec<u8>), String> {
-    let mapped_rows = map_import_rows_with_plan(rows, plan, &DatabaseType::Postgres, date_time_format);
-    let mut data = String::new();
-    for row in mapped_rows {
-        for (index, value) in row.iter().enumerate() {
-            if index > 0 {
-                data.push('\t');
-            }
-            data.push_str(&postgres_copy_text_value(value)?);
-        }
-        data.push('\n');
+    let mut data = Vec::new();
+    for row in rows {
+        data.extend_from_slice(&build_postgres_copy_text_row(row, plan, date_time_format)?);
     }
-    let table = qualified_table(table, schema, &DatabaseType::Postgres);
+    Ok((postgres_copy_sql(plan, table, schema), data))
+}
+
+fn build_postgres_copy_text_row(
+    row: &[serde_json::Value],
+    plan: &CompiledImportPlan,
+    date_time_format: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let mapped_row = map_import_row_with_plan(row, plan, &DatabaseType::Postgres, false, date_time_format);
+    let mut data = Vec::new();
+    for (index, value) in mapped_row.iter().enumerate() {
+        if index > 0 {
+            data.push(b'\t');
+        }
+        data.extend_from_slice(postgres_copy_text_value(value)?.as_bytes());
+    }
+    data.push(b'\n');
+    Ok(data)
+}
+
+fn postgres_copy_sql(plan: &CompiledImportPlan, table: &str, schema: &str) -> String {
+    let table = qualified_table(table, schema, &DatabaseType::Postgres, None);
     let columns = plan
         .target_columns
         .iter()
         .map(|column| quote_identifier(column, &DatabaseType::Postgres))
         .collect::<Vec<_>>()
         .join(", ");
-    Ok((format!("COPY {table} ({columns}) FROM STDIN WITH (FORMAT text)"), data.into_bytes()))
+    format!("COPY {table} ({columns}) FROM STDIN WITH (FORMAT text)")
 }
 
 async fn execute_postgres_copy_batch(
@@ -3592,6 +4552,96 @@ async fn execute_postgres_copy_batch(
     *db_write_ms += started_at.elapsed().as_millis();
     *statement_count += 1;
     result
+}
+
+fn postgres_copy_accumulator_for_plan(
+    allowed: bool,
+    plan: Option<&CompiledImportPlan>,
+    table: &str,
+    schema: &str,
+) -> Option<PostgresCopyAccumulator> {
+    let plan = plan.filter(|plan| {
+        allowed && plan.column_types.iter().all(|data_type| postgres_copy_compatible_column_type(data_type.as_deref()))
+    })?;
+    Some(PostgresCopyAccumulator::new(postgres_copy_sql(plan, table, schema)))
+}
+
+async fn flush_postgres_copy_accumulator(
+    state: &AppState,
+    pool_key: &str,
+    accumulator: &mut PostgresCopyAccumulator,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<usize, String> {
+    let Some(batch) = accumulator.take_batch() else {
+        return Ok(0);
+    };
+    match execute_postgres_copy_batch(state, pool_key, &batch.sql, &batch.data, db_write_ms, statement_count).await {
+        Ok(()) => {
+            let row_count = batch.row_count;
+            accumulator.recycle_batch_buffer(batch.data);
+            Ok(row_count)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn flush_pending_postgres_copy(
+    state: &AppState,
+    pool_key: &str,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    accumulator: &mut Option<PostgresCopyAccumulator>,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<usize, ImportRowsBatchError> {
+    match accumulator.as_mut() {
+        Some(accumulator) if !accumulator.is_empty() => {
+            ensure_import_write_allowed(import_id, is_cancelled, 0).await?;
+            flush_postgres_copy_accumulator(state, pool_key, accumulator, db_write_ms, statement_count)
+                .await
+                .map_err(ImportRowsBatchError::before_write)
+        }
+        Some(_) | None => Ok(0),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_postgres_copy_rows(
+    state: &AppState,
+    pool_key: &str,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    rows: &[Vec<serde_json::Value>],
+    plan: &CompiledImportPlan,
+    date_time_format: Option<&str>,
+    accumulator: &mut PostgresCopyAccumulator,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<usize, ImportRowsBatchError> {
+    let mut rows_imported = 0usize;
+    for row in rows {
+        let encoded = build_postgres_copy_text_row(row, plan, date_time_format)
+            .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?;
+        if accumulator.should_flush_before(encoded.len()) {
+            ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
+            rows_imported = rows_imported.saturating_add(
+                flush_postgres_copy_accumulator(state, pool_key, accumulator, db_write_ms, statement_count)
+                    .await
+                    .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?,
+            );
+        }
+        accumulator.append_row(&encoded);
+        if accumulator.should_flush_after_append() {
+            ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
+            rows_imported = rows_imported.saturating_add(
+                flush_postgres_copy_accumulator(state, pool_key, accumulator, db_write_ms, statement_count)
+                    .await
+                    .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?,
+            );
+        }
+    }
+    Ok(rows_imported)
 }
 
 fn postgres_copy_eligibility_sql(table: &str, schema: &str) -> String {
@@ -3632,11 +4682,32 @@ async fn postgres_copy_fast_path_eligible(state: &AppState, pool_key: &str, tabl
 struct ImportRowsBatchError {
     rows_imported: usize,
     message: String,
+    cancelled: bool,
 }
 
 impl ImportRowsBatchError {
     fn before_write(message: impl Into<String>) -> Self {
-        Self { rows_imported: 0, message: message.into() }
+        Self::with_rows_imported(0, message)
+    }
+
+    fn with_rows_imported(rows_imported: usize, message: impl Into<String>) -> Self {
+        Self { rows_imported, message: message.into(), cancelled: false }
+    }
+
+    fn cancelled(rows_imported: usize) -> Self {
+        Self { rows_imported, message: "Import cancelled".to_string(), cancelled: true }
+    }
+}
+
+async fn ensure_import_write_allowed(
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    rows_imported: usize,
+) -> Result<(), ImportRowsBatchError> {
+    if is_cancelled(import_id).await {
+        Err(ImportRowsBatchError::cancelled(rows_imported))
+    } else {
+        Ok(())
     }
 }
 
@@ -3645,6 +4716,61 @@ struct ImportBatchExecutionPolicy {
     transactional: bool,
     include_truncate: bool,
     allow_postgres_copy: bool,
+}
+
+#[derive(Debug)]
+struct SqliteAppendTransaction {
+    statements: Vec<String>,
+    rows: usize,
+    sql_bytes: usize,
+    max_rows: usize,
+    max_sql_bytes: usize,
+}
+
+impl SqliteAppendTransaction {
+    fn new() -> Self {
+        Self::with_limits(SQLITE_APPEND_COMMIT_ROWS, SQLITE_APPEND_COMMIT_SQL_BYTES)
+    }
+
+    fn with_limits(max_rows: usize, max_sql_bytes: usize) -> Self {
+        Self {
+            statements: Vec::new(),
+            rows: 0,
+            sql_bytes: 0,
+            max_rows: max_rows.max(1),
+            max_sql_bytes: max_sql_bytes.max(1),
+        }
+    }
+
+    fn should_flush_before(&self, batch: &ImportSqlBatch) -> bool {
+        !self.statements.is_empty()
+            && (self.rows.saturating_add(batch.row_count) > self.max_rows
+                || self.sql_bytes.saturating_add(batch.sql.len()) > self.max_sql_bytes)
+    }
+
+    fn push(&mut self, batch: ImportSqlBatch) {
+        self.rows = self.rows.saturating_add(batch.row_count);
+        self.sql_bytes = self.sql_bytes.saturating_add(batch.sql.len());
+        self.statements.push(batch.sql);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.rows >= self.max_rows || self.sql_bytes >= self.max_sql_bytes
+    }
+
+    fn take(&mut self) -> (Vec<String>, usize) {
+        let statements = std::mem::take(&mut self.statements);
+        let rows = std::mem::take(&mut self.rows);
+        self.sql_bytes = 0;
+        (statements, rows)
+    }
+}
+
+fn sqlite_append_transaction_for_import(
+    mode: &TableImportMode,
+    db_type: &DatabaseType,
+) -> Option<SqliteAppendTransaction> {
+    (matches!(mode, TableImportMode::Append) && *db_type == DatabaseType::Sqlite).then(SqliteAppendTransaction::new)
 }
 
 fn supports_transactional_import_truncate(db_type: &DatabaseType) -> bool {
@@ -3697,6 +4823,7 @@ async fn execute_import_transaction(
         database,
         statements,
         (!schema.trim().is_empty()).then_some(schema),
+        None,
     )
     .await;
     *db_write_ms += started_at.elapsed().as_millis();
@@ -3705,13 +4832,103 @@ async fn execute_import_transaction(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn flush_sqlite_append_transaction(
+    state: &AppState,
+    pool_key: &str,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    transaction: &mut SqliteAppendTransaction,
+    rows_imported: usize,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<usize, ImportRowsBatchError> {
+    if transaction.statements.is_empty() {
+        return Ok(rows_imported);
+    }
+    ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
+    let (statements, rows) = transaction.take();
+    execute_import_transaction(
+        state,
+        pool_key,
+        connection_id,
+        database,
+        schema,
+        &statements,
+        db_write_ms,
+        statement_count,
+    )
+    .await
+    .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?;
+    Ok(rows_imported.saturating_add(rows))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_sqlite_append_transaction<F>(
+    state: &AppState,
+    pool_key: &str,
+    request: &TableImportRequest,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    transaction: &mut Option<SqliteAppendTransaction>,
+    rows_imported: usize,
+    total_rows: usize,
+    started_at: Instant,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+    progress_callback: &mut F,
+) -> Result<usize, String>
+where
+    F: FnMut(TableImportProgress),
+{
+    let Some(transaction) = transaction.as_mut() else {
+        return Ok(rows_imported);
+    };
+    match flush_sqlite_append_transaction(
+        state,
+        pool_key,
+        &request.import_id,
+        is_cancelled,
+        &request.connection_id,
+        &request.database,
+        &request.schema,
+        transaction,
+        rows_imported,
+        db_write_ms,
+        statement_count,
+    )
+    .await
+    {
+        Ok(rows) => Ok(rows),
+        Err(error) if error.cancelled => {
+            progress_callback(import_progress(
+                &request.import_id,
+                TableImportStatus::Cancelled,
+                rows_imported,
+                total_rows,
+                started_at,
+                None,
+            ));
+            Err(error.message)
+        }
+        Err(error) => {
+            Err(emit_import_error(progress_callback, request, rows_imported, total_rows, started_at, error.message))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_import_rows_batch(
     state: &AppState,
     pool_key: &str,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
     connection_id: &str,
     database: &str,
     rows: &[Vec<serde_json::Value>],
     plan: Option<&CompiledImportPlan>,
+    sqlserver_bulk_plan: Option<&SqlServerBulkImportPlan>,
     columns: &[String],
     mappings: &[TableImportColumnMapping],
     target_column_types: &[(String, String)],
@@ -3720,33 +4937,66 @@ async fn execute_import_rows_batch(
     db_type: &DatabaseType,
     mode: &TableImportMode,
     pending_truncate: bool,
-    allow_postgres_copy: bool,
+    postgres_copy_accumulator: &mut Option<PostgresCopyAccumulator>,
+    sqlite_append_transaction: &mut Option<SqliteAppendTransaction>,
+    kingbase_oracle_mode: bool,
     date_time_format: Option<&str>,
+    hard_sql_bytes: Option<usize>,
     db_write_ms: &mut u128,
     statement_count: &mut usize,
 ) -> Result<usize, ImportRowsBatchError> {
     let execution_policy = import_batch_execution_policy(mode, pending_truncate, db_type);
+    if let Some((import_plan, bulk_plan)) = sqlserver_bulk_plans_for_rows(db_type, plan, sqlserver_bulk_plan, rows) {
+        return execute_sqlserver_bulk_rows_batch(
+            state,
+            pool_key,
+            import_id,
+            is_cancelled,
+            rows,
+            import_plan,
+            bulk_plan,
+            execution_policy.include_truncate,
+            date_time_format,
+            db_write_ms,
+            statement_count,
+        )
+        .await;
+    }
     // COPY is used only for plain scalar PostgreSQL rows and ordinary tables. Any unsupported
     // value or table feature falls through to the portable INSERT generator below.
-    if allow_postgres_copy
-        && execution_policy.allow_postgres_copy
+    if execution_policy.allow_postgres_copy
         && *db_type == DatabaseType::Postgres
         && !rows
             .iter()
             .flatten()
             .any(|value| matches!(value, serde_json::Value::Array(_) | serde_json::Value::Object(_)))
     {
-        if let Some(plan) = plan {
-            if plan.column_types.iter().all(|data_type| postgres_copy_compatible_column_type(data_type.as_deref())) {
-                let (copy_sql, copy_data) = build_postgres_copy_text_batch(rows, plan, table, schema, date_time_format)
-                    .map_err(ImportRowsBatchError::before_write)?;
-                execute_postgres_copy_batch(state, pool_key, &copy_sql, &copy_data, db_write_ms, statement_count)
-                    .await
-                    .map_err(ImportRowsBatchError::before_write)?;
-                return Ok(rows.len());
-            }
+        if let (Some(plan), Some(accumulator)) = (plan, postgres_copy_accumulator.as_mut()) {
+            return append_postgres_copy_rows(
+                state,
+                pool_key,
+                import_id,
+                is_cancelled,
+                rows,
+                plan,
+                date_time_format,
+                accumulator,
+                db_write_ms,
+                statement_count,
+            )
+            .await;
         }
     }
+    let mut rows_imported = flush_pending_postgres_copy(
+        state,
+        pool_key,
+        import_id,
+        is_cancelled,
+        postgres_copy_accumulator,
+        db_write_ms,
+        statement_count,
+    )
+    .await?;
     let batches = build_import_execution_batches(
         rows,
         plan,
@@ -3756,10 +5006,52 @@ async fn execute_import_rows_batch(
         table,
         schema,
         db_type,
+        kingbase_oracle_mode,
         date_time_format,
+        hard_sql_bytes,
     )
-    .map_err(ImportRowsBatchError::before_write)?;
+    .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?;
+    if let Some(transaction) = sqlite_append_transaction.as_mut() {
+        for batch in batches {
+            ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
+            if transaction.should_flush_before(&batch) {
+                rows_imported = flush_sqlite_append_transaction(
+                    state,
+                    pool_key,
+                    import_id,
+                    is_cancelled,
+                    connection_id,
+                    database,
+                    schema,
+                    transaction,
+                    rows_imported,
+                    db_write_ms,
+                    statement_count,
+                )
+                .await?;
+            }
+            transaction.push(batch);
+            if transaction.is_ready() {
+                rows_imported = flush_sqlite_append_transaction(
+                    state,
+                    pool_key,
+                    import_id,
+                    is_cancelled,
+                    connection_id,
+                    database,
+                    schema,
+                    transaction,
+                    rows_imported,
+                    db_write_ms,
+                    statement_count,
+                )
+                .await?;
+            }
+        }
+        return Ok(rows_imported);
+    }
     if execution_policy.transactional {
+        ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
         let mut statements = Vec::with_capacity(batches.len() + usize::from(execution_policy.include_truncate));
         if execution_policy.include_truncate {
             statements.push(truncate_sql(table, schema, db_type));
@@ -3776,13 +5068,13 @@ async fn execute_import_rows_batch(
             statement_count,
         )
         .await
-        .map_err(ImportRowsBatchError::before_write)?;
-        return Ok(rows.len());
+        .map_err(|message| ImportRowsBatchError::with_rows_imported(rows_imported, message))?;
+        return Ok(rows_imported.saturating_add(rows.len()));
     }
-    let mut rows_imported = 0usize;
     for batch in batches {
+        ensure_import_write_allowed(import_id, is_cancelled, rows_imported).await?;
         if let Err(error) = execute_import_statement(state, pool_key, &batch.sql, db_write_ms, statement_count).await {
-            return Err(ImportRowsBatchError { rows_imported, message: error });
+            return Err(ImportRowsBatchError::with_rows_imported(rows_imported, error));
         }
         rows_imported = rows_imported.saturating_add(batch.row_count);
     }
@@ -3858,11 +5150,12 @@ fn delimited_columns_and_first_record<R: std::io::Read>(
         let record = record.map_err(|e| e.to_string())?;
         let row_number = index + 1;
         if config.row_range.title_row == Some(row_number) {
-            columns = record
-                .iter()
-                .enumerate()
-                .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index))
-                .collect();
+            columns = unique_import_headers(
+                record
+                    .iter()
+                    .enumerate()
+                    .map(|(index, header)| normalize_header(header.trim_start_matches('\u{feff}'), index)),
+            );
             continue;
         }
         if row_number < config.row_range.data_start_row {
@@ -4035,6 +5328,489 @@ pub async fn preview_table_import_file_core(file_path: &str) -> Result<TableImpo
     .await
 }
 
+async fn kingbase_oracle_compatibility_mode(state: &AppState, pool_key: &str, db_type: &DatabaseType) -> bool {
+    if *db_type != DatabaseType::Kingbase {
+        return false;
+    }
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(PoolKind::Agent(client)) => client.clone(),
+            _ => return false,
+        }
+    };
+    let mut agent = client.lock().await;
+    agent
+        .connection_info(Some(crate::db::connection_timeout()))
+        .await
+        .ok()
+        .and_then(|info| info.compatibility_mode)
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("oracle"))
+}
+
+async fn mysql_import_sql_hard_limit(state: &AppState, pool_key: &str) -> Option<usize> {
+    let pool = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(PoolKind::Mysql(pool, _)) => pool.clone(),
+            _ => return None,
+        }
+    };
+    match crate::db::mysql::max_allowed_packet(&pool).await {
+        Ok(packet_bytes) => crate::db::mysql::mysql_sql_statement_hard_limit(packet_bytes),
+        Err(error) => {
+            log::debug!("MySQL max_allowed_packet query failed; using conservative SQL batch target: {error}");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerBulkImportPlan {
+    target_table: String,
+    target_columns: Vec<String>,
+    target_types: Vec<String>,
+    requires_identity_insert: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerBulkBatchSql {
+    create_staging: String,
+    write_target: String,
+    drop_staging: String,
+}
+
+impl SqlServerBulkImportPlan {
+    fn batch_sql(&self, staging_table: &str, truncate_target: bool) -> SqlServerBulkBatchSql {
+        let quoted_staging = quote_identifier(staging_table, &DatabaseType::SqlServer);
+        let staging_columns = (0..self.target_columns.len())
+            .map(|index| format!("[c{index}] NVARCHAR(MAX) NULL"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target_columns = self
+            .target_columns
+            .iter()
+            .map(|column| quote_identifier(column, &DatabaseType::SqlServer))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let converted_columns = self
+            .target_types
+            .iter()
+            .enumerate()
+            .map(|(index, data_type)| sqlserver_bulk_conversion_expression(index, data_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert = format!(
+            "INSERT INTO {} ({target_columns}) SELECT {converted_columns} FROM {quoted_staging}",
+            self.target_table
+        );
+        let write_target = if truncate_target || self.requires_identity_insert {
+            let mut statements = String::from("BEGIN TRY\nBEGIN TRANSACTION;\n");
+            if self.requires_identity_insert {
+                statements.push_str(&format!("SET IDENTITY_INSERT {} ON;\n", self.target_table));
+            }
+            if truncate_target {
+                statements.push_str(&format!("TRUNCATE TABLE {};\n", self.target_table));
+            }
+            statements.push_str(&format!("{insert};\n"));
+            if self.requires_identity_insert {
+                statements.push_str(&format!("SET IDENTITY_INSERT {} OFF;\n", self.target_table));
+            }
+            statements
+                .push_str("COMMIT TRANSACTION;\nEND TRY\nBEGIN CATCH\nIF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n");
+            if self.requires_identity_insert {
+                statements.push_str(&format!("SET IDENTITY_INSERT {} OFF;\n", self.target_table));
+            }
+            statements.push_str("THROW;\nEND CATCH");
+            statements
+        } else {
+            insert
+        };
+
+        SqlServerBulkBatchSql {
+            create_staging: format!("CREATE TABLE {quoted_staging} ({staging_columns})"),
+            write_target,
+            drop_staging: format!("DROP TABLE {quoted_staging}"),
+        }
+    }
+}
+
+fn compile_sqlserver_bulk_import_plan(
+    import_plan: &CompiledImportPlan,
+    metadata: &[crate::db::sqlserver::SqlServerColumnMetadata],
+    table: &str,
+    schema: &str,
+) -> Result<SqlServerBulkImportPlan, String> {
+    let mut target_types = Vec::with_capacity(import_plan.target_columns.len());
+    let mut requires_identity_insert = false;
+    for target_column in &import_plan.target_columns {
+        let column = metadata
+            .iter()
+            .find(|column| column.column.name.eq_ignore_ascii_case(target_column))
+            .ok_or_else(|| format!("SQL Server bulk target column not found: {target_column}"))?;
+        if column.is_computed {
+            return Err(format!("SQL Server computed column is not bulk insertable: {target_column}"));
+        }
+        if column.is_hidden || column.generated_always_type != 0 {
+            return Err(format!("SQL Server hidden/generated column is not bulk insertable: {target_column}"));
+        }
+        sqlserver_bulk_type_kind(&column.column.data_type)
+            .ok_or_else(|| format!("SQL Server type is not supported by bulk staging: {}", column.column.data_type))?;
+        requires_identity_insert |= column.is_identity;
+        target_types.push(column.column.data_type.clone());
+    }
+    Ok(SqlServerBulkImportPlan {
+        target_table: qualified_table(table, schema, &DatabaseType::SqlServer, None),
+        target_columns: import_plan.target_columns.clone(),
+        target_types,
+        requires_identity_insert,
+    })
+}
+
+async fn sqlserver_bulk_import_plan_for_pool(
+    state: &AppState,
+    pool_key: &str,
+    db_type: &DatabaseType,
+    import_plan: Option<&CompiledImportPlan>,
+    table: &str,
+    schema: &str,
+) -> Option<SqlServerBulkImportPlan> {
+    if *db_type != DatabaseType::SqlServer {
+        return None;
+    }
+    let import_plan = import_plan?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(PoolKind::SqlServer(client)) => client.clone(),
+            _ => return None,
+        }
+    };
+    let metadata = {
+        let mut client = client.lock().await;
+        match crate::db::sqlserver::get_column_metadata(&mut client, schema, table).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                log::debug!("SQL Server bulk metadata lookup failed; using SQL fallback: {error}");
+                return None;
+            }
+        }
+    };
+    match compile_sqlserver_bulk_import_plan(import_plan, &metadata, table, schema) {
+        Ok(plan) => Some(plan),
+        Err(error) => {
+            log::debug!("SQL Server bulk import is not eligible; using SQL fallback: {error}");
+            None
+        }
+    }
+}
+
+fn sqlserver_bulk_plans_for_rows<'a>(
+    db_type: &DatabaseType,
+    import_plan: Option<&'a CompiledImportPlan>,
+    bulk_plan: Option<&'a SqlServerBulkImportPlan>,
+    rows: &[Vec<serde_json::Value>],
+) -> Option<(&'a CompiledImportPlan, &'a SqlServerBulkImportPlan)> {
+    if *db_type != DatabaseType::SqlServer
+        || rows
+            .iter()
+            .flatten()
+            .any(|value| matches!(value, serde_json::Value::Array(_) | serde_json::Value::Object(_)))
+    {
+        return None;
+    }
+    let import_plan = import_plan?;
+    let bulk_plan = bulk_plan?;
+    let binary_columns = bulk_plan
+        .target_types
+        .iter()
+        .enumerate()
+        .filter(|(_, data_type)| sqlserver_bulk_type_kind(data_type) == Some(SqlServerBulkTypeKind::Binary));
+    for (target_index, _) in binary_columns {
+        let source_index = *import_plan.mapped_source_indexes.get(target_index)?;
+        if rows
+            .iter()
+            .map(|row| row.get(source_index).unwrap_or(&serde_json::Value::Null))
+            .any(|value| !sqlserver_bulk_binary_value_compatible(value))
+        {
+            return None;
+        }
+    }
+    Some((import_plan, bulk_plan))
+}
+
+fn sqlserver_bulk_binary_value_compatible(value: &serde_json::Value) -> bool {
+    let serde_json::Value::String(value) = value else {
+        return value.is_null();
+    };
+    let Some(hex) = value.strip_prefix("0x") else {
+        return false;
+    };
+    hex.len() % 2 == 0 && hex.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlServerBulkTypeKind {
+    Scalar,
+    Binary,
+}
+
+fn sqlserver_bulk_type_kind(data_type: &str) -> Option<SqlServerBulkTypeKind> {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    let base = normalized.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    if matches!(base, "timestamp" | "rowversion") {
+        return None;
+    }
+    if matches!(base, "binary" | "varbinary") {
+        return Some(SqlServerBulkTypeKind::Binary);
+    }
+    matches!(
+        base,
+        "bigint"
+            | "bit"
+            | "char"
+            | "date"
+            | "datetime"
+            | "datetime2"
+            | "datetimeoffset"
+            | "decimal"
+            | "float"
+            | "int"
+            | "money"
+            | "nchar"
+            | "numeric"
+            | "nvarchar"
+            | "real"
+            | "smalldatetime"
+            | "smallint"
+            | "smallmoney"
+            | "sysname"
+            | "time"
+            | "tinyint"
+            | "uniqueidentifier"
+            | "varchar"
+            | "xml"
+    )
+    .then_some(SqlServerBulkTypeKind::Scalar)
+}
+
+fn sqlserver_bulk_conversion_expression(index: usize, data_type: &str) -> String {
+    match sqlserver_bulk_type_kind(data_type) {
+        Some(SqlServerBulkTypeKind::Binary) => format!("CONVERT({data_type}, [c{index}], 1)"),
+        Some(SqlServerBulkTypeKind::Scalar) => format!("CONVERT({data_type}, [c{index}])"),
+        None => unreachable!("SQL Server bulk plan validates target types before building SQL"),
+    }
+}
+
+fn sqlserver_bulk_text_row(
+    row: &[serde_json::Value],
+    plan: &CompiledImportPlan,
+    date_time_format: Option<&str>,
+    row_index: usize,
+    memory_limit: usize,
+) -> Result<Vec<Option<String>>, String> {
+    let memory_limit = memory_limit.max(1);
+    let mut memory_bytes = plan.mapped_source_indexes.len().saturating_mul(std::mem::size_of::<Option<String>>());
+    if memory_bytes > memory_limit {
+        return Err(sqlserver_bulk_row_memory_error(row_index, memory_bytes, memory_limit));
+    }
+    let mut values = Vec::with_capacity(plan.mapped_source_indexes.len());
+    for (target_index, source_index) in plan.mapped_source_indexes.iter().enumerate() {
+        let source_value = row.get(*source_index).unwrap_or(&serde_json::Value::Null);
+        if let serde_json::Value::String(value) = source_value {
+            // Check before cloning so a single oversized source cell cannot create an
+            // unbounded duplicate allocation merely to discover that it is too large.
+            let projected = memory_bytes.saturating_add(sqlserver_bulk_str_memory_bytes(value));
+            if projected > memory_limit {
+                return Err(sqlserver_bulk_row_memory_error(row_index, projected, memory_limit));
+            }
+        }
+        let normalized = normalize_import_value(
+            source_value,
+            plan.column_types.get(target_index).and_then(|data_type| data_type.as_deref()),
+            &DatabaseType::SqlServer,
+            false,
+            date_time_format,
+        );
+        let value = match normalized {
+            serde_json::Value::Null => None,
+            serde_json::Value::Bool(value) => Some(if value { "1" } else { "0" }.to_string()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            serde_json::Value::String(value) => Some(value),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                return Err(format!(
+                    "SQL Server bulk row {} contains a structured value; using SQL fallback is required",
+                    row_index + 1
+                ))
+            }
+        };
+        if let Some(value) = value.as_ref() {
+            memory_bytes = memory_bytes.saturating_add(sqlserver_bulk_owned_string_memory_bytes(value));
+            if memory_bytes > memory_limit {
+                return Err(sqlserver_bulk_row_memory_error(row_index, memory_bytes, memory_limit));
+            }
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn sqlserver_bulk_str_memory_bytes(value: &str) -> usize {
+    // Count both the owned UTF-8 staging String and its UTF-16 TDS payload.
+    // Tiberius may retain either representation while encoding a TokenRow.
+    value.len().saturating_add(value.encode_utf16().count().saturating_mul(2))
+}
+
+fn sqlserver_bulk_owned_string_memory_bytes(value: &String) -> usize {
+    value.capacity().saturating_add(value.encode_utf16().count().saturating_mul(2))
+}
+
+fn sqlserver_bulk_row_memory_error(row_index: usize, actual_bytes: usize, memory_limit: usize) -> String {
+    format!(
+        "SQL Server bulk row {} requires {actual_bytes} converted bytes and exceeds the {memory_limit} byte row memory limit",
+        row_index + 1
+    )
+}
+
+async fn invalidate_sqlserver_pool_after_staging_cleanup_failure<T>(
+    state: &AppState,
+    pool_key: &str,
+    locked_client: T,
+    staging_name: &str,
+    error: &str,
+) {
+    drop(locked_client);
+    log::warn!("SQL Server bulk staging cleanup failed for {staging_name}: {error}; invalidating connection pool");
+    state.remove_pool_by_key(pool_key).await;
+}
+
+fn sqlserver_staging_cleanup_error_after_target_write(
+    write_error: Option<&str>,
+    attempted_rows: usize,
+    cleanup_error: &str,
+) -> ImportRowsBatchError {
+    match write_error {
+        None => ImportRowsBatchError::with_rows_imported(
+            attempted_rows,
+            format!("SQL Server bulk staging cleanup failed after writing {attempted_rows} rows: {cleanup_error}"),
+        ),
+        Some(write_error) => ImportRowsBatchError::before_write(format!(
+            "SQL Server bulk target write failed: {write_error}; staging cleanup also failed: {cleanup_error}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_sqlserver_bulk_rows_batch(
+    state: &AppState,
+    pool_key: &str,
+    import_id: &str,
+    is_cancelled: &impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>,
+    rows: &[Vec<serde_json::Value>],
+    import_plan: &CompiledImportPlan,
+    bulk_plan: &SqlServerBulkImportPlan,
+    truncate_target: bool,
+    date_time_format: Option<&str>,
+    db_write_ms: &mut u128,
+    statement_count: &mut usize,
+) -> Result<usize, ImportRowsBatchError> {
+    ensure_import_write_allowed(import_id, is_cancelled, 0).await?;
+    let staging_name = format!("#dbx_import_{}", uuid::Uuid::new_v4().simple());
+    let quoted_staging = quote_identifier(&staging_name, &DatabaseType::SqlServer);
+    let sql = bulk_plan.batch_sql(&staging_name, truncate_target);
+    crate::query::check_read_only_for_connection(state, pool_key, &sql.write_target)
+        .await
+        .map_err(ImportRowsBatchError::before_write)?;
+    let client = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(PoolKind::SqlServer(client)) => client.clone(),
+            _ => {
+                return Err(ImportRowsBatchError::before_write(
+                    "Native SQL Server connection not found for bulk import",
+                ))
+            }
+        }
+    };
+
+    let started_at = Instant::now();
+    let mut client = client.lock().await;
+    *statement_count += 1;
+    if let Err(error) = crate::db::sqlserver::execute_query(&mut client, &sql.create_staging).await {
+        *db_write_ms += started_at.elapsed().as_millis();
+        return Err(ImportRowsBatchError::before_write(error));
+    }
+
+    *statement_count += 1;
+    let bulk_count = match crate::db::sqlserver::bulk_insert_text_rows(
+        &mut client,
+        &quoted_staging,
+        rows,
+        import_plan.target_columns.len(),
+        |row_index, row| {
+            sqlserver_bulk_text_row(row, import_plan, date_time_format, row_index, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+        },
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            drop(client);
+            *db_write_ms += started_at.elapsed().as_millis();
+            state.remove_pool_by_key(pool_key).await;
+            return Err(ImportRowsBatchError::before_write(error));
+        }
+    };
+    if bulk_count != rows.len() as u64 {
+        *statement_count += 1;
+        if let Err(error) = crate::db::sqlserver::execute_query(&mut client, &sql.drop_staging).await {
+            invalidate_sqlserver_pool_after_staging_cleanup_failure(state, pool_key, client, &staging_name, &error)
+                .await;
+            *db_write_ms += started_at.elapsed().as_millis();
+            return Err(ImportRowsBatchError::before_write(format!(
+                "SQL Server bulk load staged {bulk_count} rows; expected {}; staging cleanup failed: {error}",
+                rows.len()
+            )));
+        }
+        *db_write_ms += started_at.elapsed().as_millis();
+        return Err(ImportRowsBatchError::before_write(format!(
+            "SQL Server bulk load staged {bulk_count} rows; expected {}",
+            rows.len()
+        )));
+    }
+
+    if is_cancelled(import_id).await {
+        *statement_count += 1;
+        if let Err(error) = crate::db::sqlserver::execute_query(&mut client, &sql.drop_staging).await {
+            invalidate_sqlserver_pool_after_staging_cleanup_failure(state, pool_key, client, &staging_name, &error)
+                .await;
+        }
+        *db_write_ms += started_at.elapsed().as_millis();
+        return Err(ImportRowsBatchError::cancelled(0));
+    }
+
+    *statement_count += 1;
+    let write_result = crate::db::sqlserver::execute_batch(&mut client, &sql.write_target).await;
+    *statement_count += 1;
+    if let Err(error) = crate::db::sqlserver::execute_query(&mut client, &sql.drop_staging).await {
+        let batch_error = sqlserver_staging_cleanup_error_after_target_write(
+            write_result.as_ref().err().map(String::as_str),
+            rows.len(),
+            &error,
+        );
+        invalidate_sqlserver_pool_after_staging_cleanup_failure(state, pool_key, client, &staging_name, &error).await;
+        *db_write_ms += started_at.elapsed().as_millis();
+        return Err(batch_error);
+    }
+    drop(client);
+    *db_write_ms += started_at.elapsed().as_millis();
+
+    if let Err(error) = write_result {
+        return Err(ImportRowsBatchError::before_write(error));
+    }
+    Ok(rows.len())
+}
+
 /// Core import logic. Returns (rows_imported, total_rows).
 /// `progress_callback` is invoked for progress updates.
 pub async fn import_table_file_core<F>(
@@ -4052,6 +5828,7 @@ where
     let mut db_write_ms = 0u128;
     let mut statement_count = 0usize;
     let batch_size = if request.batch_size == 0 { DEFAULT_BATCH_SIZE } else { request.batch_size };
+    let kingbase_oracle_mode = kingbase_oracle_compatibility_mode(state, pool_key, db_type).await;
     let source_format = match effective_source_format(&request.file_path, request.source_format) {
         Ok(format) => format,
         Err(error) => {
@@ -4069,6 +5846,7 @@ where
             format!("Import source is no longer available: {error}"),
         ));
     }
+    let import_sql_hard_limit = mysql_import_sql_hard_limit(state, pool_key).await;
     let prepared_source = validated_prepared_import_source(request, source_format);
     let prepared_source_total_exact =
         prepared_source.is_some() && request.prepared_source.as_ref().is_some_and(|prepared| prepared.total_rows_exact);
@@ -4142,13 +5920,8 @@ where
         import_parse_options.encoding = Some(encoding);
     }
 
-    let extension =
-        Path::new(&request.file_path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
-    let is_streaming_xlsx_import = source_format == TableImportSourceFormat::Excel
-        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"));
     let mut create_table_sample: Option<ParsedImportFile> = None;
     let mut created_column_types: Option<Vec<(String, String)>> = None;
-    let mut xlsx_worksheet_validated = false;
     if request.create_table {
         if matches!(request.mode, TableImportMode::Truncate) {
             return Err(emit_import_error(
@@ -4200,22 +5973,6 @@ where
                 return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
             }
         };
-        if is_streaming_xlsx_import {
-            let target_column_types =
-                plan.columns.iter().map(|column| (column.name.clone(), column.data_type.clone())).collect::<Vec<_>>();
-            let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
-            if let Err(error) = validate_xlsx_worksheet_for_import(
-                request.file_path.clone(),
-                import_parse_options.clone(),
-                Some(parsed.columns.clone()),
-                text_source_columns,
-            )
-            .await
-            {
-                return Err(emit_import_error(&mut progress_callback, request, 0, total_rows, started_at, error));
-            }
-            xlsx_worksheet_validated = true;
-        }
         // The table must be created before streaming rows so existing import batching
         // can reuse the same INSERT path and database-specific value escaping.
         if let Err(error) =
@@ -4258,6 +6015,7 @@ where
             &request.database,
             &request.schema,
             &request.table,
+            None,
         )
         .await
         .unwrap_or_default()
@@ -4346,8 +6104,24 @@ where
                 }
             }
         };
+        let sqlserver_bulk_plan = sqlserver_bulk_import_plan_for_pool(
+            state,
+            pool_key,
+            db_type,
+            compiled_plan.as_ref(),
+            &request.table,
+            &request.schema,
+        )
+        .await;
         let allow_postgres_copy = *db_type == DatabaseType::Postgres
             && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
+        let mut postgres_copy_accumulator = postgres_copy_accumulator_for_plan(
+            allow_postgres_copy,
+            compiled_plan.as_ref(),
+            &request.table,
+            &request.schema,
+        );
+        let mut sqlite_append_transaction = sqlite_append_transaction_for_import(&request.mode, db_type);
         let mut pending_truncate =
             matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
         if matches!(request.mode, TableImportMode::Truncate) && !pending_truncate {
@@ -4392,10 +6166,13 @@ where
                     let row_count = match execute_import_rows_batch(
                         state,
                         pool_key,
+                        &request.import_id,
+                        &is_cancelled,
                         &request.connection_id,
                         &request.database,
                         &rows,
                         compiled_plan.as_ref(),
+                        sqlserver_bulk_plan.as_ref(),
                         &columns,
                         &request.mappings,
                         &target_column_types,
@@ -4404,8 +6181,11 @@ where
                         db_type,
                         &request.mode,
                         pending_truncate,
-                        allow_postgres_copy,
+                        &mut postgres_copy_accumulator,
+                        &mut sqlite_append_transaction,
+                        kingbase_oracle_mode,
                         request.date_time_format.as_deref(),
+                        import_sql_hard_limit,
                         &mut db_write_ms,
                         &mut statement_count,
                     )
@@ -4416,6 +6196,21 @@ where
                             drop(receiver);
                             let _ = producer.await;
                             rows_imported = rows_imported.saturating_add(error.rows_imported);
+                            if error.cancelled {
+                                progress_callback(import_progress_with_details(
+                                    &request.import_id,
+                                    TableImportStatus::Cancelled,
+                                    TableImportPhase::Done,
+                                    rows_imported,
+                                    total_rows,
+                                    total_rows_exact,
+                                    last_bytes_read.min(total_bytes),
+                                    total_bytes,
+                                    started_at,
+                                    None,
+                                ));
+                                return Err(error.message);
+                            }
                             return Err(emit_import_error(
                                 &mut progress_callback,
                                 request,
@@ -4485,6 +6280,62 @@ where
                 ));
             }
         }
+        rows_imported = finish_sqlite_append_transaction(
+            state,
+            pool_key,
+            request,
+            &is_cancelled,
+            &mut sqlite_append_transaction,
+            rows_imported,
+            total_rows,
+            started_at,
+            &mut db_write_ms,
+            &mut statement_count,
+            &mut progress_callback,
+        )
+        .await?;
+        let flushed_rows = match flush_pending_postgres_copy(
+            state,
+            pool_key,
+            &request.import_id,
+            &is_cancelled,
+            &mut postgres_copy_accumulator,
+            &mut db_write_ms,
+            &mut statement_count,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) if error.cancelled => {
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Cancelled,
+                    TableImportPhase::Done,
+                    rows_imported,
+                    total_rows,
+                    total_rows_exact,
+                    last_bytes_read.min(total_bytes),
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+                return Err(error.message);
+            }
+            Err(error) => {
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    rows_imported,
+                    total_rows,
+                    started_at,
+                    error.message,
+                ));
+            }
+        };
+        rows_imported = rows_imported.saturating_add(flushed_rows);
+        if let Some(known_total_rows) = known_total_rows {
+            rows_imported = rows_imported.min(known_total_rows);
+        }
 
         progress_callback(import_progress_with_details(
             &request.import_id,
@@ -4503,7 +6354,11 @@ where
         return Ok(import_summary(&request.import_id, rows_imported, rows_imported, started_at));
     }
 
-    if is_streaming_xlsx_import {
+    let extension =
+        Path::new(&request.file_path).extension().and_then(|extension| extension.to_str()).unwrap_or_default();
+    if source_format == TableImportSourceFormat::Excel
+        && (extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm"))
+    {
         let total_bytes = tokio::fs::metadata(&request.file_path).await.map(|metadata| metadata.len()).unwrap_or(0);
         progress_callback(import_progress_with_details(
             &request.import_id,
@@ -4518,18 +6373,8 @@ where
             None,
         ));
         let effective_batch_size = effective_import_batch_size(db_type, batch_size);
-        let expected_columns = if let Some(source) = create_table_sample.as_ref().or(prepared_source.as_ref()) {
-            Some(source.columns.clone())
-        } else {
-            match parse_import_preview_file_with_options(&request.file_path, source_format, &import_parse_options, 1)
-                .await
-            {
-                Ok((parsed, _, _)) => Some(parsed.columns),
-                Err(error) => {
-                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
-                }
-            }
-        };
+        let expected_columns =
+            create_table_sample.as_ref().or(prepared_source.as_ref()).map(|source| source.columns.clone());
         let mut target_column_types = get_columns_for_transfer(
             state,
             pool_key,
@@ -4537,6 +6382,7 @@ where
             &request.database,
             &request.schema,
             &request.table,
+            None,
         )
         .await
         .unwrap_or_default()
@@ -4548,18 +6394,54 @@ where
         }
         let text_source_columns = textual_source_columns_for_import(&request.mappings, &target_column_types);
         // No truncate, INSERT, or COPY may run until the selected worksheet parses to EOF.
-        if !xlsx_worksheet_validated {
-            if let Err(error) = validate_xlsx_worksheet_for_import(
-                request.file_path.clone(),
-                request.parse_options.clone(),
-                expected_columns.clone(),
-                text_source_columns.clone(),
-            )
-            .await
-            {
+        let mut last_xlsx_read_bytes = 0u64;
+        let validated_columns = match validate_xlsx_worksheet_for_import(
+            request.file_path.clone(),
+            request.parse_options.clone(),
+            expected_columns.clone(),
+            text_source_columns.clone(),
+            &request.import_id,
+            &is_cancelled,
+            |bytes_read| {
+                last_xlsx_read_bytes =
+                    last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, false));
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Running,
+                    TableImportPhase::Reading,
+                    0,
+                    0,
+                    false,
+                    last_xlsx_read_bytes,
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+            },
+        )
+        .await
+        {
+            Ok(columns) => columns,
+            Err(error) if error == "Import cancelled" => {
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Cancelled,
+                    TableImportPhase::Done,
+                    0,
+                    0,
+                    false,
+                    last_xlsx_read_bytes,
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+                return Err(error);
+            }
+            Err(error) => {
                 return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
             }
-        }
+        };
+        let expected_columns = Some(validated_columns);
         // Full-sheet validation can take long enough for the user to cancel. Recheck before
         // starting the producer or executing a non-transactional truncate.
         if is_cancelled(&request.import_id).await {
@@ -4570,7 +6452,7 @@ where
                 0,
                 0,
                 false,
-                total_bytes,
+                last_xlsx_read_bytes,
                 total_bytes,
                 started_at,
                 None,
@@ -4578,10 +6460,12 @@ where
             return Err("Import cancelled".to_string());
         }
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<XlsxStreamMessage, String>>(2);
+        let producer_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_producer = producer_cancelled.clone();
         let path = request.file_path.clone();
         let options = request.parse_options.clone();
         let producer = tokio::task::spawn_blocking(move || {
-            stream_xlsx_rows_to_channel(
+            stream_xlsx_rows_to_channel_with_control(
                 &path,
                 &options,
                 effective_batch_size,
@@ -4589,36 +6473,86 @@ where
                 text_source_columns,
                 false,
                 sender,
+                cancelled_for_producer,
             )
         });
-        let columns = match receiver.recv().await {
-            Some(Ok(XlsxStreamMessage::Header(columns))) => columns,
-            Some(Ok(_)) => {
-                drop(receiver);
-                let _ = producer.await;
-                return Err(emit_import_error(
-                    &mut progress_callback,
-                    request,
-                    0,
-                    0,
-                    started_at,
-                    "Excel stream did not provide a header before data rows",
-                ));
-            }
-            Some(Err(error)) => {
-                let _ = producer.await;
-                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
-            }
-            None => {
-                let error = producer
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .err()
-                    .unwrap_or_else(|| "Excel stream ended before providing a header".to_string());
-                return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+        let columns = loop {
+            let message = match receive_xlsx_stream_message(
+                &mut receiver,
+                &request.import_id,
+                &is_cancelled,
+                &producer_cancelled,
+            )
+            .await
+            {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    let error = producer
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .err()
+                        .unwrap_or_else(|| "Excel stream ended before providing a header".to_string());
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+                }
+                Err(()) => {
+                    drop(receiver);
+                    let _ = producer.await;
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        TableImportPhase::Done,
+                        0,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                    return Err("Import cancelled".to_string());
+                }
+            };
+            match message {
+                Ok(XlsxStreamMessage::Header(columns)) => break columns,
+                Ok(XlsxStreamMessage::Progress(bytes_read)) => {
+                    last_xlsx_read_bytes =
+                        last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, true));
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Running,
+                        TableImportPhase::Reading,
+                        0,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                }
+                Ok(_) => {
+                    producer_cancelled.store(true, Ordering::Release);
+                    drop(receiver);
+                    let _ = producer.await;
+                    return Err(emit_import_error(
+                        &mut progress_callback,
+                        request,
+                        0,
+                        0,
+                        started_at,
+                        "Excel stream did not provide a header before data rows",
+                    ));
+                }
+                Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
+                    drop(receiver);
+                    let _ = producer.await;
+                    return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
+                }
             }
         };
         if columns.is_empty() {
+            producer_cancelled.store(true, Ordering::Release);
             drop(receiver);
             let _ = producer.await;
             return Err(emit_import_error(
@@ -4631,6 +6565,7 @@ where
             ));
         }
         if let Err(error) = mapping_indexes_for_columns(&columns, &request.mappings) {
+            producer_cancelled.store(true, Ordering::Release);
             drop(receiver);
             let _ = producer.await;
             return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -4641,14 +6576,31 @@ where
             match compile_import_plan(&columns, &request.mappings, &target_column_types) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
                     drop(receiver);
                     let _ = producer.await;
                     return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
                 }
             }
         };
+        let sqlserver_bulk_plan = sqlserver_bulk_import_plan_for_pool(
+            state,
+            pool_key,
+            db_type,
+            compiled_plan.as_ref(),
+            &request.table,
+            &request.schema,
+        )
+        .await;
         let allow_postgres_copy = *db_type == DatabaseType::Postgres
             && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
+        let mut postgres_copy_accumulator = postgres_copy_accumulator_for_plan(
+            allow_postgres_copy,
+            compiled_plan.as_ref(),
+            &request.table,
+            &request.schema,
+        );
+        let mut sqlite_append_transaction = sqlite_append_transaction_for_import(&request.mode, db_type);
         let mut pending_truncate =
             matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
         if matches!(request.mode, TableImportMode::Truncate) && !pending_truncate {
@@ -4656,6 +6608,7 @@ where
             if let Err(error) =
                 execute_import_statement(state, pool_key, &sql, &mut db_write_ms, &mut statement_count).await
             {
+                producer_cancelled.store(true, Ordering::Release);
                 drop(receiver);
                 let _ = producer.await;
                 return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -4663,14 +6616,39 @@ where
         }
         let mut rows_imported = 0usize;
         loop {
-            let message = match receiver.recv().await {
-                Some(message) => message,
-                None => break,
+            let message = match receive_xlsx_stream_message(
+                &mut receiver,
+                &request.import_id,
+                &is_cancelled,
+                &producer_cancelled,
+            )
+            .await
+            {
+                Ok(Some(message)) => message,
+                Ok(None) => break,
+                Err(()) => {
+                    drop(receiver);
+                    let _ = producer.await;
+                    progress_callback(import_progress_with_details(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        TableImportPhase::Done,
+                        rows_imported,
+                        0,
+                        false,
+                        last_xlsx_read_bytes,
+                        total_bytes,
+                        started_at,
+                        None,
+                    ));
+                    return Err("Import cancelled".to_string());
+                }
             };
             match message {
                 Ok(XlsxStreamMessage::Header(_)) => {}
                 Ok(XlsxStreamMessage::Rows(rows)) => {
                     if is_cancelled(&request.import_id).await {
+                        producer_cancelled.store(true, Ordering::Release);
                         drop(receiver);
                         let _ = producer.await;
                         progress_callback(import_progress_with_details(
@@ -4680,7 +6658,7 @@ where
                             rows_imported,
                             0,
                             false,
-                            0,
+                            last_xlsx_read_bytes,
                             total_bytes,
                             started_at,
                             None,
@@ -4690,10 +6668,13 @@ where
                     let row_count = match execute_import_rows_batch(
                         state,
                         pool_key,
+                        &request.import_id,
+                        &is_cancelled,
                         &request.connection_id,
                         &request.database,
                         &rows,
                         compiled_plan.as_ref(),
+                        sqlserver_bulk_plan.as_ref(),
                         &columns,
                         &request.mappings,
                         &target_column_types,
@@ -4702,8 +6683,11 @@ where
                         db_type,
                         &request.mode,
                         pending_truncate,
-                        allow_postgres_copy,
+                        &mut postgres_copy_accumulator,
+                        &mut sqlite_append_transaction,
+                        kingbase_oracle_mode,
                         request.date_time_format.as_deref(),
+                        import_sql_hard_limit,
                         &mut db_write_ms,
                         &mut statement_count,
                     )
@@ -4711,9 +6695,25 @@ where
                     {
                         Ok(row_count) => row_count,
                         Err(error) => {
+                            producer_cancelled.store(true, Ordering::Release);
                             drop(receiver);
                             let _ = producer.await;
                             rows_imported = rows_imported.saturating_add(error.rows_imported);
+                            if error.cancelled {
+                                progress_callback(import_progress_with_details(
+                                    &request.import_id,
+                                    TableImportStatus::Cancelled,
+                                    TableImportPhase::Done,
+                                    rows_imported,
+                                    0,
+                                    false,
+                                    0,
+                                    total_bytes,
+                                    started_at,
+                                    None,
+                                ));
+                                return Err(error.message);
+                            }
                             return Err(emit_import_error(
                                 &mut progress_callback,
                                 request,
@@ -4740,6 +6740,8 @@ where
                     ));
                 }
                 Ok(XlsxStreamMessage::Progress(bytes_read)) => {
+                    last_xlsx_read_bytes =
+                        last_xlsx_read_bytes.max(xlsx_import_pass_progress(bytes_read, total_bytes, true));
                     progress_callback(import_progress_with_details(
                         &request.import_id,
                         TableImportStatus::Running,
@@ -4747,7 +6749,7 @@ where
                         rows_imported,
                         0,
                         false,
-                        bytes_read.min(total_bytes),
+                        last_xlsx_read_bytes,
                         total_bytes,
                         started_at,
                         None,
@@ -4755,6 +6757,7 @@ where
                 }
                 Ok(XlsxStreamMessage::Done) => break,
                 Err(error) => {
+                    producer_cancelled.store(true, Ordering::Release);
                     drop(receiver);
                     let _ = producer.await;
                     return Err(emit_import_error(
@@ -4784,6 +6787,59 @@ where
                 ));
             }
         }
+        rows_imported = finish_sqlite_append_transaction(
+            state,
+            pool_key,
+            request,
+            &is_cancelled,
+            &mut sqlite_append_transaction,
+            rows_imported,
+            0,
+            started_at,
+            &mut db_write_ms,
+            &mut statement_count,
+            &mut progress_callback,
+        )
+        .await?;
+        let flushed_rows = match flush_pending_postgres_copy(
+            state,
+            pool_key,
+            &request.import_id,
+            &is_cancelled,
+            &mut postgres_copy_accumulator,
+            &mut db_write_ms,
+            &mut statement_count,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) if error.cancelled => {
+                progress_callback(import_progress_with_details(
+                    &request.import_id,
+                    TableImportStatus::Cancelled,
+                    TableImportPhase::Done,
+                    rows_imported,
+                    0,
+                    false,
+                    total_bytes,
+                    total_bytes,
+                    started_at,
+                    None,
+                ));
+                return Err(error.message);
+            }
+            Err(error) => {
+                return Err(emit_import_error(
+                    &mut progress_callback,
+                    request,
+                    rows_imported,
+                    0,
+                    started_at,
+                    error.message,
+                ));
+            }
+        };
+        rows_imported = rows_imported.saturating_add(flushed_rows);
         progress_callback(import_progress_with_details(
             &request.import_id,
             TableImportStatus::Done,
@@ -4820,6 +6876,7 @@ where
         &request.database,
         &request.schema,
         &request.table,
+        None,
     )
     .await
     .unwrap_or_default()
@@ -4874,8 +6931,24 @@ where
             }
         }
     };
+    let sqlserver_bulk_plan = sqlserver_bulk_import_plan_for_pool(
+        state,
+        pool_key,
+        db_type,
+        compiled_plan.as_ref(),
+        &request.table,
+        &request.schema,
+    )
+    .await;
     let allow_postgres_copy = *db_type == DatabaseType::Postgres
         && postgres_copy_fast_path_eligible(state, pool_key, &request.table, &request.schema).await;
+    let mut postgres_copy_accumulator = postgres_copy_accumulator_for_plan(
+        allow_postgres_copy,
+        compiled_plan.as_ref(),
+        &request.table,
+        &request.schema,
+    );
+    let mut sqlite_append_transaction = sqlite_append_transaction_for_import(&request.mode, db_type);
 
     let mut pending_truncate =
         matches!(request.mode, TableImportMode::Truncate) && supports_transactional_import_truncate(db_type);
@@ -4905,10 +6978,13 @@ where
         let row_count = match execute_import_rows_batch(
             state,
             pool_key,
+            &request.import_id,
+            &is_cancelled,
             &request.connection_id,
             &request.database,
             rows,
             compiled_plan.as_ref(),
+            sqlserver_bulk_plan.as_ref(),
             &parsed.columns,
             &request.mappings,
             &target_column_types,
@@ -4917,8 +6993,11 @@ where
             db_type,
             &request.mode,
             pending_truncate,
-            allow_postgres_copy,
+            &mut postgres_copy_accumulator,
+            &mut sqlite_append_transaction,
+            kingbase_oracle_mode,
             request.date_time_format.as_deref(),
+            import_sql_hard_limit,
             &mut db_write_ms,
             &mut statement_count,
         )
@@ -4927,6 +7006,17 @@ where
             Ok(row_count) => row_count,
             Err(error) => {
                 rows_imported = (rows_imported + error.rows_imported).min(total_rows);
+                if error.cancelled {
+                    progress_callback(import_progress(
+                        &request.import_id,
+                        TableImportStatus::Cancelled,
+                        rows_imported,
+                        total_rows,
+                        started_at,
+                        None,
+                    ));
+                    return Err(error.message);
+                }
                 return Err(emit_import_error(
                     &mut progress_callback,
                     request,
@@ -4951,6 +7041,58 @@ where
             last_progress_emit = Instant::now();
         }
     }
+
+    rows_imported = finish_sqlite_append_transaction(
+        state,
+        pool_key,
+        request,
+        &is_cancelled,
+        &mut sqlite_append_transaction,
+        rows_imported,
+        total_rows,
+        started_at,
+        &mut db_write_ms,
+        &mut statement_count,
+        &mut progress_callback,
+    )
+    .await?
+    .min(total_rows);
+
+    let flushed_rows = flush_pending_postgres_copy(
+        state,
+        pool_key,
+        &request.import_id,
+        &is_cancelled,
+        &mut postgres_copy_accumulator,
+        &mut db_write_ms,
+        &mut statement_count,
+    )
+    .await;
+    let flushed_rows = match flushed_rows {
+        Ok(rows) => rows,
+        Err(error) if error.cancelled => {
+            progress_callback(import_progress(
+                &request.import_id,
+                TableImportStatus::Cancelled,
+                rows_imported,
+                total_rows,
+                started_at,
+                None,
+            ));
+            return Err(error.message);
+        }
+        Err(error) => {
+            return Err(emit_import_error(
+                &mut progress_callback,
+                request,
+                rows_imported,
+                total_rows,
+                started_at,
+                error.message,
+            ));
+        }
+    };
+    rows_imported = rows_imported.saturating_add(flushed_rows).min(total_rows);
 
     progress_callback(import_progress(
         &request.import_id,
@@ -5026,6 +7168,21 @@ mod tests {
         assert_eq!(plan.mapped_source_indexes, vec![1, 0]);
         assert_eq!(plan.target_columns, vec!["user_id", "display_name"]);
         assert_eq!(plan.column_types, vec![Some("BIGINT".to_string()), Some("VARCHAR(255)".to_string())]);
+    }
+
+    #[test]
+    fn duplicate_import_headers_receive_stable_case_insensitive_suffixes() {
+        assert_eq!(
+            unique_import_headers(["Name", "name", "name", "name_1"].into_iter().map(str::to_string)),
+            vec!["Name", "name_1", "name_2", "name_1_1"]
+        );
+        assert_eq!(
+            unique_import_headers(["id", "display_name"].into_iter().map(str::to_string)),
+            vec!["id", "display_name"]
+        );
+        let many = unique_import_headers(std::iter::repeat_n("value".to_string(), 10_000));
+        assert_eq!(many.len(), 10_000);
+        assert_eq!(many.last().map(String::as_str), Some("value_9999"));
     }
 
     #[test]
@@ -5250,6 +7407,158 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
+    fn assert_xlsx_empty_string_option(options: TableImportParseOptions, expected_row: Vec<serde_json::Value>) {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-empty-string-option-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:E2"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>inline</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>shared</t></is></c>
+      <c r="C1" t="inlineStr"><is><t>formula</t></is></c>
+      <c r="D1" t="inlineStr"><is><t>absent</t></is></c>
+      <c r="E1" t="inlineStr"><is><t>empty_cell</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t></t></is></c>
+      <c r="B2" t="s"><v>0</v></c>
+      <c r="C2" t="str"><f>""</f><v></v></c>
+      <c r="E2"/>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let shared_strings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si><t></t></si>
+</sst>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(shared_strings_xml))).unwrap();
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (preview, _) = parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, HashSet::new(), false, sender)
+            .unwrap();
+
+        let mut streamed_columns = Vec::new();
+        let mut streamed_rows = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            match message.unwrap() {
+                XlsxStreamMessage::Header(columns) => streamed_columns = columns,
+                XlsxStreamMessage::Rows(rows) => streamed_rows.extend(rows),
+                _ => {}
+            }
+        }
+
+        assert_eq!(parsed.columns, vec!["inline", "shared", "formula", "absent", "empty_cell"]);
+        assert_eq!(preview.columns, parsed.columns);
+        assert_eq!(streamed_columns, parsed.columns);
+        assert_eq!(parsed.rows, vec![expected_row.clone()]);
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(streamed_rows, parsed.rows);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_duplicate_headers_are_unique_in_preview_parse_and_streaming() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-duplicate-headers-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:B2"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>name</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>name</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>Ada</t></is></c>
+      <c r="B2" t="inlineStr"><is><t>Lovelace</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+        let options = TableImportParseOptions::default();
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (preview, _) = parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, HashSet::new(), false, sender)
+            .unwrap();
+
+        let mut streamed_columns = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            if let XlsxStreamMessage::Header(columns) = message.unwrap() {
+                streamed_columns = columns;
+            }
+        }
+
+        assert_eq!(parsed.columns, vec!["name", "name_1"]);
+        assert_eq!(preview.columns, parsed.columns);
+        assert_eq!(streamed_columns, parsed.columns);
+        assert_eq!(parsed.rows, vec![vec![serde_json::json!("Ada"), serde_json::json!("Lovelace")]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_preserves_explicit_empty_strings_when_configured() {
+        let options =
+            TableImportParseOptions { empty_string_as_null: Some(false), ..TableImportParseOptions::default() };
+
+        assert_xlsx_empty_string_option(
+            options,
+            vec![
+                serde_json::json!(""),
+                serde_json::json!(""),
+                serde_json::json!(""),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ],
+        );
+    }
+
+    #[test]
+    fn xlsx_defaults_explicit_empty_strings_to_null() {
+        assert_xlsx_empty_string_option(TableImportParseOptions::default(), vec![serde_json::Value::Null; 5]);
+    }
+
+    #[test]
+    fn dbx_exported_xlsx_round_trip_preserves_empty_strings_when_configured() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-empty-round-trip-{}.xlsx", uuid::Uuid::new_v4()));
+        let workbook = build_xlsx_workbook_multi(&[XlsxWorksheetData {
+            sheet_name: Some("Data".to_string()),
+            columns: vec!["empty_text".to_string(), "missing_value".to_string()],
+            column_types: vec!["VARCHAR(255)".to_string(), "VARCHAR(255)".to_string()],
+            column_comments: vec![],
+            rows: vec![vec![serde_json::json!(""), serde_json::Value::Null]],
+            numeric_column_right_align: false,
+        }])
+        .unwrap();
+        std::fs::write(&path, workbook).unwrap();
+        let options =
+            TableImportParseOptions { empty_string_as_null: Some(false), ..TableImportParseOptions::default() };
+
+        let parsed = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (preview, _) = parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        stream_xlsx_rows_to_channel(&path.to_string_lossy(), &options, 500, None, HashSet::new(), false, sender)
+            .unwrap();
+        let mut streamed_rows = Vec::new();
+        while let Some(message) = receiver.blocking_recv() {
+            if let XlsxStreamMessage::Rows(rows) = message.unwrap() {
+                streamed_rows.extend(rows);
+            }
+        }
+
+        let expected = vec![vec![serde_json::json!(""), serde_json::Value::Null]];
+        assert_eq!(parsed.rows, expected);
+        assert_eq!(preview.rows, parsed.rows);
+        assert_eq!(streamed_rows, parsed.rows);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn retains_only_temporal_and_text_target_xlsx_styles() {
         let styles = vec![
@@ -5296,6 +7605,28 @@ mod tests {
             assert!(error.contains(&source_column), "{error}");
             assert!(error.contains("Save the workbook as .xlsx"), "{error}");
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn legacy_xls_preview_reads_sheet_names_without_zip_parser() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-preview-{}.xls", uuid::Uuid::new_v4()));
+        std::fs::write(&path, include_bytes!("../tests/fixtures/issue3683-formatted-numbers.xls")).unwrap();
+        let options = TableImportParseOptions { has_header: Some(false), ..TableImportParseOptions::default() };
+
+        let (parsed, non_streaming, sheets) = parse_import_preview_file_with_options(
+            &path.to_string_lossy(),
+            TableImportSourceFormat::Excel,
+            &options,
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert!(non_streaming);
+        assert_eq!(sheets, vec!["Sheet1"]);
+        assert_eq!(parsed.columns, vec!["column_1", "column_2", "column_3", "column_4", "column_5"]);
+        assert_eq!(parsed.rows.len(), 1);
         let _ = std::fs::remove_file(path);
     }
 
@@ -5410,6 +7741,41 @@ mod tests {
                 serde_json::Value::Null,
                 serde_json::Value::String("false".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn duplicate_csv_headers_map_to_distinct_source_indexes() {
+        let parsed = parse_csv_bytes(b"name,name\nAda,Lovelace\n", 10).unwrap();
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "name".to_string(),
+                target_column: "first_name".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "name_1".to_string(),
+                target_column: "last_name".to_string(),
+                target_data_type: None,
+            },
+        ];
+
+        assert_eq!(parsed.columns, vec!["name", "name_1"]);
+        let batch = build_import_insert_batch_from_rows(
+            &parsed.rows,
+            &parsed.columns,
+            &mappings,
+            &[],
+            "people",
+            "public",
+            &DatabaseType::Postgres,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            batch.sql,
+            "INSERT INTO \"public\".\"people\" (\"first_name\", \"last_name\") VALUES\n('Ada', 'Lovelace')"
         );
     }
 
@@ -5684,6 +8050,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_csv_uses_the_same_unique_duplicate_headers_as_preview() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-duplicate-stream-{}.csv", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"name,name\nAda,Lovelace\n").unwrap();
+        let options = TableImportParseOptions::default();
+        let preview = parse_csv_bytes(b"name,name\nAda,Lovelace\n", 10).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+
+        stream_delimited_rows_to_channel(&path.to_string_lossy(), TableImportSourceFormat::Csv, &options, 500, sender)
+            .unwrap();
+
+        let messages =
+            std::iter::from_fn(|| receiver.blocking_recv()).map(|message| message.unwrap()).collect::<Vec<_>>();
+        assert!(
+            matches!(messages.first(), Some(DelimitedStreamMessage::Header(columns)) if columns == &preview.columns)
+        );
+        assert!(messages.iter().any(|message| {
+            matches!(message, DelimitedStreamMessage::Rows { rows, .. } if rows == &vec![vec![serde_json::json!("Ada"), serde_json::json!("Lovelace")]])
+        }));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn legacy_xls_uses_a_stricter_non_streaming_file_limit() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-limit-{}.xls", uuid::Uuid::new_v4()));
         let file = File::create(&path).unwrap();
@@ -5797,6 +8185,226 @@ mod tests {
         assert!(error.contains("configured for object rows"));
     }
 
+    fn sql_import_options(dialect: DatabaseType) -> TableImportParseOptions {
+        TableImportParseOptions { sql_dialect: Some(dialect), ..TableImportParseOptions::default() }
+    }
+
+    #[test]
+    fn parses_sql_insert_with_column_list_and_comments() {
+        let script = b"-- dump header comment\n\
+                       /*!40101 SET NAMES utf8mb4 */;\n\
+                       CREATE TABLE users (id INT, name TEXT);\n\
+                       /* block comment; with semicolon */\n\
+                       INSERT INTO `users` (`id`, `name`) VALUES (1, 'Ada'), (2, 'Bob');\n\
+                       INSERT INTO users (id, name) VALUES (3, 'Cathy');";
+        let options = sql_import_options(DatabaseType::Mysql);
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["id", "name"]);
+        assert_eq!(parsed.total_rows, 3);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+        assert_eq!(parsed.rows[2], vec![serde_json::json!(3), serde_json::json!("Cathy")]);
+    }
+
+    #[test]
+    fn parses_sql_insert_without_column_list_using_generated_columns() {
+        let script = b"INSERT INTO users VALUES (1, 'it''s'), (2, 'back\\'slash');";
+        let options = sql_import_options(DatabaseType::Mysql);
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+
+        assert_eq!(parsed.columns, vec!["column_1", "column_2"]);
+        assert_eq!(parsed.total_rows, 2);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!("it's")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!(2), serde_json::json!("back'slash")]);
+    }
+
+    #[test]
+    fn parses_sql_insert_value_kinds() {
+        let script = b"INSERT INTO t (a, b, c, d, e, f) VALUES \
+                       (NULL, TRUE, FALSE, -1.5, 3, '2026-01-01 10:00:00');";
+        let parsed = parse_sql_bytes(script, 10).unwrap();
+
+        assert_eq!(parsed.total_rows, 1);
+        assert_eq!(
+            parsed.rows[0],
+            vec![
+                serde_json::Value::Null,
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::json!(-1.5),
+                serde_json::json!(3),
+                serde_json::json!("2026-01-01 10:00:00"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_import_rejects_replace() {
+        let error = parse_sql_bytes(b"REPLACE INTO users (id) VALUES (1);", 10).unwrap_err();
+        assert!(error.contains("REPLACE"));
+    }
+
+    #[test]
+    fn sql_import_rejects_expressions() {
+        let error = parse_sql_bytes(b"INSERT INTO t (a) VALUES (NOW());", 10).unwrap_err();
+        assert!(error.contains("not supported"));
+    }
+
+    #[test]
+    fn sql_import_expands_literal_temporal_functions() {
+        let options = sql_import_options(DatabaseType::Oracle);
+        let script = b"INSERT INTO t (a, b, c) VALUES \
+            (TO_DATE('2021-09-08 09:06:25', 'YYYY-MM-DD HH24:MI:SS'), \
+             TO_TIMESTAMP('2021-09-08 09:06:25', 'YYYY-MM-DD HH24:MI:SS'), \
+             TIMESTAMP '2021-09-08 09:06:25');";
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+
+        assert_eq!(parsed.rows[0][0], serde_json::json!("2021-09-08 09:06:25"));
+        assert_eq!(parsed.rows[0][1], serde_json::json!("2021-09-08 09:06:25"));
+        assert_eq!(parsed.rows[0][2], serde_json::json!("2021-09-08 09:06:25"));
+    }
+
+    #[test]
+    fn sql_import_expands_typed_date_literal() {
+        let script = b"INSERT INTO t (a) VALUES (DATE '2021-09-08');";
+        let parsed = parse_sql_bytes(script, 10).unwrap();
+        assert_eq!(parsed.rows[0][0], serde_json::json!("2021-09-08"));
+    }
+
+    #[test]
+    fn sql_import_expands_temporal_function_generic_dialect() {
+        // 未指定目标方言（Generic）时也按函数名展开。
+        let script = b"INSERT INTO t (a) VALUES (TO_DATE('2021-09-08 09:06:25', 'YYYY-MM-DD HH24:MI:SS'));";
+        let parsed = parse_sql_bytes(script, 10).unwrap();
+        assert_eq!(parsed.rows[0][0], serde_json::json!("2021-09-08 09:06:25"));
+    }
+
+    #[test]
+    fn sql_import_rejects_temporal_function_with_non_literal_args() {
+        let options = sql_import_options(DatabaseType::Oracle);
+        // 列引用作为参数：无法无损展开，应拒绝而非静默改写。
+        let error =
+            parse_sql_bytes_with_options(b"INSERT INTO t (a) VALUES (TO_DATE(col, 'YYYY-MM-DD'));", &options, 10)
+                .unwrap_err();
+        assert!(error.contains("not supported"));
+    }
+
+    #[test]
+    fn sql_import_rejects_unlisted_function_still() {
+        // 非白名单函数（如 NOW()）仍按表达式拒绝。
+        let options = sql_import_options(DatabaseType::Mysql);
+        let error = parse_sql_bytes_with_options(b"INSERT INTO t (a) VALUES (NOW());", &options, 10).unwrap_err();
+        assert!(error.contains("not supported"));
+    }
+
+    #[test]
+    fn sql_import_rejects_binary_literals() {
+        let error = parse_sql_bytes(b"INSERT INTO t (a) VALUES (X'1A2B');", 10).unwrap_err();
+        assert!(error.contains("binary/hex"));
+    }
+
+    #[test]
+    fn sql_import_rejects_insert_select() {
+        let error = parse_sql_bytes(b"INSERT INTO t (a) SELECT a FROM other;", 10).unwrap_err();
+        assert!(error.contains("VALUES"));
+    }
+
+    #[test]
+    fn sql_import_postgres_treats_backslash_as_literal() {
+        // PostgreSQL 普通字符串中的反斜杠是字面量，不解释为转义。
+        let script = b"INSERT INTO t (a) VALUES ('a\\nb');";
+        let options = sql_import_options(DatabaseType::Postgres);
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("a\\nb")]);
+    }
+
+    #[test]
+    fn sql_import_mysql_decodes_backslash_escapes() {
+        // MySQL 普通字符串中的反斜杠转义（\n → 换行）。
+        let script = b"INSERT INTO t (a) VALUES ('a\\nb');";
+        let options = sql_import_options(DatabaseType::Mysql);
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("a\nb")]);
+    }
+
+    #[test]
+    fn sql_import_postgres_distinguishes_quoted_identifiers() {
+        // 加引号的 "Foo" 与未加引号的 foo 在 PostgreSQL 中是不同标识符。
+        let script = b"INSERT INTO t (\"Foo\", foo) VALUES (1, 2);";
+        let options = sql_import_options(DatabaseType::Postgres);
+        let parsed = parse_sql_bytes_with_options(script, &options, 10).unwrap();
+        assert_eq!(parsed.columns, vec!["Foo", "foo"]);
+    }
+
+    #[test]
+    fn sql_import_postgres_rejects_mismatched_quoted_column_lists() {
+        // "Foo" 与 foo 不同，不能合并为同一张表的列清单。
+        let script = b"INSERT INTO t (\"Foo\") VALUES (1); INSERT INTO t (foo) VALUES (2);";
+        let options = sql_import_options(DatabaseType::Postgres);
+        let error = parse_sql_bytes_with_options(script, &options, 10).unwrap_err();
+        assert!(error.contains("different column lists"));
+    }
+
+    #[test]
+    fn sql_import_rejects_multiple_tables() {
+        let script = b"INSERT INTO a VALUES (1); INSERT INTO b VALUES (2);";
+        let error = parse_sql_bytes(script, 10).unwrap_err();
+
+        assert!(error.contains("one table per file"));
+    }
+
+    #[test]
+    fn sql_import_rejects_row_arity_mismatch() {
+        let script = b"INSERT INTO t (a, b) VALUES (1, 2), (3);";
+        let error = parse_sql_bytes(script, 10).unwrap_err();
+
+        assert!(error.contains("expects 2 columns"));
+    }
+
+    #[test]
+    fn sql_import_rejects_file_without_insert_statements() {
+        let error = parse_sql_bytes(b"CREATE TABLE t (id INT); SET NAMES utf8;", 10).unwrap_err();
+
+        assert!(error.contains("No INSERT statements found"));
+    }
+
+    #[test]
+    fn sql_import_caps_preview_rows_but_counts_total() {
+        let script = b"INSERT INTO t (id) VALUES (1), (2), (3), (4), (5);";
+        let parsed = parse_sql_bytes(script, 2).unwrap();
+
+        assert_eq!(parsed.total_rows, 5);
+        assert_eq!(parsed.rows.len(), 2);
+    }
+
+    #[test]
+    fn sql_import_decodes_gbk_script() {
+        // INSERT INTO t (name) VALUES ('中文'); encoded as GBK
+        let mut script = b"INSERT INTO t (name) VALUES ('".to_vec();
+        script.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
+        script.extend_from_slice(b"');");
+        let options = TableImportParseOptions {
+            encoding: Some(TableImportTextEncoding::Gbk),
+            ..TableImportParseOptions::default()
+        };
+        let parsed = parse_sql_bytes_with_options(&script, &options, 10).unwrap();
+
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("中文")]);
+        assert_eq!(parsed.effective_encoding, Some(TableImportTextEncoding::Gbk));
+    }
+
+    #[test]
+    fn parses_sql_insert_with_semicolon_and_quote_inside_comments() {
+        // 注释里的分号与引号不能作为语句边界；字符串里的分号同理
+        let script = b"-- note: don't split; here\n\
+                       INSERT INTO t (a) VALUES ('a;b'), ('it -- not a comment');";
+        let parsed = parse_sql_bytes(script, 10).unwrap();
+
+        assert_eq!(parsed.total_rows, 2);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!("a;b")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!("it -- not a comment")]);
+    }
+
     #[test]
     fn parses_selected_excel_sheet() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-{}.xlsx", uuid::Uuid::new_v4()));
@@ -5805,13 +8413,17 @@ mod tests {
                 sheet_name: Some("First".to_string()),
                 columns: vec!["id".to_string()],
                 column_types: vec![],
+                column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
+                numeric_column_right_align: false,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
                 columns: vec!["name".to_string()],
                 column_types: vec![],
+                column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")]],
+                numeric_column_right_align: false,
             },
         ])
         .unwrap();
@@ -5847,13 +8459,17 @@ mod tests {
                 sheet_name: Some("First".to_string()),
                 columns: vec!["id".to_string()],
                 column_types: vec![],
+                column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
+                numeric_column_right_align: false,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
                 columns: vec!["name".to_string()],
                 column_types: vec![],
+                column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")], vec![serde_json::json!("Grace")]],
+                numeric_column_right_align: false,
             },
         ])
         .unwrap();
@@ -5892,6 +8508,73 @@ mod tests {
         drop(strings);
         drop(zip);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn xlsx_shared_strings_validation_reports_progress_and_cancels_before_header() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-shared-cancel-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A2"/>
+  <sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let shared_items =
+            (0..8192).map(|index| format!("<si><t>{index:04}-{}</t></si>", "x".repeat(512))).collect::<String>();
+        let shared_strings_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="8193" uniqueCount="8193">
+  <si><t>name</t></si>{shared_items}
+</sst>"#
+        );
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, Some(&shared_strings_xml))).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_check = cancelled.clone();
+        let cancelled_on_progress = cancelled.clone();
+        let cancel_requested_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let cancel_requested_on_progress = cancel_requested_at.clone();
+        let mut progress = Vec::new();
+
+        let error = validate_xlsx_worksheet_for_import(
+            path.to_string_lossy().to_string(),
+            TableImportParseOptions::default(),
+            None,
+            HashSet::new(),
+            "shared-strings-cancel",
+            &move |_| {
+                let cancelled = cancelled_for_check.clone();
+                Box::pin(async move { cancelled.load(Ordering::Acquire) })
+            },
+            |bytes_read| {
+                progress.push(bytes_read);
+                let mut requested_at = cancel_requested_on_progress.lock().unwrap();
+                if requested_at.is_none() {
+                    *requested_at = Some(Instant::now());
+                }
+                cancelled_on_progress.store(true, Ordering::Release);
+            },
+        )
+        .await
+        .unwrap_err();
+        let cancel_latency = cancel_requested_at
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("cancellation must be requested during shared strings preprocessing")
+            .elapsed();
+
+        assert_eq!(error, "Import cancelled");
+        assert!(!progress.is_empty(), "shared strings preprocessing must report progress before the header");
+        assert!(progress.windows(2).all(|window| window[0] <= window[1]));
+        assert!(cancel_latency < Duration::from_secs(1), "cancellation took {cancel_latency:?} after the request");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn xlsx_two_pass_progress_is_monotonic_and_reserves_half_for_each_pass() {
+        assert_eq!(xlsx_import_pass_progress(0, 101, false), 0);
+        assert_eq!(xlsx_import_pass_progress(101, 101, false), 50);
+        assert_eq!(xlsx_import_pass_progress(0, 101, true), 50);
+        assert_eq!(xlsx_import_pass_progress(101, 101, true), 101);
     }
 
     #[test]
@@ -5994,10 +8677,12 @@ mod tests {
             sheet_name: Some("Rows".to_string()),
             columns: vec!["id".to_string(), "name".to_string()],
             column_types: vec![],
+            column_comments: vec![],
             rows: vec![
                 vec![serde_json::json!(1), serde_json::json!("Ada")],
                 vec![serde_json::json!(2), serde_json::json!("Grace")],
             ],
+            numeric_column_right_align: false,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -6030,8 +8715,8 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
         assert_eq!(streamed_rows.len(), 2);
-        assert_eq!(streamed_rows[0], vec![serde_json::json!(1.0), serde_json::json!("Ada")]);
-        assert_eq!(streamed_rows[1], vec![serde_json::json!(2.0), serde_json::json!("Grace")]);
+        assert_eq!(streamed_rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+        assert_eq!(streamed_rows[1], vec![serde_json::json!(2), serde_json::json!("Grace")]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6349,12 +9034,14 @@ mod tests {
             sheet_name: Some("Rows".to_string()),
             columns: vec!["report".to_string(), "ignored".to_string()],
             column_types: vec![],
+            column_comments: vec![],
             rows: vec![
                 vec![serde_json::json!("id"), serde_json::json!("name")],
                 vec![serde_json::json!(1), serde_json::json!("Ada")],
                 vec![serde_json::json!(2), serde_json::json!("Grace")],
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
+            numeric_column_right_align: false,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -6382,8 +9069,8 @@ mod tests {
         assert_eq!(
             streamed_rows,
             vec![
-                vec![serde_json::json!(1.0), serde_json::json!("Ada")],
-                vec![serde_json::json!(2.0), serde_json::json!("Grace")],
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
             ]
         );
         let _ = std::fs::remove_file(path);
@@ -6449,10 +9136,7 @@ mod tests {
                 streamed_rows.extend(rows);
             }
         }
-        assert_eq!(
-            streamed_rows,
-            vec![vec![serde_json::json!(7.0), serde_json::Value::Null, serde_json::json!("Ada")]]
-        );
+        assert_eq!(streamed_rows, vec![vec![serde_json::json!(7), serde_json::Value::Null, serde_json::json!("Ada")]]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6478,7 +9162,7 @@ mod tests {
 
         assert_eq!(preview.columns, parsed.columns);
         assert_eq!(preview.rows, parsed.rows);
-        assert_eq!(preview.rows, vec![vec![serde_json::json!(7.0), serde_json::json!("Ada")]]);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(7), serde_json::json!("Ada")]]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6505,7 +9189,7 @@ mod tests {
         assert_eq!(preview.columns, parsed.columns);
         assert_eq!(preview.rows, parsed.rows);
         assert_eq!(preview.columns, vec!["id", "column_2", "name"]);
-        assert_eq!(preview.rows, vec![vec![serde_json::json!(7.0), serde_json::Value::Null, serde_json::json!("Ada")]]);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(7), serde_json::Value::Null, serde_json::json!("Ada")]]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6562,7 +9246,7 @@ mod tests {
         assert_eq!(preview.columns, parsed.columns);
         assert_eq!(preview.rows, parsed.rows);
         assert_eq!(preview.columns, vec!["id", "name"]);
-        assert_eq!(preview.rows, vec![vec![serde_json::json!(8.0), serde_json::json!("Grace")]]);
+        assert_eq!(preview.rows, vec![vec![serde_json::json!(8), serde_json::json!("Grace")]]);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6601,6 +9285,188 @@ mod tests {
         assert_eq!(display(12.5, "["), "12.5");
     }
 
+    fn postgres_import_batches(
+        rows: Vec<Vec<serde_json::Value>>,
+        target_types: &[(&str, &str)],
+    ) -> Vec<ImportSqlBatch> {
+        let data = ParsedImportFile {
+            columns: target_types.iter().map(|(column, _)| column.to_string()).collect(),
+            rows,
+            total_rows: 1,
+            effective_encoding: None,
+        };
+        let mappings = target_types
+            .iter()
+            .map(|(column, _)| TableImportColumnMapping {
+                source_column: column.to_string(),
+                target_column: column.to_string(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+        let target_column_types = target_types
+            .iter()
+            .map(|(column, data_type)| (column.to_string(), data_type.to_string()))
+            .collect::<Vec<_>>();
+        build_import_insert_batches(
+            &data,
+            &mappings,
+            &target_column_types,
+            "issue_6491",
+            "",
+            &DatabaseType::Postgres,
+            500,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn postgres_import_converts_valid_thousands_separators_for_numeric_targets() {
+        for (value, data_type, expected) in [
+            ("1,234.56", "numeric(18,2)", "'1234.56'"),
+            ("-1,234.56", "numeric(18,2)", "'-1234.56'"),
+            ("+1,234.56", "numeric(18,2)", "'1234.56'"),
+            ("1,234.00", "numeric(18,2)", "'1234.00'"),
+            ("1,234,567.89", "decimal(12,2)", "'1234567.89'"),
+            ("1,234", "bigint", "'1234'"),
+            ("12,345", "integer", "'12345'"),
+            ("1,234,567,890", "bigint", "'1234567890'"),
+            ("1,234.5", "double precision", "'1234.5'"),
+            ("1,234.5", "real", "'1234.5'"),
+        ] {
+            let batches = postgres_import_batches(vec![vec![serde_json::json!(value)]], &[("amount", data_type)]);
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n({expected})"),
+                "{value} -> {data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_import_preserves_thousands_separators_for_text_targets() {
+        for data_type in ["varchar(64)", "text"] {
+            let batches = postgres_import_batches(vec![vec![serde_json::json!("1,234.56")]], &[("amount", data_type)]);
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1,234.56')"),
+                "{data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_import_keeps_malformed_grouping_untouched() {
+        for value in ["1,23,4", "12,34.56", "1,,234", ",123", "123,", "1,234,", "1,234.5.6", "abc,123", "1,234abc"] {
+            let batches = postgres_import_batches(vec![vec![serde_json::json!(value)]], &[("amount", "numeric(18,2)")]);
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('{value}')"),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_import_keeps_plain_numeric_and_empty_values_unchanged() {
+        for (value, data_type, expected) in [
+            (serde_json::json!("1234.56"), "numeric(18,2)", "'1234.56'"),
+            (serde_json::json!("0"), "numeric(18,2)", "'0'"),
+            (serde_json::json!("1234.56"), "bigint", "'1234.56'"),
+            (serde_json::json!(1234.56), "numeric(18,2)", "1234.56"),
+        ] {
+            let label = value.to_string();
+            let batches = postgres_import_batches(vec![vec![value]], &[("amount", data_type)]);
+            assert_eq!(
+                batches[0].sql,
+                format!("INSERT INTO \"issue_6491\" (\"amount\") VALUES\n({expected})"),
+                "{label} -> {data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_copy_import_uses_canonical_numeric_text() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["amount".to_string()],
+            column_types: vec![Some("numeric(18,2)".to_string())],
+        };
+        let (_, data) =
+            build_postgres_copy_text_batch(&[vec![serde_json::json!("1,234.56")]], &plan, "issue_6491", "", None)
+                .unwrap();
+        assert_eq!(data, b"1234.56\n");
+    }
+
+    #[test]
+    fn excel_text_cell_with_thousands_separator_imports_to_postgres_numeric() {
+        let path = std::env::temp_dir().join(format!("dbx-table-import-6491-{}.xlsx", uuid::Uuid::new_v4()));
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A3"/>
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>amount</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>1,234.56</t></is></c></row>
+    <row r="3"><c r="A3" t="inlineStr"><is><t>-1,234</t></is></c></row>
+  </sheetData>
+</worksheet>"#;
+        std::fs::write(&path, build_preview_test_xlsx(sheet_xml, None)).unwrap();
+        let options = TableImportParseOptions::default();
+
+        let data = parse_xlsx_file_with_options(&path.to_string_lossy(), &options, 10).unwrap();
+        assert_eq!(data.rows, vec![vec![serde_json::json!("1,234.56")], vec![serde_json::json!("-1,234")]]);
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "amount".to_string(),
+            target_column: "amount".to_string(),
+            target_data_type: None,
+        }];
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("amount".to_string(), "numeric(18,2)".to_string())],
+            "issue_6491",
+            "",
+            &DatabaseType::Postgres,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(batches[0].sql, "INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1234.56'),\n('-1234')");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn csv_thousands_separator_uses_same_numeric_normalization() {
+        let parsed = parse_csv_bytes(b"amount\n\"1,234.56\"\n\"12,345\"\n", 10).unwrap();
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "amount".to_string(),
+            target_column: "amount".to_string(),
+            target_data_type: None,
+        }];
+        let batches = build_import_insert_batches(
+            &parsed,
+            &mappings,
+            &[("amount".to_string(), "numeric(18,2)".to_string())],
+            "issue_6491",
+            "",
+            &DatabaseType::Postgres,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(batches[0].sql, "INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1234.56'),\n('12345')");
+        let text_batches = build_import_insert_batches(
+            &parsed,
+            &mappings,
+            &[("amount".to_string(), "varchar(32)".to_string())],
+            "issue_6491",
+            "",
+            &DatabaseType::Postgres,
+            500,
+        )
+        .unwrap();
+        assert_eq!(text_batches[0].sql, "INSERT INTO \"issue_6491\" (\"amount\") VALUES\n('1,234.56'),\n('12,345')");
+    }
+
     #[test]
     fn formats_only_excel_columns_mapped_to_text_targets() {
         let path = std::env::temp_dir().join(format!("dbx-table-import-display-formats-{}.xlsx", uuid::Uuid::new_v4()));
@@ -6636,7 +9502,7 @@ mod tests {
                 serde_json::json!("12.5%"),
                 serde_json::json!("€1.234,50"),
                 serde_json::json!("1,234.50"),
-                serde_json::json!(10.0),
+                serde_json::json!(10),
             ]
         );
         let _ = std::fs::remove_file(path);
@@ -6693,15 +9559,54 @@ mod tests {
     fn borrowed_excel_cells_preserve_owned_cell_conversion_semantics() {
         let shared_string = DataRef::SharedString("Ada");
         let number = DataRef::Float(42.5);
+        let integer = DataRef::Float(42.0);
         let date = DataRef::DateTime(ExcelDateTime::new(45996.0, calamine::ExcelDateTimeType::DateTime, false));
 
         assert_eq!(xlsx_cell_ref_label_with_temporal_kind(&shared_string, None), "Ada");
-        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&shared_string, None), serde_json::json!("Ada"));
-        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&number, None), serde_json::json!(42.5));
+        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&shared_string, None, true), serde_json::json!("Ada"));
+        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&number, None, true), serde_json::json!(42.5));
+        assert_eq!(xlsx_cell_ref_value_with_temporal_kind(&integer, None, true), serde_json::json!(42));
         assert_eq!(
-            xlsx_cell_ref_value_with_temporal_kind(&date, Some(XlsxTemporalKind::Date)),
+            xlsx_cell_ref_value_with_temporal_kind(&date, Some(XlsxTemporalKind::Date), true),
             serde_json::json!("2025-12-05")
         );
+    }
+
+    #[test]
+    fn excel_zero_fraction_numbers_infer_integer_columns() {
+        let path =
+            std::env::temp_dir().join(format!("dbx-table-import-integer-inference-{}.xlsx", uuid::Uuid::new_v4()));
+        let workbook = build_xlsx_workbook_multi(&[XlsxWorksheetData {
+            sheet_name: Some("Numbers".to_string()),
+            columns: vec!["id".to_string(), "amount".to_string()],
+            column_types: vec![],
+            column_comments: vec![],
+            rows: vec![
+                vec![serde_json::json!(1), serde_json::json!(1.5)],
+                vec![serde_json::json!(2), serde_json::json!(2.25)],
+            ],
+            numeric_column_right_align: false,
+        }])
+        .unwrap();
+        std::fs::write(&path, workbook).unwrap();
+
+        let parsed =
+            parse_xlsx_file_with_options(&path.to_string_lossy(), &TableImportParseOptions::default(), 10).unwrap();
+        let mappings = parsed
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping {
+                source_column: column.clone(),
+                target_column: column.clone(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+        let plan = build_import_create_table_plan(&parsed, &mappings, "numbers", "app", &DatabaseType::Mysql).unwrap();
+
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!(1.5)]);
+        assert_eq!(plan.columns[0].data_type, "BIGINT");
+        assert_eq!(plan.columns[1].data_type, "DOUBLE");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -6772,12 +9677,14 @@ mod tests {
             sheet_name: Some("Rows".to_string()),
             columns: vec!["report".to_string(), "ignored".to_string()],
             column_types: vec![],
+            column_comments: vec![],
             rows: vec![
                 vec![serde_json::json!("id"), serde_json::json!("name")],
                 vec![serde_json::json!(1), serde_json::json!("Ada")],
                 vec![serde_json::json!(2), serde_json::json!("Grace")],
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
+            numeric_column_right_align: false,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -6792,8 +9699,8 @@ mod tests {
 
         assert_eq!(parsed.columns, vec!["id", "name"]);
         assert_eq!(parsed.total_rows, 2);
-        assert_eq!(parsed.rows[0], vec![serde_json::json!(1.0), serde_json::json!("Ada")]);
-        assert_eq!(parsed.rows[1], vec![serde_json::json!(2.0), serde_json::json!("Grace")]);
+        assert_eq!(parsed.rows[0], vec![serde_json::json!(1), serde_json::json!("Ada")]);
+        assert_eq!(parsed.rows[1], vec![serde_json::json!(2), serde_json::json!("Grace")]);
         assert_eq!(preview.rows, parsed.rows);
         let _ = std::fs::remove_file(path);
     }
@@ -6899,6 +9806,49 @@ mod tests {
     }
 
     #[test]
+    fn create_table_plan_uses_sqlserver_float_for_inferred_decimals() {
+        let data = ParsedImportFile {
+            columns: vec![
+                "id".to_string(),
+                "active".to_string(),
+                "amount".to_string(),
+                "created_at".to_string(),
+                "notes".to_string(),
+            ],
+            rows: vec![vec![
+                serde_json::json!(1001),
+                serde_json::json!(true),
+                serde_json::json!("12.5"),
+                serde_json::json!("2026-07-07 08:15:00"),
+                serde_json::json!("invoice"),
+            ]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+        let mappings = data
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping {
+                source_column: column.clone(),
+                target_column: column.clone(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+
+        let plan =
+            build_import_create_table_plan(&data, &mappings, "invoices", "dbo", &DatabaseType::SqlServer).unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "CREATE TABLE [dbo].[invoices] (\n  [id] BIGINT,\n  [active] BIT,\n  [amount] FLOAT,\n  [created_at] DATETIME2,\n  [notes] NVARCHAR(MAX)\n)"
+        );
+        assert_eq!(decimal_data_type(&DatabaseType::Mysql), "DOUBLE");
+        assert_eq!(decimal_data_type(&DatabaseType::Postgres), "DOUBLE PRECISION");
+        assert_eq!(decimal_data_type(&DatabaseType::Sqlite), "REAL");
+        assert_eq!(decimal_data_type(&DatabaseType::Oracle), "BINARY_DOUBLE");
+    }
+
+    #[test]
     fn create_table_plan_uses_user_defined_column_type() {
         let data = ParsedImportFile {
             columns: vec!["code".to_string(), "amount".to_string()],
@@ -6929,6 +9879,38 @@ mod tests {
                 ImportCreateTableColumn { name: "amount".to_string(), data_type: "DECIMAL(10,2)".to_string() },
             ]
         );
+    }
+
+    #[test]
+    fn create_table_plan_defaults_length_for_bare_varchar_on_mysql_family() {
+        let data = ParsedImportFile {
+            columns: vec!["name".to_string()],
+            rows: vec![vec![serde_json::json!("Ada")]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "name".to_string(),
+            target_column: "name".to_string(),
+            target_data_type: Some("VARCHAR".to_string()),
+        }];
+
+        for db_type in [
+            DatabaseType::Mysql,
+            DatabaseType::Doris,
+            DatabaseType::StarRocks,
+            DatabaseType::Goldendb,
+            DatabaseType::Sundb,
+        ] {
+            let plan = build_import_create_table_plan(&data, &mappings, "users", "", &db_type).unwrap();
+            assert_eq!(plan.columns[0].data_type, "VARCHAR(255)", "{db_type:?} should default a length");
+        }
+
+        // PostgreSQL allows a bare, unparameterized VARCHAR (unlimited length),
+        // so it must be left untouched.
+        let plan =
+            build_import_create_table_plan(&data, &mappings, "users", "public", &DatabaseType::Postgres).unwrap();
+        assert_eq!(plan.columns[0].data_type, "VARCHAR");
     }
 
     #[test]
@@ -7020,6 +10002,7 @@ mod tests {
         assert_eq!(effective_import_batch_size(&DatabaseType::OceanbaseOracle, 1000), 1);
         assert_eq!(effective_import_batch_size(&DatabaseType::Iris, 1000), 1);
         assert_eq!(effective_import_batch_size(&DatabaseType::CloudflareD1, 1000), 100);
+        assert_eq!(effective_import_batch_size(&DatabaseType::SqlServer, 1001), 1000);
         assert_eq!(effective_import_batch_size(&DatabaseType::Postgres, 1000), 1000);
         assert_eq!(effective_import_batch_size(&DatabaseType::Mysql, 1000), 1000);
     }
@@ -7102,6 +10085,583 @@ mod tests {
     }
 
     #[test]
+    fn postgres_copy_accumulator_keeps_rows_across_producer_chunks() {
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 10, 100);
+
+        accumulator.append_row(b"aa\n");
+        assert!(!accumulator.should_flush_before(4));
+        accumulator.append_row(b"bbb\n");
+
+        assert_eq!(accumulator.row_count(), 2);
+        assert_eq!(accumulator.data(), b"aa\nbbb\n");
+    }
+
+    #[test]
+    fn postgres_copy_accumulator_flushes_before_exceeding_byte_target() {
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 8, 100);
+        accumulator.append_row(b"first\n");
+
+        assert!(accumulator.should_flush_before(4));
+        let batch = accumulator.take_batch().unwrap();
+        assert_eq!(batch.row_count, 1);
+        assert_eq!(batch.data, b"first\n");
+        assert!(accumulator.is_empty());
+    }
+
+    #[test]
+    fn postgres_copy_accumulator_flushes_single_row_over_target_and_at_eof() {
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 4, 100);
+
+        assert!(!accumulator.should_flush_before(9));
+        accumulator.append_row(b"oversize\n");
+        assert!(accumulator.should_flush_after_append());
+
+        let batch = accumulator.take_batch().unwrap();
+        assert_eq!(batch.row_count, 1);
+        assert_eq!(batch.data, b"oversize\n");
+        assert_eq!(batch.sql, "COPY items");
+    }
+
+    #[test]
+    fn postgres_copy_accumulator_reuses_successful_batch_buffer() {
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 8, 100);
+        accumulator.append_row(b"12345678");
+        let batch = accumulator.take_batch().unwrap();
+        let batch_capacity = batch.data.capacity();
+
+        accumulator.recycle_batch_buffer(batch.data);
+
+        assert!(accumulator.is_empty());
+        assert_eq!(accumulator.data.capacity(), batch_capacity);
+    }
+
+    #[test]
+    fn postgres_copy_accumulator_discards_excessively_large_batch_buffer() {
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 8, 100);
+        let oversized = Vec::with_capacity(32);
+
+        accumulator.recycle_batch_buffer(oversized);
+
+        assert!(accumulator.data.capacity() <= 16);
+    }
+
+    fn sqlserver_test_column(
+        name: &str,
+        data_type: &str,
+        is_identity: bool,
+        is_computed: bool,
+        is_hidden: bool,
+    ) -> crate::db::sqlserver::SqlServerColumnMetadata {
+        crate::db::sqlserver::SqlServerColumnMetadata {
+            column: crate::db::ColumnInfo {
+                name: name.to_string(),
+                data_type: data_type.to_string(),
+                ..Default::default()
+            },
+            is_identity,
+            is_computed,
+            is_hidden,
+            generated_always_type: i32::from(is_hidden),
+        }
+    }
+
+    #[test]
+    fn sqlserver_bulk_plan_uses_staging_conversions_and_identity_scope() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0, 1, 2, 3, 4],
+            target_columns: vec!["id", "occurred_at", "amount", "name", "payload"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            column_types: vec![None; 5],
+        };
+        let metadata = vec![
+            sqlserver_test_column("id", "int", true, false, false),
+            sqlserver_test_column("occurred_at", "datetime2(7)", false, false, false),
+            sqlserver_test_column("amount", "decimal(38,10)", false, false, false),
+            sqlserver_test_column("name", "nvarchar(100)", false, false, false),
+            sqlserver_test_column("payload", "varbinary(max)", false, false, false),
+        ];
+
+        let plan = compile_sqlserver_bulk_import_plan(&import_plan, &metadata, "events", "dbo").unwrap();
+        let sql = plan.batch_sql("#dbx_import_test", true);
+
+        assert!(plan.requires_identity_insert);
+        assert!(sql.create_staging.contains("[c0] NVARCHAR(MAX) NULL"));
+        assert!(sql.write_target.contains("SET IDENTITY_INSERT [dbo].[events] ON"));
+        assert!(sql.write_target.contains("CONVERT(datetime2(7), [c1])"));
+        assert!(sql.write_target.contains("CONVERT(decimal(38,10), [c2])"));
+        assert!(sql.write_target.contains("CONVERT(nvarchar(100), [c3])"));
+        assert!(sql.write_target.contains("CONVERT(varbinary(max), [c4], 1)"));
+        assert!(sql.write_target.contains("BEGIN TRANSACTION"));
+        assert!(sql.write_target.contains("TRUNCATE TABLE [dbo].[events]"));
+        assert!(sql.write_target.contains("ROLLBACK TRANSACTION"));
+    }
+
+    #[test]
+    fn sqlserver_bulk_binary_route_accepts_only_unambiguous_hex_values() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("varbinary(max)".to_string())],
+        };
+        let bulk_plan = SqlServerBulkImportPlan {
+            target_table: "[dbo].[events]".to_string(),
+            target_columns: vec!["payload".to_string()],
+            target_types: vec!["varbinary(max)".to_string()],
+            requires_identity_insert: false,
+        };
+
+        for value in [
+            serde_json::json!("plain"),
+            serde_json::json!("0xabc"),
+            serde_json::json!("0xnothex"),
+            serde_json::json!(" 0x00ff "),
+            serde_json::json!("0X00ff"),
+            serde_json::json!(7),
+        ] {
+            assert!(sqlserver_bulk_plans_for_rows(
+                &DatabaseType::SqlServer,
+                Some(&import_plan),
+                Some(&bulk_plan),
+                &[vec![value]],
+            )
+            .is_none());
+        }
+        assert!(sqlserver_bulk_plans_for_rows(
+            &DatabaseType::SqlServer,
+            Some(&import_plan),
+            Some(&bulk_plan),
+            &[vec![serde_json::json!("0x00ff")], vec![serde_json::Value::Null]],
+        )
+        .is_some());
+
+        let fallback = build_import_insert_batches_with_plan(
+            &[vec![serde_json::json!("plain")]],
+            &import_plan,
+            "events",
+            "dbo",
+            &DatabaseType::SqlServer,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fallback[0].sql,
+            "INSERT INTO [dbo].[events] ([payload]) VALUES\n(CONVERT(varbinary(max), N'plain'))"
+        );
+    }
+
+    #[test]
+    fn sqlserver_bulk_identity_truncate_turns_identity_insert_off_before_commit() {
+        let plan = SqlServerBulkImportPlan {
+            target_table: "[dbo].[events]".to_string(),
+            target_columns: vec!["id".to_string()],
+            target_types: vec!["int".to_string()],
+            requires_identity_insert: true,
+        };
+
+        let sql = plan.batch_sql("#dbx_import_test", true).write_target;
+        let identity_on = sql.find("SET IDENTITY_INSERT [dbo].[events] ON").unwrap();
+        let insert = sql.find("INSERT INTO [dbo].[events]").unwrap();
+        let identity_off = sql.find("SET IDENTITY_INSERT [dbo].[events] OFF").unwrap();
+        let commit = sql.find("COMMIT TRANSACTION").unwrap();
+
+        assert!(identity_on < insert);
+        assert!(insert < identity_off);
+        assert!(identity_off < commit);
+    }
+
+    #[test]
+    fn sqlserver_bulk_identity_append_commits_only_after_identity_insert_is_off() {
+        let plan = SqlServerBulkImportPlan {
+            target_table: "[dbo].[events]".to_string(),
+            target_columns: vec!["id".to_string()],
+            target_types: vec!["int".to_string()],
+            requires_identity_insert: true,
+        };
+
+        let sql = plan.batch_sql("#dbx_import_test", false).write_target;
+        let transaction = sql.find("BEGIN TRANSACTION").unwrap();
+        let insert = sql.find("INSERT INTO [dbo].[events]").unwrap();
+        let identity_off = sql.find("SET IDENTITY_INSERT [dbo].[events] OFF").unwrap();
+        let commit = sql.find("COMMIT TRANSACTION").unwrap();
+
+        assert!(transaction < insert);
+        assert!(insert < identity_off);
+        assert!(identity_off < commit);
+    }
+
+    #[test]
+    fn sqlserver_bulk_plan_omits_unmapped_identity_and_default_columns() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["name".to_string()],
+            column_types: vec![None],
+        };
+        let metadata = vec![
+            sqlserver_test_column("id", "int", true, false, false),
+            sqlserver_test_column("name", "nvarchar(100)", false, false, false),
+            sqlserver_test_column("created_at", "datetime2(7)", false, false, false),
+        ];
+
+        let plan = compile_sqlserver_bulk_import_plan(&import_plan, &metadata, "events", "dbo").unwrap();
+        let sql = plan.batch_sql("#dbx_import_test", false);
+
+        assert!(!plan.requires_identity_insert);
+        assert!(sql.write_target.contains("INSERT INTO [dbo].[events] ([name])"));
+        assert!(!sql.write_target.contains("[id],"));
+        assert!(!sql.write_target.contains("[created_at]"));
+    }
+
+    #[test]
+    fn sqlserver_bulk_plan_rejects_non_insertable_and_unsupported_columns() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["version".to_string()],
+            column_types: vec![None],
+        };
+
+        let rowversion = vec![sqlserver_test_column("version", "rowversion", false, false, false)];
+        let error = compile_sqlserver_bulk_import_plan(&import_plan, &rowversion, "events", "dbo").unwrap_err();
+        assert!(error.contains("rowversion"));
+
+        let computed = vec![sqlserver_test_column("version", "int", false, true, false)];
+        let error = compile_sqlserver_bulk_import_plan(&import_plan, &computed, "events", "dbo").unwrap_err();
+        assert!(error.contains("computed"));
+
+        let hidden = vec![sqlserver_test_column("version", "datetime2(7)", false, false, true)];
+        let error = compile_sqlserver_bulk_import_plan(&import_plan, &hidden, "events", "dbo").unwrap_err();
+        assert!(error.contains("hidden/generated"));
+    }
+
+    #[test]
+    fn sqlserver_bulk_rows_are_textual_and_reject_structured_values_before_write() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0, 1, 2],
+            target_columns: vec!["enabled", "amount", "name"].into_iter().map(str::to_string).collect(),
+            column_types: vec![Some("bit".to_string()), Some("decimal(38,10)".to_string()), None],
+        };
+        let row = vec![serde_json::json!(true), serde_json::json!("12.3400"), serde_json::Value::Null];
+
+        assert_eq!(
+            sqlserver_bulk_text_row(&row, &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap(),
+            vec![Some("1".to_string()), Some("12.3400".to_string()), None]
+        );
+
+        let structured = vec![serde_json::json!({"nested": true}), serde_json::json!(1), serde_json::json!("x")];
+        assert!(sqlserver_bulk_text_row(&structured, &import_plan, None, 0, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+            .unwrap_err()
+            .contains("structured"));
+    }
+
+    #[test]
+    fn sqlserver_bulk_normalizes_zero_fraction_values_for_integer_targets() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0, 1, 2],
+            target_columns: vec!["id".to_string(), "enabled".to_string(), "amount".to_string()],
+            column_types: vec![Some("bigint".to_string()), Some("bit".to_string()), Some("decimal(10,2)".to_string())],
+        };
+
+        assert_eq!(
+            sqlserver_bulk_text_row(
+                &[serde_json::json!(1.0), serde_json::json!(0.0), serde_json::json!(3.0)],
+                &plan,
+                None,
+                0,
+                SQLSERVER_BULK_ROW_MEMORY_BYTES,
+            )
+            .unwrap(),
+            vec![Some("1".to_string()), Some("0".to_string()), Some("3.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn sqlserver_bulk_converts_wide_large_batches_one_row_at_a_time() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("nvarchar(max)".to_string())],
+        };
+        let wide_value = "x".repeat(1024 * 1024);
+        let rows = (0..32).map(|_| vec![serde_json::json!(&wide_value)]).collect::<Vec<_>>();
+
+        for (row_index, row) in rows.iter().enumerate() {
+            let converted =
+                sqlserver_bulk_text_row(row, &plan, None, row_index, SQLSERVER_BULK_ROW_MEMORY_BYTES).unwrap();
+            assert_eq!(converted[0].as_deref(), Some(wide_value.as_str()));
+            drop(converted);
+        }
+    }
+
+    #[test]
+    fn sqlserver_bulk_rejects_a_single_row_over_the_converted_memory_limit_before_cloning() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("nvarchar(max)".to_string())],
+        };
+        let value = "x".repeat(SQLSERVER_BULK_ROW_MEMORY_BYTES / 3 + 1);
+
+        let error =
+            sqlserver_bulk_text_row(&[serde_json::json!(value)], &plan, None, 6, SQLSERVER_BULK_ROW_MEMORY_BYTES)
+                .unwrap_err();
+
+        assert!(error.contains("row 7"));
+        assert!(error.contains("converted bytes"));
+        assert!(error.contains(&SQLSERVER_BULK_ROW_MEMORY_BYTES.to_string()));
+    }
+
+    #[test]
+    fn sqlserver_bulk_route_requires_native_plan_and_scalar_rows() {
+        let import_plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["name".to_string()],
+            column_types: vec![Some("nvarchar(100)".to_string())],
+        };
+        let bulk_plan = SqlServerBulkImportPlan {
+            target_table: "[dbo].[events]".to_string(),
+            target_columns: vec!["name".to_string()],
+            target_types: vec!["nvarchar(100)".to_string()],
+            requires_identity_insert: false,
+        };
+        let scalar_rows = vec![vec![serde_json::json!("Tieng Viet")]];
+        let structured_rows = vec![vec![serde_json::json!({"nested": true})]];
+
+        assert!(sqlserver_bulk_plans_for_rows(
+            &DatabaseType::SqlServer,
+            Some(&import_plan),
+            Some(&bulk_plan),
+            &scalar_rows,
+        )
+        .is_some());
+        assert!(
+            sqlserver_bulk_plans_for_rows(&DatabaseType::SqlServer, Some(&import_plan), None, &scalar_rows).is_none()
+        );
+        assert!(sqlserver_bulk_plans_for_rows(
+            &DatabaseType::Postgres,
+            Some(&import_plan),
+            Some(&bulk_plan),
+            &scalar_rows,
+        )
+        .is_none());
+        assert!(sqlserver_bulk_plans_for_rows(
+            &DatabaseType::SqlServer,
+            Some(&import_plan),
+            Some(&bulk_plan),
+            &structured_rows,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn import_rows_batch_cancellation_is_distinct_from_write_failures() {
+        let cancelled = ImportRowsBatchError::cancelled(3);
+        let failed = ImportRowsBatchError::with_rows_imported(2, "constraint failed");
+
+        assert!(cancelled.cancelled);
+        assert_eq!(cancelled.rows_imported, 3);
+        assert_eq!(cancelled.message, "Import cancelled");
+        assert!(!failed.cancelled);
+        assert_eq!(failed.rows_imported, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_staging_cleanup_failure_invalidates_cached_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "sqlserver-cleanup-failure";
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(sqlite));
+
+        invalidate_sqlserver_pool_after_staging_cleanup_failure(
+            &state,
+            pool_key,
+            (),
+            "#dbx_import_test",
+            "connection closed",
+        )
+        .await;
+
+        assert!(!state.connections.read().await.contains_key(pool_key));
+    }
+
+    #[test]
+    fn sqlserver_cleanup_failure_after_successful_write_reports_committed_rows() {
+        let error = sqlserver_staging_cleanup_error_after_target_write(None, 3, "connection closed");
+
+        assert_eq!(error.rows_imported, 3);
+        assert!(!error.cancelled);
+        assert!(error.message.contains("after writing 3 rows"));
+    }
+
+    #[test]
+    fn sqlserver_cleanup_failure_after_failed_write_reports_both_errors() {
+        let error =
+            sqlserver_staging_cleanup_error_after_target_write(Some("constraint failed"), 3, "connection closed");
+
+        assert_eq!(error.rows_imported, 0);
+        assert!(error.message.contains("constraint failed"));
+        assert!(error.message.contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn sql_sub_batches_stop_before_the_next_write_when_cancelled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let pool_key = "cancel-sql-sub-batches:session:import";
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        crate::db::sqlite::execute_query(&sqlite, "CREATE TABLE items (payload TEXT)").await.unwrap();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(sqlite.clone()));
+
+        let rows =
+            vec![vec![serde_json::json!("a".repeat(300 * 1024))], vec![serde_json::json!("b".repeat(300 * 1024))]];
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["payload".to_string()],
+            column_types: vec![Some("text".to_string())],
+        };
+        let cancellation_checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_import = cancellation_checks.clone();
+        let mut postgres_copy_accumulator = None;
+        let mut sqlite_append_transaction = None;
+        let mut db_write_ms = 0;
+        let mut statement_count = 0;
+
+        let error = execute_import_rows_batch(
+            &state,
+            pool_key,
+            "cancel-sql-sub-batches",
+            &move |_| {
+                let checks = checks_for_import.clone();
+                Box::pin(async move { checks.fetch_add(1, Ordering::SeqCst) >= 1 })
+            },
+            "connection",
+            "",
+            &rows,
+            Some(&plan),
+            None,
+            &["payload".to_string()],
+            &[],
+            &[],
+            "items",
+            "",
+            &DatabaseType::Sqlite,
+            &TableImportMode::Append,
+            false,
+            &mut postgres_copy_accumulator,
+            &mut sqlite_append_transaction,
+            false,
+            None,
+            None,
+            &mut db_write_ms,
+            &mut statement_count,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.cancelled);
+        assert_eq!(error.rows_imported, 1);
+        let count = crate::db::sqlite::execute_query(&sqlite, "SELECT COUNT(*) FROM items").await.unwrap();
+        assert_eq!(count.rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    #[tokio::test]
+    async fn pending_postgres_copy_is_not_flushed_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut accumulator = Some(PostgresCopyAccumulator::with_limits("COPY items".to_string(), 1024, 100));
+        accumulator.as_mut().unwrap().append_row(b"1\n");
+        let mut db_write_ms = 0;
+        let mut statement_count = 0;
+
+        let error = flush_pending_postgres_copy(
+            &state,
+            "missing-pool",
+            "cancel-copy-flush",
+            &|_| Box::pin(async { true }),
+            &mut accumulator,
+            &mut db_write_ms,
+            &mut statement_count,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.cancelled);
+        assert_eq!(error.rows_imported, 0);
+        assert_eq!(accumulator.as_ref().unwrap().row_count(), 1);
+        assert_eq!(statement_count, 0);
+    }
+
+    #[tokio::test]
+    async fn postgres_copy_internal_flush_stops_before_write_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["id".to_string()],
+            column_types: vec![Some("integer".to_string())],
+        };
+        let rows = vec![vec![serde_json::json!(1)]];
+        let mut accumulator = PostgresCopyAccumulator::with_limits("COPY items".to_string(), 1, 100);
+        let mut db_write_ms = 0;
+        let mut statement_count = 0;
+
+        let error = append_postgres_copy_rows(
+            &state,
+            "missing-pool",
+            "cancel-copy-internal",
+            &|_| Box::pin(async { true }),
+            &rows,
+            &plan,
+            None,
+            &mut accumulator,
+            &mut db_write_ms,
+            &mut statement_count,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.cancelled);
+        assert_eq!(error.rows_imported, 0);
+        assert_eq!(accumulator.row_count(), 1);
+        assert_eq!(statement_count, 0);
+    }
+
+    #[test]
+    fn postgres_copy_normalizes_zero_fraction_integer_values_for_integer_targets() {
+        let plan = CompiledImportPlan {
+            mapped_source_indexes: vec![0, 1, 2],
+            target_columns: vec!["small_value".to_string(), "big_value".to_string(), "label".to_string()],
+            column_types: vec![Some("smallint".to_string()), Some("bigint".to_string()), Some("text".to_string())],
+        };
+        let (sql, data) = build_postgres_copy_text_batch(
+            &[vec![serde_json::json!("1.0"), serde_json::json!(2.0), serde_json::json!("3.0")]],
+            &plan,
+            "numbers",
+            "public",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sql,
+            "COPY \"public\".\"numbers\" (\"small_value\", \"big_value\", \"label\") FROM STDIN WITH (FORMAT text)"
+        );
+        assert_eq!(String::from_utf8(data).unwrap(), "1\t2\t3.0\n");
+    }
+
+    #[test]
     fn postgres_copy_eligibility_requires_plain_table_without_rls_or_rules() {
         assert_eq!(
             postgres_copy_eligibility_sql("items", "public"),
@@ -7144,6 +10704,220 @@ mod tests {
         assert!(!policy.transactional);
         assert!(!policy.include_truncate);
         assert!(!policy.allow_postgres_copy);
+    }
+
+    fn sqlite_append_test_plan() -> CompiledImportPlan {
+        CompiledImportPlan {
+            mapped_source_indexes: vec![0],
+            target_columns: vec!["id".to_string()],
+            column_types: vec![Some("integer".to_string())],
+        }
+    }
+
+    struct SqliteAppendTestContext {
+        _dir: tempfile::TempDir,
+        state: AppState,
+        sqlite: crate::db::sqlite::SqliteHandle,
+        pool_key: String,
+        plan: CompiledImportPlan,
+        postgres_copy_accumulator: Option<PostgresCopyAccumulator>,
+        transaction: Option<SqliteAppendTransaction>,
+        db_write_ms: u128,
+        statement_count: usize,
+    }
+
+    impl SqliteAppendTestContext {
+        async fn new(test_name: &str, max_rows: usize) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+            let state = AppState::new(storage);
+            let pool_key = format!("{test_name}:session:import");
+            let database_path = dir.path().join("target.db");
+            let sqlite =
+                crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+            crate::db::sqlite::execute_query(&sqlite, "CREATE TABLE items (id INTEGER PRIMARY KEY)").await.unwrap();
+            state.connections.write().await.insert(pool_key.clone(), PoolKind::Sqlite(sqlite.clone()));
+            Self {
+                _dir: dir,
+                state,
+                sqlite,
+                pool_key,
+                plan: sqlite_append_test_plan(),
+                postgres_copy_accumulator: None,
+                transaction: Some(SqliteAppendTransaction::with_limits(max_rows, usize::MAX)),
+                db_write_ms: 0,
+                statement_count: 0,
+            }
+        }
+
+        async fn append(&mut self, ids: &[i64]) -> Result<usize, ImportRowsBatchError> {
+            let rows = ids.iter().map(|id| vec![serde_json::json!(id)]).collect::<Vec<_>>();
+            execute_import_rows_batch(
+                &self.state,
+                &self.pool_key,
+                &self.pool_key,
+                &|_| Box::pin(async { false }),
+                &self.pool_key,
+                "",
+                &rows,
+                Some(&self.plan),
+                None,
+                &[],
+                &[],
+                &[],
+                "items",
+                "",
+                &DatabaseType::Sqlite,
+                &TableImportMode::Append,
+                false,
+                &mut self.postgres_copy_accumulator,
+                &mut self.transaction,
+                false,
+                None,
+                None,
+                &mut self.db_write_ms,
+                &mut self.statement_count,
+            )
+            .await
+        }
+
+        async fn ids(&self) -> Vec<Vec<serde_json::Value>> {
+            crate::db::sqlite::execute_query(&self.sqlite, "SELECT id FROM items ORDER BY id").await.unwrap().rows
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_commits_only_bounded_row_windows() {
+        let mut context = SqliteAppendTestContext::new("sqlite-append-window", 3).await;
+        let first = context.append(&[1, 2]).await.unwrap();
+        assert_eq!(first, 0);
+        assert!(context.ids().await.is_empty());
+
+        let second = context.append(&[3]).await.unwrap();
+        assert_eq!(second, 3);
+        assert_eq!(context.ids().await.len(), 3);
+        assert_eq!(context.statement_count, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_failure_keeps_prior_window_and_rolls_back_current_window() {
+        let mut context = SqliteAppendTestContext::new("sqlite-append-failure", 2).await;
+        let committed = context.append(&[1, 2]).await.unwrap();
+        assert_eq!(committed, 2);
+        context.transaction.as_mut().unwrap().max_rows = 4;
+
+        let pending = context.append(&[3, 4]).await.unwrap();
+        assert_eq!(pending, 0);
+        let error = context.append(&[5, 1]).await.unwrap_err();
+        assert_eq!(error.rows_imported, 0);
+        assert_eq!(context.ids().await, vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_append_cancellation_drops_the_uncommitted_window() {
+        let mut context = SqliteAppendTestContext::new("sqlite-append-cancel", 10).await;
+        context.append(&[1, 2]).await.unwrap();
+
+        let error = flush_sqlite_append_transaction(
+            &context.state,
+            &context.pool_key,
+            "sqlite-append-cancel",
+            &|_| Box::pin(async { true }),
+            "sqlite-append-cancel",
+            "",
+            "",
+            context.transaction.as_mut().unwrap(),
+            0,
+            &mut context.db_write_ms,
+            &mut context.statement_count,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.cancelled);
+        assert_eq!(error.rows_imported, 0);
+        assert!(context.ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delimited_sqlite_append_import_flushes_the_final_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "sqlite-delimited-append";
+        let pool_key = format!("{connection_id}:session:import");
+        let database_path = dir.path().join("target.db");
+        let sqlite = crate::db::sqlite::connect_path_create_if_missing(database_path.to_str().unwrap()).await.unwrap();
+        crate::db::sqlite::execute_query(&sqlite, "CREATE TABLE items (id INTEGER, name TEXT)").await.unwrap();
+        state.connections.write().await.insert(pool_key.clone(), PoolKind::Sqlite(sqlite.clone()));
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": connection_id,
+            "name": "SQLite delimited append test",
+            "db_type": "sqlite",
+            "host": "",
+            "port": 0,
+            "username": "",
+            "password": "",
+            "database": database_path.to_string_lossy()
+        }))
+        .unwrap();
+        state.configs.write().await.insert(connection_id.to_string(), config);
+        let data_path = dir.path().join("rows.txt");
+        std::fs::write(&data_path, b"id%name\n1%Ada\n2%Grace\n3%Linus\n").unwrap();
+        let request = TableImportRequest {
+            import_id: "sqlite-delimited-append".to_string(),
+            connection_id: connection_id.to_string(),
+            database: String::new(),
+            schema: String::new(),
+            table: "items".to_string(),
+            file_path: data_path.to_string_lossy().to_string(),
+            source_ref: None,
+            source_format: Some(TableImportSourceFormat::Delimited),
+            parse_options: TableImportParseOptions {
+                delimiter: Some("%".to_string()),
+                ..TableImportParseOptions::default()
+            },
+            mappings: vec![
+                TableImportColumnMapping {
+                    source_column: "id".to_string(),
+                    target_column: "id".to_string(),
+                    target_data_type: None,
+                },
+                TableImportColumnMapping {
+                    source_column: "name".to_string(),
+                    target_column: "name".to_string(),
+                    target_data_type: None,
+                },
+            ],
+            mode: TableImportMode::Append,
+            create_table: false,
+            batch_size: 2,
+            date_time_format: None,
+            prepared_source: None,
+            retain_source: false,
+        };
+
+        let summary = import_table_file_core(
+            &state,
+            &request,
+            &DatabaseType::Sqlite,
+            &pool_key,
+            |_| Box::pin(async { false }),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.rows_imported, 3);
+        let rows =
+            crate::db::sqlite::execute_query(&sqlite, "SELECT id, name FROM items ORDER BY id").await.unwrap().rows;
+        assert_eq!(
+            rows,
+            vec![
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+                vec![serde_json::json!(3), serde_json::json!("Linus")]
+            ]
+        );
     }
 
     #[tokio::test]
@@ -7291,6 +11065,56 @@ mod tests {
         assert_eq!(
             batches[0].sql,
             "INSERT INTO \"APP\".\"events\" (\"created_at\") VALUES\n(TO_DATE('2024-02-25 13:02:15', 'YYYY-MM-DD HH24:MI:SS'))"
+        );
+    }
+
+    fn kingbase_date_import_sql(oracle_mode: bool) -> String {
+        let mappings = vec![TableImportColumnMapping {
+            source_column: "created_at".to_string(),
+            target_column: "created_at".to_string(),
+            target_data_type: None,
+        }];
+        let excel_date_time =
+            Data::DateTime(ExcelDateTime::new(45959.686111111, calamine::ExcelDateTimeType::DateTime, false));
+        let imported_value =
+            xlsx_cell_value_with_temporal_kind(&excel_date_time, Some(XlsxTemporalKind::DateTime), true);
+        assert_eq!(imported_value, serde_json::json!("2025-10-29 16:28:00"));
+        let data = ParsedImportFile {
+            columns: vec!["created_at".to_string()],
+            rows: vec![vec![imported_value]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+
+        let batches = build_import_insert_batches_with_format(
+            &data,
+            &mappings,
+            &[("created_at".to_string(), "DATE".to_string())],
+            "events",
+            "public",
+            &DatabaseType::Kingbase,
+            oracle_mode,
+            500,
+            None,
+        )
+        .unwrap();
+
+        batches[0].sql.clone()
+    }
+
+    #[test]
+    fn import_insert_batches_preserve_kingbase_oracle_date_time_components() {
+        assert_eq!(
+            kingbase_date_import_sql(true),
+            "INSERT INTO \"public\".\"events\" (\"created_at\") VALUES\n('2025-10-29 16:28:00')"
+        );
+    }
+
+    #[test]
+    fn import_insert_batches_normalize_kingbase_postgres_date() {
+        assert_eq!(
+            kingbase_date_import_sql(false),
+            "INSERT INTO \"public\".\"events\" (\"created_at\") VALUES\n('2025-10-29')"
         );
     }
 

@@ -65,6 +65,29 @@ ${StrLoc}
 !define STARTMENUFOLDER "{{start_menu_folder}}"
 !searchreplace WEBVIEW2LOADERSRCPATH "${MAINBINARYSRCPATH}" "\${MAINBINARYNAME}.exe" "\WebView2Loader.dll"
 
+!macro ReadWebView2RuntimeVersion RESULT
+  StrCpy ${RESULT} ""
+  ${If} ${RunningX64}
+    ReadRegStr ${RESULT} HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${Else}
+    ReadRegStr ${RESULT} HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${EndIf}
+  ${If} ${RESULT} == ""
+    ReadRegStr ${RESULT} HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
+  ${EndIf}
+!macroend
+
+!macro ShouldAbortWebView2OfflineInstall INSTALL_RESULT RUNTIME_VERSION MINIMUM_COMPARISON RESULT
+  StrCpy ${RESULT} 0
+  ${If} ${INSTALL_RESULT} <> 0
+    ${If} ${RUNTIME_VERSION} == ""
+      StrCpy ${RESULT} 1
+    ${ElseIf} ${MINIMUM_COMPARISON} = 1
+      StrCpy ${RESULT} 1
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 Var PassiveMode
 Var UpdateMode
 Var NoShortcutMode
@@ -472,6 +495,16 @@ FunctionEnd
   !include "{{this}}"
 {{/each}}
 
+; Keep the standard write-error actions while explaining how to upgrade legacy
+; installations restored from Program Files without changing the install mode.
+LangString dbxFileWriteError ${LANG_ENGLISH} "Error opening file for writing:$\r$\n$\r$\n$0$\r$\n$\r$\nIf you are upgrading DBX installed under Program Files, abort this installation, right-click the installer, and select Run as administrator.$\r$\n$\r$\nClick Abort to stop the installation,$\r$\nRetry to try again, or$\r$\nIgnore to skip this file."
+LangString dbxFileWriteErrorNoIgnore ${LANG_ENGLISH} "Error opening file for writing:$\r$\n$\r$\n$0$\r$\n$\r$\nIf you are upgrading DBX installed under Program Files, cancel this installation, right-click the installer, and select Run as administrator.$\r$\n$\r$\nClick Retry to try again, or$\r$\nCancel to stop the installation."
+LangString dbxFileWriteError ${LANG_SIMPCHINESE} "无法打开要写入的文件：$\r$\n$\r$\n$0$\r$\n$\r$\n如果正在升级安装于 Program Files 的 DBX，请中止本次安装，然后右键单击安装程序并选择“以管理员身份运行”。$\r$\n$\r$\n单击“中止”停止安装，$\r$\n单击“重试”再次尝试，或$\r$\n单击“忽略”跳过此文件。"
+LangString dbxFileWriteErrorNoIgnore ${LANG_SIMPCHINESE} "无法打开要写入的文件：$\r$\n$\r$\n$0$\r$\n$\r$\n如果正在升级安装于 Program Files 的 DBX，请取消本次安装，然后右键单击安装程序并选择“以管理员身份运行”。$\r$\n$\r$\n单击“重试”再次尝试，或$\r$\n单击“取消”停止安装。"
+LangString dbxFileWriteError ${LANG_TRADCHINESE} "無法開啟要寫入的檔案：$\r$\n$\r$\n$0$\r$\n$\r$\n如果正在升級安裝於 Program Files 的 DBX，請中止本次安裝，然後以滑鼠右鍵按一下安裝程式並選擇「以系統管理員身分執行」。$\r$\n$\r$\n按一下「中止」以停止安裝，$\r$\n按一下「重試」以再次嘗試，或$\r$\n按一下「忽略」以略過此檔案。"
+LangString dbxFileWriteErrorNoIgnore ${LANG_TRADCHINESE} "無法開啟要寫入的檔案：$\r$\n$\r$\n$0$\r$\n$\r$\n如果正在升級安裝於 Program Files 的 DBX，請取消本次安裝，然後以滑鼠右鍵按一下安裝程式並選擇「以系統管理員身分執行」。$\r$\n$\r$\n按一下「重試」以再次嘗試，或$\r$\n按一下「取消」以停止安裝。"
+FileErrorText "$(dbxFileWriteError)" "$(dbxFileWriteErrorNoIgnore)"
+
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
@@ -542,15 +575,36 @@ Section EarlyChecks
 SectionEnd
 
 Section WebView2
+  ; Offline packages carry the runtime they were built for. Always run that
+  ; installer so an existing stale runtime is upgraded without network access.
+  !if "${INSTALLWEBVIEW2MODE}" == "offlineInstaller"
+    Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
+    File "/oname=$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" "${WEBVIEW2INSTALLERPATH}"
+    DetailPrint "$(installingWebview2)"
+    ExecWait '"$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" ${WEBVIEW2INSTALLERARGS} /install' $1
+    Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
+    StrCpy $4 ""
+    StrCpy $R0 0
+    ${If} $1 = 0
+      DetailPrint "$(webview2InstallSuccess)"
+    ${Else}
+      DetailPrint "$(webview2InstallError)"
+      ; Enterprise policy can make the bundled installer return a non-zero code.
+      ; Continue when a usable Runtime is already registered on the machine.
+      !insertmacro ReadWebView2RuntimeVersion $4
+      ${If} $4 != ""
+        !if "${MINIMUMWEBVIEW2VERSION}" != ""
+          ${VersionCompare} "${MINIMUMWEBVIEW2VERSION}" "$4" $R0
+        !endif
+      ${EndIf}
+    ${EndIf}
+    !insertmacro ShouldAbortWebView2OfflineInstall $1 $4 $R0 $R1
+    ${If} $R1 = 1
+      Abort "$(webview2AbortError)"
+    ${EndIf}
+  !else
   ; Check if Webview2 is already installed and skip this section
-  ${If} ${RunningX64}
-    ReadRegStr $4 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${Else}
-    ReadRegStr $4 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${EndIf}
-  ${If} $4 == ""
-    ReadRegStr $4 HKCU "SOFTWARE\Microsoft\EdgeUpdate\Clients\${WEBVIEW2APPGUID}" "pv"
-  ${EndIf}
+  !insertmacro ReadWebView2RuntimeVersion $4
 
   ${If} $4 == ""
     ; Webview2 installation
@@ -577,14 +631,6 @@ Section WebView2
         File "/oname=$TEMP\MicrosoftEdgeWebview2Setup.exe" "${WEBVIEW2BOOTSTRAPPERPATH}"
         DetailPrint "$(installingWebview2)"
         StrCpy $6 "$TEMP\MicrosoftEdgeWebview2Setup.exe"
-        Goto install_webview2
-      !endif
-
-      !if "${INSTALLWEBVIEW2MODE}" == "offlineInstaller"
-        Delete "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
-        File "/oname=$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe" "${WEBVIEW2INSTALLERPATH}"
-        DetailPrint "$(installingWebview2)"
-        StrCpy $6 "$TEMP\MicrosoftEdgeWebView2RuntimeInstaller.exe"
         Goto install_webview2
       !endif
 
@@ -631,6 +677,7 @@ Section WebView2
       ${EndIf}
     !endif
   ${EndIf}
+  !endif
 SectionEnd
 
 Section Install

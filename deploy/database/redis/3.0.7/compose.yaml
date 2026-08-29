@@ -3,12 +3,13 @@ services:
     image: docker.cnb.cool/znb/images/redis:3.0.7-alpine
     platform: linux/amd64
     container_name: dbx-redis-3.0.7
+    restart: always
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${DB_PASSWORD:-123456}"]
     environment:
       # Keep the password in container env so CMD-SHELL can quote it safely.
       REDIS_PASSWORD: "${DB_PASSWORD:-123456}"
     ports:
-      - "${DB_BIND_ADDRESS:-127.0.0.1}:${DB_PORT:-6380}:6379"
+      - "${DB_BIND_ADDRESS:-127.0.0.1}:${DB_PORT:-10500}:6379"
     volumes:
       - data:/data
     healthcheck:
