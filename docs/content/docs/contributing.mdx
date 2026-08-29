@@ -33,6 +33,8 @@ If nobody is working on the issue, post this as a standalone comment:
 
 The claim workflow assigns the issue to you when it is available. If your proposed solution changes existing behavior, explain the approach briefly in the issue before making a large patch.
 
+If you later cannot continue, post `/unclaim` as a standalone comment (`/unclaimed` is also accepted). The workflow removes only your own assignment so another contributor can claim the issue.
+
 ## 2. Install the Toolchain
 
 DBX Desktop uses Tauri, Vue, and Rust. The repository currently requires:
@@ -41,9 +43,9 @@ DBX Desktop uses Tauri, Vue, and Rust. The repository currently requires:
 | --- | --- |
 | Node.js | 22.13.0 or newer |
 | pnpm | 10.27.0 |
-| Rust | 1.77 or newer |
+| Rust | 1.88 or newer |
 | Git | Current stable version |
-| Make | Recommended on macOS and Linux |
+| Make | Required on macOS and Linux; optional on Windows |
 
 ### Install Node.js and pnpm
 
@@ -104,7 +106,15 @@ See the [official Tauri prerequisites](https://v2.tauri.app/start/prerequisites/
     1. Install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
     2. Select **Desktop development with C++** in the installer.
     3. Make sure a Windows 10/11 SDK and WebView2 are installed. Windows 11 normally includes WebView2.
-    4. Run the Windows commands on this page in PowerShell.
+    4. Install [Strawberry Perl](https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases), required to build the bundled OpenSSL:
+
+        ```powershell
+        winget install StrawberryPerl.StrawberryPerl
+        ```
+
+        DBX enables the `sqlite-sqlcipher` feature by default, which compiles SQLCipher and OpenSSL from source. Windows needs Perl to run the OpenSSL `Configure` script. Reopen your terminal after installing so `perl` is available on `PATH`.
+
+    5. Run the Windows commands on this page in PowerShell.
 
     Make is optional on Windows because equivalent pnpm commands are provided below.
 
@@ -151,7 +161,7 @@ make
 
 `make` installs dependencies from the lockfile and starts the Tauri desktop development environment. The first Rust build can take a while; later starts are much faster.
 
-If your change does not involve DuckDB, skip the DuckDB source build:
+For a lightweight desktop build, disable the default Rust features and enable only the DuckDB sidecar, DynamoDB, and bundled SQLite:
 
 ```bash
 make dev-fast
@@ -170,10 +180,10 @@ pnpm install --frozen-lockfile
 pnpm dev:tauri
 ```
 
-To skip DuckDB:
+For the same lightweight build:
 
 ```powershell
-pnpm tauri dev -- --no-default-features
+pnpm tauri dev -- --no-default-features --features duckdb-sidecar,dynamodb,sqlite-bundled
 ```
 
 ### Confirm the Environment Works
@@ -250,6 +260,15 @@ Open the local address printed in the terminal. When adding a page, also registe
 docs/content/docs/meta.json
 docs/content/docs/meta.cn.json
 ```
+
+Run the fast content check and then the full documentation build before submitting:
+
+```bash
+pnpm --dir docs content:check
+make docs-build
+```
+
+`content:check` verifies bilingual page pairs, navigation coverage and ordering, frontmatter, duplicate titles, and internal links. `make docs-build` runs the check again and validates the Next.js production build.
 
 ### Path B: Change the Desktop Frontend
 
@@ -329,7 +348,7 @@ Restart DBX or disconnect and reconnect the database so the old agent process ex
 #### When to Change `agents/versions.json`
 
 <Callout type="warn">
-  Do not edit `agents/versions.json` when changing an existing driver. The agent release workflow compares against the previous `agents-v*` tag and automatically increments the patch version of changed modules.
+  Do not edit `agents/versions.json` when changing an existing driver. The agent release workflow compares runtime files against the previous `agents-v*` tag, uses that release's post-release version-sync commit as the effective version baseline, and automatically increments the patch version of changed modules. Unchanged modules reuse verified artifacts from the previous immutable release.
 </Callout>
 
 - A change under `agents/drivers/<module>/` automatically bumps that module during release
@@ -421,6 +440,8 @@ The pull request description should include:
 
 If CI fails, open the failed job and inspect its logs. Push the fix to the same branch; you do not need to create another pull request.
 
+When your linked PR has been merged into the default branch but the issue remains open, post `/close` as a standalone issue comment. The workflow only closes the issue when you are its current assignee and the author of a merged PR that cross-references the issue.
+
 ## 10. Update the Pull Request After Review
 
 Continue working on the same branch after receiving review feedback:
@@ -447,7 +468,7 @@ git push --force-with-lease
 
 ### The First Rust Build Is Slow
 
-This is expected. Use `make dev-fast`, `make cargo-check-fast`, and `make cargo-test-fast` when DuckDB is not part of the change.
+This is expected. Use `make dev-fast` for a lightweight desktop build with default Rust features disabled and only the DuckDB sidecar and DynamoDB enabled. `make cargo-check-fast` and `make cargo-test-fast` skip all optional default features, so they do not validate DuckDB-specific paths.
 
 ### pnpm Reports the Wrong Version
 

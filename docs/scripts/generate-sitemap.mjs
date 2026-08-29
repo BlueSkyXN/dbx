@@ -3,9 +3,8 @@ import { resolve, relative } from "path";
 
 const OUT_DIR = resolve(import.meta.dirname, "../out");
 const SITE_URL = "https://dbxio.com";
-const TODAY = new Date().toISOString().split("T")[0];
-
 const EXCLUDE = new Set(["index.html", "404.html", "_not-found.html"]);
+const EXCLUDE_PATHS = new Set(["/en/issue", "/cn/issue"]);
 
 function* walkDir(dir) {
   const entries = readdirSync(dir, { withFileTypes: true });
@@ -26,7 +25,7 @@ function pathToUrl(filePath) {
 
 const htmlFiles = [...walkDir(OUT_DIR)].filter((f) => {
   const basename = f.split("/").pop() ?? "";
-  return !EXCLUDE.has(basename);
+  return !EXCLUDE.has(basename) && !EXCLUDE_PATHS.has(pathToUrl(f));
 });
 
 const pagesByPath = new Map();
@@ -51,9 +50,8 @@ const urls = [];
 const seen = new Set();
 
 for (const [, langs] of pagesByPath) {
-  const primary = langs.en || langs.cn;
-  if (!primary || seen.has(primary)) continue;
-  seen.add(primary);
+  const localizedPages = [langs.en, langs.cn].filter(Boolean);
+  if (localizedPages.length === 0) continue;
 
   const altLinks = [];
   if (langs.en) {
@@ -67,7 +65,11 @@ for (const [, langs] of pagesByPath) {
     altLinks.push({ lang: "x-default", href: `${SITE_URL}${langs.en}` });
   }
 
-  urls.push({ loc: `${SITE_URL}${primary}`, lastmod: TODAY, altLinks });
+  for (const localizedPage of localizedPages) {
+    if (seen.has(localizedPage)) continue;
+    seen.add(localizedPage);
+    urls.push({ loc: `${SITE_URL}${localizedPage}`, altLinks });
+  }
 }
 
 const sitemapXml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -78,7 +80,6 @@ ${urls
     (entry) =>
       `  <url>
     <loc>${entry.loc}</loc>
-    <lastmod>${entry.lastmod}</lastmod>
 ${entry.altLinks.map((alt) => `    <xhtml:link rel="alternate" hreflang="${alt.lang}" href="${alt.href}" />`).join("\n")}
   </url>`,
   )

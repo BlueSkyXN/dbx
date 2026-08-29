@@ -1,7 +1,8 @@
-name: Issue Claim
+name: Issue Commands
 
 on:
-  workflow_dispatch:
+  issue_comment:
+    types: [created]
 
 concurrency:
   group: issue-claim-${{ github.event.issue.number }}
@@ -10,6 +11,7 @@ concurrency:
 permissions:
   contents: read
   issues: write
+  pull-requests: read
 
 jobs:
   claim:
@@ -27,9 +29,10 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: dbx
           permission-issues: write
+          permission-pull-requests: read
 
-      - name: Handle /claim command
-        run: node .github/scripts/issue-claim.mjs
+      - name: Handle issue command
+        run: node .github/scripts/issue-commands.mjs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}

@@ -9,6 +9,7 @@ export interface SavedQueryResultRun {
   sequence: number;
   sql: string;
   createdAt: number;
+  pinned?: boolean;
   activeResultIndex?: number;
   resultCacheKey?: string;
   resultEvicted?: boolean;
@@ -20,11 +21,15 @@ export interface SavedOpenTab {
   customTitle?: boolean;
   connectionId: string;
   database: string;
+  catalog?: string;
   schema?: string;
   sql: string;
   originalSql?: string;
   savedSqlId?: string;
   externalSqlPath?: string;
+  externalSqlFileVersion?: QueryTab["externalSqlFileVersion"];
+  externalSqlIgnoredFileVersion?: QueryTab["externalSqlIgnoredFileVersion"];
+  externalSqlFileMissing?: boolean;
   lastExecutedSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
@@ -38,6 +43,7 @@ export interface SavedOpenTab {
   whereInput?: string;
   pinned?: boolean;
   mode?: QueryTab["mode"];
+  autoCommit?: boolean;
   mqTenant?: string;
   mqInitialTab?: QueryTab["mqInitialTab"];
   nacosNamespace?: string;
@@ -60,6 +66,11 @@ export interface RestoredOpenTabs {
 }
 
 export type OpenTabsRestoreFilter = "all" | "pinned";
+export interface OpenTabsRestoreOptions {
+  queryOnly?: boolean;
+  filter?: OpenTabsRestoreFilter;
+  validConnectionIds?: Iterable<string>;
+}
 
 function shouldPersistTabSql(tab: QueryTab) {
   if (!tab.savedSqlId) return true;
@@ -68,7 +79,7 @@ function shouldPersistTabSql(tab: QueryTab) {
 
 function restoredOriginalSql(tab: SavedOpenTab, mode: QueryTab["mode"], sql: string) {
   if (mode !== "query") return undefined;
-  if (tab.externalSqlPath) return sql;
+  if (tab.externalSqlPath) return tab.originalSql ?? sql;
   if (tab.savedSqlId) return sql ? "" : undefined;
   // Prefer the persisted originalSql so a clean prefilled query tab (sql === originalSql)
   // restores clean instead of being marked dirty. Older saved state without this field
@@ -84,14 +95,17 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.customTitle ? { customTitle: true } : {}),
     connectionId: tab.connectionId,
     database: tab.database,
+    ...(tab.catalog !== undefined ? { catalog: tab.catalog } : {}),
     schema: tab.schema,
     sql: shouldPersistTabSql(tab) ? tab.sql : "",
-    // Only round-trip originalSql for plain query tabs (no savedSqlId / externalSqlPath):
-    // saved-SQL and external-file tabs re-derive it on restore, and persisting it here
-    // would duplicate their (potentially large) SQL text in the open-tabs state.
-    ...(tab.originalSql !== undefined && !tab.savedSqlId && !tab.externalSqlPath ? { originalSql: tab.originalSql } : {}),
+    // Plain query tabs always round-trip originalSql. External-file tabs only persist it
+    // while dirty so their disk baseline survives restart without duplicating clean SQL.
+    ...(tab.originalSql !== undefined && !tab.savedSqlId && (!tab.externalSqlPath || tab.sql !== tab.originalSql) ? { originalSql: tab.originalSql } : {}),
     savedSqlId: tab.savedSqlId,
     externalSqlPath: tab.externalSqlPath,
+    ...(tab.externalSqlFileVersion ? { externalSqlFileVersion: tab.externalSqlFileVersion } : {}),
+    ...(tab.externalSqlIgnoredFileVersion ? { externalSqlIgnoredFileVersion: tab.externalSqlIgnoredFileVersion } : {}),
+    ...(tab.externalSqlFileMissing ? { externalSqlFileMissing: true } : {}),
     ...(tab.lastExecutedSql !== undefined ? { lastExecutedSql: tab.lastExecutedSql } : {}),
     ...(tab.resultBaseSql !== undefined ? { resultBaseSql: tab.resultBaseSql } : {}),
     ...(tab.resultSortedSql !== undefined ? { resultSortedSql: tab.resultSortedSql } : {}),
@@ -105,6 +119,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.whereInput !== undefined ? { whereInput: tab.whereInput } : {}),
     pinned: tab.pinned,
     mode: tab.mode,
+    ...(tab.mode === "query" && tab.autoCommit !== undefined ? { autoCommit: tab.autoCommit } : {}),
     ...(tab.mqTenant !== undefined ? { mqTenant: tab.mqTenant } : {}),
     ...(tab.mqInitialTab !== undefined ? { mqInitialTab: tab.mqInitialTab } : {}),
     ...(tab.nacosNamespace !== undefined ? { nacosNamespace: tab.nacosNamespace } : {}),
@@ -124,6 +139,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
             sequence: run.sequence,
             sql: run.sql,
             createdAt: run.createdAt,
+            ...(run.pinned ? { pinned: true } : {}),
             activeResultIndex: run.activeResultIndex,
             ...(run.resultCacheKey !== undefined ? { resultCacheKey: run.resultCacheKey } : {}),
             ...(run.resultEvicted ? { resultEvicted: true } : {}),
@@ -141,14 +157,17 @@ function isSavedOpenTab(value: unknown): value is SavedOpenTab {
   return typeof tab.id === "string" && typeof tab.title === "string" && typeof tab.connectionId === "string" && typeof tab.database === "string" && (typeof tab.sql === "string" || typeof tab.savedSqlId === "string");
 }
 
-function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, options: { queryOnly?: boolean; filter?: OpenTabsRestoreFilter } = {}): RestoredOpenTabs {
+function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, options: OpenTabsRestoreOptions = {}): RestoredOpenTabs {
   if (!Array.isArray(parsed)) return { tabs: [], activeTabId: null };
 
   try {
+    const validConnectionIds = options.validConnectionIds ? new Set(options.validConnectionIds) : undefined;
     const saved = parsed.filter(isSavedOpenTab);
     const filtered = saved.filter((tab) => {
-      if (options.queryOnly && (tab.mode ?? "query") !== "query") return false;
+      const mode = tab.mode ?? "query";
+      if (options.queryOnly && mode !== "query") return false;
       if (options.filter === "pinned" && !tab.pinned) return false;
+      if (mode !== "query" && validConnectionIds && !validConnectionIds.has(tab.connectionId)) return false;
       return true;
     });
     const tabs: QueryTab[] = filtered.map((tab) => {
@@ -192,12 +211,12 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
   }
 }
 
-export function restoreOpenTabsPayload(payload: { tabs?: unknown; activeTabId?: unknown } | null | undefined, options: { queryOnly?: boolean; filter?: OpenTabsRestoreFilter } = {}): RestoredOpenTabs {
+export function restoreOpenTabsPayload(payload: { tabs?: unknown; activeTabId?: unknown } | null | undefined, options: OpenTabsRestoreOptions = {}): RestoredOpenTabs {
   if (!payload) return { tabs: [], activeTabId: null };
   return restoreOpenTabsArray(payload.tabs, typeof payload.activeTabId === "string" ? payload.activeTabId : null, options);
 }
 
-export function restoreOpenTabsState(rawTabs: string | null, rawActiveTabId: string | null, options: { queryOnly?: boolean; filter?: OpenTabsRestoreFilter } = {}): RestoredOpenTabs {
+export function restoreOpenTabsState(rawTabs: string | null, rawActiveTabId: string | null, options: OpenTabsRestoreOptions = {}): RestoredOpenTabs {
   if (!rawTabs) return { tabs: [], activeTabId: null };
 
   try {

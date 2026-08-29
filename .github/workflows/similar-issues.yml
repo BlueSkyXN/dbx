@@ -1,7 +1,8 @@
 name: Suggest Similar Issues
 
 on:
-  workflow_dispatch:
+  issues:
+    types: [opened]
 
 concurrency:
   group: similar-issues-${{ github.event.issue.number }}

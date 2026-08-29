@@ -347,7 +347,7 @@ pub async fn list_databases(client: &InfluxdbClient) -> Result<Vec<DatabaseInfo>
         return Ok(influx_v2_buckets(client, Duration::from_secs(30))
             .await?
             .into_iter()
-            .map(|bucket| DatabaseInfo { name: bucket.name })
+            .map(|bucket| DatabaseInfo { name: bucket.name, ..Default::default() })
             .collect());
     }
     let result = influx_query(client, "SHOW DATABASES", None).await?;
@@ -356,7 +356,7 @@ pub async fn list_databases(client: &InfluxdbClient) -> Result<Vec<DatabaseInfo>
         .iter()
         .flat_map(|r| &r.series)
         .flat_map(|s| &s.values)
-        .map(|row| DatabaseInfo { name: row[0].as_str().unwrap_or("").to_string() })
+        .map(|row| DatabaseInfo { name: row[0].as_str().unwrap_or("").to_string(), ..Default::default() })
         .collect())
 }
 
@@ -476,23 +476,31 @@ pub async fn execute_query(client: &InfluxdbClient, database: &str, sql: &str) -
             columns: s.columns.clone(),
             column_types: vec![],
             column_sortables: s.columns.iter().map(|_| false).collect(),
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: s.values.clone(),
             affected_rows: s.values.len() as u64,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }),
         None => Ok(QueryResult {
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
         }),
     }
 }
@@ -628,6 +636,8 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
     let columns = headers.unwrap_or_default();
     Ok(QueryResult {
         column_sortables: columns.iter().map(|_| false).collect(),
+        spatial_columns: vec![],
+        spatial_values: vec![],
         columns,
         column_types: vec![],
         affected_rows: rows.len() as u64,
@@ -636,6 +646,8 @@ fn parse_flux_csv(text: &str, start: Instant) -> Result<QueryResult, String> {
         truncated: false,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
     })
 }
 

@@ -34,6 +34,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Kwdb
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
+            | DatabaseType::Uxdb
             | DatabaseType::Vastbase
             | DatabaseType::Yashandb
             | DatabaseType::Oscar
@@ -52,13 +53,21 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Trino
             | DatabaseType::PrestoSql
             | DatabaseType::Hive
+            | DatabaseType::Kyuubi
+            | DatabaseType::Impala
             | DatabaseType::Spark
             | DatabaseType::Db2
+            | DatabaseType::Informix
             | DatabaseType::Tdengine
             | DatabaseType::Xugu
             | DatabaseType::Sqlite
             | DatabaseType::DuckDb
             | DatabaseType::Iris
+            // Spanner supports named schemas; the PostgreSQL dialect defaults to `public`.
+            // GoogleSQL's default schema is the empty string, which the blank-schema filters
+            // in `qualified_table_name` / `table_data_qualified_table_name` drop along with
+            // the dot separator (`` `s`.`t` `` with an empty `s` is a Spanner syntax error).
+            | DatabaseType::Spanner
     )
 }
 
@@ -82,8 +91,11 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::TablePreview) => {
             TablePaginationStrategy::Rownum
         }
+        // Oracle's row-limiting clause (`FETCH FIRST`/`OFFSET ... FETCH`) was
+        // introduced in 12c. ROWNUM remains compatible with the supported 11g
+        // baseline while still providing a bounded read for newer servers.
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::BoundedRead) => {
-            TablePaginationStrategy::FetchFirst
+            TablePaginationStrategy::Rownum
         }
         Some(DatabaseType::Oracle) => TablePaginationStrategy::Unbounded,
         Some(DatabaseType::Oscar)

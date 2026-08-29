@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sqlSemanticCompletionScope, sqlSemanticLocalColumnsByTable, sqlSemanticProjectionAliasColumns } from "@/lib/sql/semantic/completion";
+import { sqlSemanticCompletionScope, sqlSemanticLocalColumnsByTable, sqlSemanticProjectionAliasColumns, sqlSemanticSelectStarIsOnlyProjection, sqlSemanticSelectStarQualifierSql, sqlSemanticSelectStarTableSource, sqlSemanticSelectStarTableSources } from "@/lib/sql/semantic/completion";
 import { SQL_SEMANTIC_BASELINE_FIXTURES, sqlFixtureCursor } from "@/lib/sql/semantic/fixtures";
 import { buildSqlSemanticModel, sqlSemanticTableNameSpans } from "@/lib/sql/semantic/model";
 
@@ -28,6 +28,53 @@ describe("sqlSemanticModel baseline fixtures", () => {
       }
     });
   }
+
+  it("does not treat SELECT as the qualifier of an unqualified star", () => {
+    const { sql, cursor } = sqlFixtureCursor("select *| from apis as ap");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "star", qualifierParts: [] }));
+  });
+
+  it("retains the qualifier of a qualified star", () => {
+    const { sql, cursor } = sqlFixtureCursor("select ap.*| from apis as ap");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "star", qualifierParts: ["ap"], targetSourceId: model.rowSources[0]?.id }));
+  });
+
+  it("does not resolve an unqualified star to the only physical table among multiple row sources", () => {
+    const { sql, cursor } = sqlFixtureCursor("select *| from users u join (select 1 as x) s on 1 = 1");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(model.rowSources.map((source) => source.kind)).toEqual(["table", "subquery"]);
+    expect(sqlSemanticSelectStarTableSource(model)).toBeUndefined();
+  });
+
+  it("returns every table source for an unqualified multi-table star", () => {
+    const { sql, cursor } = sqlFixtureCursor("select *| from tVillage tV inner join tland tl on tV.villageId = tl.villageId");
+    const model = buildSqlSemanticModel(sql, cursor);
+
+    expect(sqlSemanticSelectStarTableSources(model).map((source) => source.alias)).toEqual(["tV", "tl"]);
+  });
+
+  it.each([
+    ["select *| from apis", true],
+    ["select distinct *| from apis", true],
+    ["select ap.*| from apis ap", true],
+    ["select *, 1 as extra| from apis", false],
+    ["select ap.*, 1 as extra| from apis ap", false],
+  ] as const)("detects whether the star is the only projection in %s", (markedSql, expected) => {
+    const { sql, cursor } = sqlFixtureCursor(markedSql);
+
+    expect(sqlSemanticSelectStarIsOnlyProjection(buildSqlSemanticModel(sql, cursor))).toBe(expected);
+  });
+
+  it("retains the original quoting of a star qualifier", () => {
+    const { sql, cursor } = sqlFixtureCursor('select "Order Alias".*| from orders as "Order Alias"');
+
+    expect(sqlSemanticSelectStarQualifierSql(buildSqlSemanticModel(sql, cursor, { databaseType: "postgres", dialect: "postgres" }))).toBe('"Order Alias"');
+  });
 
   it("does not mix row sources from inactive statements", () => {
     const { sql, cursor } = sqlFixtureCursor("select * from users u; select * from orders o where o.|");
@@ -78,6 +125,47 @@ describe("sqlSemanticModel baseline fixtures", () => {
 
     expect(model.rowSources).toEqual(expect.arrayContaining([expect.objectContaining({ name: "table_a", alias: "a" }), expect.objectContaining({ name: "table_b", alias: "b" })]));
     expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "alias_column", qualifierParts: ["b"] }));
+  });
+
+  it.each([
+    ["table name", "SELECT orders.| FROM orders", ["orders"]],
+    ["schema-qualified table name", "SELECT public.orders.| FROM public.orders", ["public", "orders"]],
+  ] as const)("resolves columns through a PostgreSQL %s qualifier before FROM", (_label, markedSql, qualifierParts) => {
+    const { sql, cursor } = sqlFixtureCursor(markedSql);
+    const model = buildSqlSemanticModel(sql, cursor, { databaseType: "postgres", dialect: "postgres" });
+
+    expect(model.rowSources).toEqual(expect.arrayContaining([expect.objectContaining({ name: "orders", alias: undefined })]));
+    expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "alias_column", qualifierParts, targetSourceId: model.rowSources[0]?.id }));
+  });
+
+  it("keeps nested EXISTS sources and outer correlated sources visible", () => {
+    const { sql, cursor } = sqlFixtureCursor("SELECT * FROM aa.tb t WHERE EXISTS (SELECT 1 FROM aa.tb1 t1, aa.tb2 t2 WHERE t1.|)");
+    const model = buildSqlSemanticModel(sql, cursor, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(model.rowSources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "tb1", alias: "t1", metadataTarget: { schema: "aa", table: "tb1" } }),
+        expect.objectContaining({ name: "tb2", alias: "t2", metadataTarget: { schema: "aa", table: "tb2" } }),
+        expect.objectContaining({ name: "tb", alias: "t", metadataTarget: { schema: "aa", table: "tb" } }),
+      ]),
+    );
+    expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "alias_column", qualifierParts: ["t1"] }));
+    expect(model.cursorIntent.targetSourceId).toBe(model.rowSources.find((source) => source.alias === "t1")?.id);
+  });
+
+  it("classifies an incomplete nested database qualifier as a table context", () => {
+    const { sql, cursor } = sqlFixtureCursor("SELECT * FROM aa.tb t WHERE EXISTS (SELECT 1 FROM aa.tb1 t1, aa.|)");
+    const model = buildSqlSemanticModel(sql, cursor, { databaseType: "mysql", dialect: "mysql" });
+
+    expect(model.rowSources.some((source) => source.name === "aa")).toBe(false);
+    expect(model.cursorIntent).toEqual(expect.objectContaining({ kind: "table", qualifierParts: ["aa"], confidence: "high" }));
+  });
+
+  it("does not treat an Oracle FOR UPDATE clause as a table alias", () => {
+    const sql = "SELECT * FROM APP.USERS FOR UPDATE SKIP LOCKED";
+    const model = buildSqlSemanticModel(sql, sql.length, { databaseType: "oracle" });
+
+    expect(model.rowSources).toEqual([expect.objectContaining({ name: "USERS", qualifierParts: ["APP"], alias: undefined })]);
   });
 
   it("consumes correlation column lists before parsing later comma-separated sources", () => {

@@ -1,21 +1,27 @@
 import type { ColumnInfo, DatabaseType } from "@/types/database";
-import { qualifiedTableName, quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { metricRangeQuery, qualifiedTableName, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
 
 export interface TableSqlTemplateOptions {
   databaseType?: DatabaseType;
+  driverProfile?: string;
+  identifierQuote?: string;
   schema?: string;
+  catalog?: string;
+  database?: string;
+  includeDatabaseName?: boolean;
   tableName: string;
   columns?: ColumnInfo[];
   tableType?: string;
 }
 
 export function buildTableSelectTemplate(options: TableSqlTemplateOptions): string {
+  if (options.databaseType === "victoriametrics") return metricRangeQuery(options.tableName);
   const tableName = templateTableName(options);
   const columns = options.columns ?? [];
   if (!columns.length) {
     return `SELECT *\nFROM ${tableName};`;
   }
-  const selectColumns = columns.map((column) => quoteTableIdentifier(options.databaseType, column.name));
+  const selectColumns = columns.map((column) => templateIdentifier(options, column.name));
   return `SELECT ${selectColumns.join(", ")}\nFROM ${tableName};`;
 }
 
@@ -43,7 +49,7 @@ function buildDefaultInsertTemplate(options: TableSqlTemplateOptions): string {
     return `INSERT INTO ${tableName}\n/* TODO: add column values */\nVALUES ();`;
   }
 
-  const columnNames = columns.map((column) => quoteTableIdentifier(options.databaseType, column.name));
+  const columnNames = columns.map((column) => templateIdentifier(options, column.name));
   const values = columns.map((column) => columnPlaceholderValue(column, options.databaseType));
   return `INSERT INTO ${tableName} (${columnNames.join(", ")})\nVALUES (${values.join(", ")});`;
 }
@@ -82,28 +88,37 @@ export function buildTableUpdateTemplate(options: TableSqlTemplateOptions): stri
   const primaryKeys = columns.filter((column) => column.is_primary_key);
   const primaryKeyNames = new Set(primaryKeys.map((column) => column.name));
   const updateColumns = columns.filter((column) => !primaryKeyNames.has(column.name));
-  const setClause = updateColumns.length ? updateColumns.map((column) => `${quoteTableIdentifier(options.databaseType, column.name)} = ${columnPlaceholderValue(column, options.databaseType)}`).join(",\n    ") : "/* TODO: set column = value */";
+  const setClause = updateColumns.length ? updateColumns.map((column) => `${templateIdentifier(options, column.name)} = ${columnPlaceholderValue(column, options.databaseType)}`).join(",\n    ") : "/* TODO: set column = value */";
 
-  return `UPDATE ${tableName}\nSET ${setClause}\n${buildWhereClause(options.databaseType, primaryKeys)};`;
+  return `UPDATE ${tableName}\nSET ${setClause}\n${buildWhereClause(options, primaryKeys)};`;
 }
 
 export function buildTableDeleteTemplate(options: TableSqlTemplateOptions): string {
   const tableName = templateTableName(options);
   const primaryKeys = (options.columns ?? []).filter((column) => column.is_primary_key);
-  return `DELETE FROM ${tableName}\n${buildWhereClause(options.databaseType, primaryKeys)};`;
+  return `DELETE FROM ${tableName}\n${buildWhereClause(options, primaryKeys)};`;
 }
 
 function templateTableName(options: TableSqlTemplateOptions): string {
   return qualifiedTableName({
     databaseType: options.databaseType,
+    driverProfile: options.driverProfile,
+    identifierQuote: options.identifierQuote,
+    catalog: options.catalog,
+    database: options.database,
+    includeDatabaseName: options.includeDatabaseName,
     schema: options.schema,
     tableName: options.tableName,
   });
 }
 
-function buildWhereClause(databaseType: DatabaseType | undefined, primaryKeys: ColumnInfo[]): string {
+function templateIdentifier(options: TableSqlTemplateOptions, name: string): string {
+  return quoteTableDataIdentifier(options.databaseType, name, options.identifierQuote);
+}
+
+function buildWhereClause(options: TableSqlTemplateOptions, primaryKeys: ColumnInfo[]): string {
   if (!primaryKeys.length) return "WHERE /* TODO: add WHERE clause */";
-  const conditions = primaryKeys.map((column) => `${quoteTableIdentifier(databaseType, column.name)} = ${columnPlaceholderValue(column, databaseType)}`);
+  const conditions = primaryKeys.map((column) => `${templateIdentifier(options, column.name)} = ${columnPlaceholderValue(column, options.databaseType)}`);
   return `WHERE ${conditions.join(" AND ")}`;
 }
 

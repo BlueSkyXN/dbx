@@ -60,6 +60,7 @@ struct MongoFindDocumentsRequest {
     filter: Option<String>,
     projection: Option<String>,
     sort: Option<String>,
+    collation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -368,6 +369,7 @@ mod tests {
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::MongoDb).is_err());
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Redis).is_err());
         assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Elasticsearch).is_err());
+        assert!(ensure_mcp_execute_and_show_supported(&DatabaseType::Easysearch).is_err());
     }
 
     #[test]
@@ -1104,7 +1106,8 @@ async fn handle_list_tables_data(state: &Arc<AppState>, body: &str, stream: &mut
         respond_error(stream, "403 Forbidden", &e).await;
         return;
     }
-    match dbx_core::schema::list_tables_core(state, &config.id, &database, &schema, None, None, None, None).await {
+    match dbx_core::schema::list_tables_core(state, &config.id, &database, &schema, None, None, None, None, None).await
+    {
         Ok(tables) => respond_json(stream, &tables).await,
         Err(e) => respond_error(stream, "500 Internal Server Error", &e).await,
     }
@@ -1179,6 +1182,7 @@ async fn handle_mongo_find_documents_data(state: &Arc<AppState>, body: &str, str
         req.filter.as_deref(),
         req.projection.as_deref(),
         req.sort.as_deref(),
+        req.collation.as_deref(),
     )
     .await
     {

@@ -3,7 +3,9 @@ import { filterDatabaseNamesForVisiblePicker, normalizeVisibleDatabaseSelection 
 
 const DRAFT_VISIBLE_DATABASES_PREFIX = "__visible_draft_";
 
-const UNSUPPORTED_VISIBLE_DATABASE_TYPES = new Set<DatabaseType>(["csvfile", "xlsxfile", "feishu_sheets", "feishu_bitable", "cloudflare-d1", "turso", "elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper"]);
+// Turso and Cloudflare D1 target one fixed SQLite-compatible `main` namespace;
+// non-database services expose their own root objects rather than database namespaces.
+const UNSUPPORTED_VISIBLE_DATABASE_TYPES = new Set<DatabaseType>(["turso", "cloudflare-d1", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "mq", "nacos", "consul"]);
 
 type VisibleDatabaseConnectionFields = Pick<
   ConnectionConfig,

@@ -83,6 +83,22 @@ export const SQL_SEMANTIC_DIALECTS: Record<string, SqlSemanticDialectAdapter> = 
       return parts.length >= 1 ? "schema" : "unknown";
     },
   },
+  clickhouse: {
+    id: "clickhouse",
+    identifierQuotes: [
+      { open: "`", close: "`" },
+      { open: '"', close: '"' },
+    ],
+    supportsAsForTableAlias: true,
+    projectionAliasVisibility: { where: false, groupBy: true, having: true, orderBy: true },
+    normalizeIdentifier: defaultNormalize,
+    quoteIdentifier: (identifier) => quoteWith(identifier, "`"),
+    qualifierRole(parts, context) {
+      if (context === "column") return parts.length >= 2 ? "table" : "table";
+      if (context === "routine") return parts.length >= 2 ? "package" : "schema";
+      return parts.length >= 1 ? "schema" : "unknown";
+    },
+  },
   sqlserver: {
     id: "sqlserver",
     identifierQuotes: [
@@ -138,11 +154,13 @@ export const SQL_SEMANTIC_DIALECTS: Record<string, SqlSemanticDialectAdapter> = 
 };
 
 export function sqlReferenceAnalysisDialectFor(options: { databaseType?: DatabaseType; identifierQuote?: string; fallbackDialect: string }): string {
+  if (options.databaseType === "kyuubi") return "spark";
   if (options.databaseType === "kingbase" && options.identifierQuote === "`") return "mysql";
   return options.fallbackDialect;
 }
 
-export function sqlSemanticDialectFor(options: { databaseType?: DatabaseType; dialect?: "mysql" | "postgres" | "sqlserver" }): SqlSemanticDialectAdapter {
+export function sqlSemanticDialectFor(options: { databaseType?: DatabaseType; dialect?: "mysql" | "postgres" | "sqlserver" | "clickhouse" }): SqlSemanticDialectAdapter {
+  if (options.databaseType === "clickhouse") return SQL_SEMANTIC_DIALECTS.clickhouse;
   if (options.dialect && SQL_SEMANTIC_DIALECTS[options.dialect]) return SQL_SEMANTIC_DIALECTS[options.dialect];
   switch (options.databaseType) {
     case "postgres":
@@ -150,6 +168,7 @@ export function sqlSemanticDialectFor(options: { databaseType?: DatabaseType; di
     case "opengauss":
     case "gaussdb":
     case "highgo":
+    case "uxdb":
       return SQL_SEMANTIC_DIALECTS.postgres;
     case "mysql":
     case "doris":
@@ -175,4 +194,16 @@ export function sqlSemanticDialectFor(options: { databaseType?: DatabaseType; di
     default:
       return SQL_SEMANTIC_DIALECTS.generic;
   }
+}
+
+/**
+ * Resolves the dialect id ("mysql", "postgres", ...) used to keep lexical/statement-boundary
+ * scanning in sync with tokenizeSqlSemantic's own dialect-aware tokenization -- most importantly,
+ * whether '#' starts a line comment (MySQL) or is an operator (PostgreSQL: #, #>, #>>, #-).
+ * Defaults to "mysql" when no dialect info is available (rather than sqlSemanticDialectFor's own
+ * "generic" default), matching tokenizeSqlSemantic's default and preserving the behavior callers
+ * had before dialect-aware scanning existed.
+ */
+export function resolveSqlDialectId(options: { databaseType?: DatabaseType; dialect?: "mysql" | "postgres" | "sqlserver" | "clickhouse" }): string {
+  return options.databaseType || options.dialect ? sqlSemanticDialectFor(options).id : "mysql";
 }

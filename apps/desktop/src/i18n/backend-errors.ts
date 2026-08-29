@@ -1,4 +1,16 @@
-import type { ComposerTranslation } from "vue-i18n";
+import { normalizeBackendError, sanitizeBackendErrorMessage, type BackendError } from "@/lib/backend/errorUtils";
+import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
+
+/**
+ * Minimal shape of a translate function, satisfied by both `useI18n().t` inside
+ * components and `i18n.global.t` in stores and composables. Using the full
+ * `ComposerTranslation` type here would reject the latter, because the global
+ * composer is typed against the concrete message schema.
+ */
+export type BackendErrorTranslate = {
+  (key: string): string;
+  (key: string, named: Record<string, unknown>): string;
+};
 
 const taggedAiCliErrorKeys: Record<string, string> = {
   claudeCodeNotInstalled: "ai.cliErrors.claudeCodeNotInstalled",
@@ -11,6 +23,67 @@ const taggedAiCliErrorKeys: Record<string, string> = {
   claudeCodeMcpStartupFailed: "ai.cliErrors.claudeCodeMcpStartupFailed",
   claudeCodeCommandLineTooLong: "ai.cliErrors.claudeCodeCommandLineTooLong",
   claudeCodeRunFailed: "ai.cliErrors.claudeCodeRunFailed",
+  piAgentNotInstalled: "ai.cliErrors.piAgentNotInstalled",
+  piAgentCliPathInvalid: "ai.cliErrors.piAgentCliPathInvalid",
+  piAgentEnvInvalid: "ai.cliErrors.piAgentEnvInvalid",
+  piAgentEnvReserved: "ai.cliErrors.piAgentEnvReserved",
+  piAgentNotAuthenticated: "ai.cliErrors.piAgentNotAuthenticated",
+  piAgentMcpStartupFailed: "ai.cliErrors.piAgentMcpStartupFailed",
+  piAgentTimeout: "ai.cliErrors.piAgentTimeout",
+  piAgentProtocolError: "ai.cliErrors.piAgentProtocolError",
+  piAgentModelInvalid: "ai.cliErrors.piAgentModelInvalid",
+  piAgentRunFailed: "ai.cliErrors.piAgentRunFailed",
+  openCodeNotInstalled: "ai.cliErrors.openCodeNotInstalled",
+  openCodeCliPathInvalid: "ai.cliErrors.openCodeCliPathInvalid",
+  openCodeEnvInvalid: "ai.cliErrors.openCodeEnvInvalid",
+  openCodeEnvReserved: "ai.cliErrors.openCodeEnvReserved",
+  openCodeNotAuthenticated: "ai.cliErrors.openCodeNotAuthenticated",
+  openCodeMcpStartupFailed: "ai.cliErrors.openCodeMcpStartupFailed",
+  openCodeTimeout: "ai.cliErrors.openCodeTimeout",
+  openCodeProtocolError: "ai.cliErrors.openCodeProtocolError",
+  openCodeRunFailed: "ai.cliErrors.openCodeRunFailed",
+  cursorNotInstalled: "ai.cliErrors.cursorNotInstalled",
+  cursorCliPathInvalid: "ai.cliErrors.cursorCliPathInvalid",
+  grokCliNotInstalled: "ai.cliErrors.grokCliNotInstalled",
+  grokCliPathInvalid: "ai.cliErrors.grokCliPathInvalid",
+  grokCliEnvInvalid: "ai.cliErrors.grokCliEnvInvalid",
+  grokCliEnvReserved: "ai.cliErrors.grokCliEnvReserved",
+  grokCliNotAuthenticated: "ai.cliErrors.grokCliNotAuthenticated",
+  grokCliMcpStartupFailed: "ai.cliErrors.grokCliMcpStartupFailed",
+  grokCliCommandLineTooLong: "ai.cliErrors.grokCliCommandLineTooLong",
+  grokCliRunFailed: "ai.cliErrors.grokCliRunFailed",
+  codeBuddyNotInstalled: "ai.cliErrors.codeBuddyNotInstalled",
+  codeBuddyCliPathInvalid: "ai.cliErrors.codeBuddyCliPathInvalid",
+  codeBuddyEnvInvalid: "ai.cliErrors.codeBuddyEnvInvalid",
+  codeBuddyEnvReserved: "ai.cliErrors.codeBuddyEnvReserved",
+  codeBuddyNotAuthenticated: "ai.cliErrors.codeBuddyNotAuthenticated",
+  codeBuddyTimeout: "ai.cliErrors.codeBuddyTimeout",
+  codeBuddyMcpConfigInvalid: "ai.cliErrors.codeBuddyMcpConfigInvalid",
+  codeBuddyMcpStartupFailed: "ai.cliErrors.codeBuddyMcpStartupFailed",
+  codeBuddyProtocolError: "ai.cliErrors.codeBuddyProtocolError",
+  codeBuddyRunFailed: "ai.cliErrors.codeBuddyRunFailed",
+  qoderNotInstalled: "ai.cliErrors.qoderNotInstalled",
+  qoderCliPathInvalid: "ai.cliErrors.qoderCliPathInvalid",
+  qoderEnvInvalid: "ai.cliErrors.qoderEnvInvalid",
+  qoderEnvReserved: "ai.cliErrors.qoderEnvReserved",
+  qoderNotAuthenticated: "ai.cliErrors.qoderNotAuthenticated",
+  qoderTimeout: "ai.cliErrors.qoderTimeout",
+  qoderMcpConfigInvalid: "ai.cliErrors.qoderMcpConfigInvalid",
+  qoderMcpStartupFailed: "ai.cliErrors.qoderMcpStartupFailed",
+  qoderProtocolError: "ai.cliErrors.qoderProtocolError",
+  qoderRunFailed: "ai.cliErrors.qoderRunFailed",
+  cursorEnvInvalid: "ai.cliErrors.cursorEnvInvalid",
+  cursorEnvReserved: "ai.cliErrors.cursorEnvReserved",
+  cursorNotAuthenticated: "ai.cliErrors.cursorNotAuthenticated",
+  cursorMcpStartupFailed: "ai.cliErrors.cursorMcpStartupFailed",
+  cursorTimeout: "ai.cliErrors.cursorTimeout",
+  cursorProtocolError: "ai.cliErrors.cursorProtocolError",
+  cursorRunFailed: "ai.cliErrors.cursorRunFailed",
+};
+
+const exactMessageKeys: Record<string, string> = {
+  [PHOENIX_DRIVER_NOT_INSTALLED_ERROR]: "connection.phoenixDriverNotInstalled",
+  [PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR]: "connection.phoenixDriverNotInstalled",
 };
 
 const patterns: [RegExp, string][] = [
@@ -20,7 +93,12 @@ const patterns: [RegExp, string][] = [
   [/^Custom Java runtime path is empty\. Please choose a Java executable\.$/, "connection.customJavaPathEmpty"],
   [/^Agent requires Java 21, but DBX started it with an older Java runtime\. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager\./, "connection.agentJavaTooOld"],
   [/^JDBC plugin is not installed\. Install the optional JDBC plugin to use this connection\.$/, "connection.jdbcPluginNotInstalled"],
+  [/GBASEDBTSERVER[\s\S]*DBSERVERNAME[\s\S]*DBSERVERALIASES/, "connection.gbaseServerMismatch"],
   [/^ai\.configNameExists:(.+)$/, "ai.configNameExists"],
+
+  // Ordinary users may not enumerate namespaces or authorization data through Nacos management APIs.
+  [/NACOS_ERROR\[(?:v3ManagedNamespacesRequired|managedNamespacesRequired)\]:[\s\S]*$/, "nacos.nacosManagedNamespacesRequired"],
+  [/NACOS_ERROR\[managedNamespaceAccessDenied\]: One or more configured namespace IDs are not readable: ([\s\S]+)$/, "nacos.nacosManagedNamespaceAccessDenied"],
 
   // Tunnel / proxy test messages
   [/^HTTP CONNECT proxy connection successful \((\d+)\)$/, "settings.tunnelsHttpTestSuccess"],
@@ -43,12 +121,42 @@ const patterns: [RegExp, string][] = [
   [/^Proxy host too long for SOCKS5 domain address$/, "settings.tunnelsSocksHostTooLong"],
   [/^SOCKS proxy connect rejected \(code (\d+)\)$/, "settings.tunnelsSocksConnectRejected"],
   [/^Unsupported SOCKS bound address type: (\d+)$/, "settings.tunnelsSocksUnsupportedAddrType"],
+
+  // SSH keyboard-interactive prompts (for example JumpServer TOTP).
+  [/^(?:SSH layer \d+ failed:\s*)?SSH keyboard-interactive authentication was cancelled$/, "connection.sshTotpCancelled"],
+
+  // Query result export limits (crates/dbx-core/src/query_result_export.rs)
+  [/^Streaming export is unsupported for this query\. Simplify it or use a supported driver\.$/, "exportProgress.streamingUnsupported"],
+  [/^Streaming export needs a result-set session, but this driver returned no session_id\.$/, "exportProgress.agentSessionMissing"],
+
+  // Legacy bundled DuckDB error kept for compatibility with older backends.
+  [/^The previous DuckDB query is still stopping\. Please try again shortly\.$/, "editor.duckdbDraining"],
+
+  // Driver / JRE management (crates/dbx-core/src/agent_service.rs, routes/agents.rs)
+  // The Windows variant is multi-line, so it must be tried before the single-line one.
+  [/^Failed to remove the old JRE directory: (.+)\nPossible causes:[\s\S]*\(original error: ([\s\S]+)\)$/, "driverStore.jreDirRemoveFailedWindows"],
+  [/^Failed to remove the old JRE directory: (.+) \(original error: ([\s\S]+)\)$/, "driverStore.jreDirRemoveFailed"],
+  [/^JRE (.+?) is in use by drivers: (.+)\. Uninstall them first\.$/, "driverStore.jreInUseByDrivers"],
+  [/^agent-registry\.json not found in the ZIP; not a valid offline driver package\.$/, "driverStore.offlinePackageRegistryMissing"],
+  [/^Close these database connections before updating drivers: (.+)$/, "driverStore.driverUpdateBlocked"],
+
+  // Message queues (crates/dbx-core/src/mq/adapters/kafka.rs)
+  [/^Kafka does not support unloading topics$/, "mqClients.unloadTopicUnsupportedKafka"],
+
+  // Filesystem (src-tauri/src/commands/fs_open.rs)
+  [/^file does not exist: (.+)$/, "common.fileNotFound"],
+
+  // Web auth rate limiting (crates/dbx-web/src/auth.rs)
+  [/^Please try again in (\d+)s$/, "auth.rateLimited"],
 ];
 
-const paramNames: Record<string, string> = {
+// Named placeholders for each pattern's capture groups, in capture order.
+// A bare string is shorthand for a single capture group.
+const paramNames: Record<string, string | string[]> = {
   "connection.driverNotInstalled": "driver",
   "connection.jreNotInstalled": "jre",
   "ai.configNameExists": "name",
+  "nacos.nacosManagedNamespaceAccessDenied": "detail",
   "settings.tunnelsHttpTestSuccess": "code",
   "settings.tunnelsProxyTimedOut": "duration",
   "settings.tunnelsProxyConnectFailed": "error",
@@ -59,9 +167,38 @@ const paramNames: Record<string, string> = {
   "settings.tunnelsSocksUnsupportedAuth": "method",
   "settings.tunnelsSocksConnectRejected": "code",
   "settings.tunnelsSocksUnsupportedAddrType": "type",
+  "driverStore.jreDirRemoveFailedWindows": ["path", "error"],
+  "driverStore.jreDirRemoveFailed": ["path", "error"],
+  "driverStore.jreInUseByDrivers": ["jre", "drivers"],
+  "driverStore.driverUpdateBlocked": "labels",
+  "common.fileNotFound": "path",
+  "auth.rateLimited": "seconds",
 };
 
-export function translateBackendError(t: ComposerTranslation, message: string): string {
+function backendErrorMessage(error: unknown): string {
+  if (typeof error === "string") return sanitizeBackendErrorMessage(error);
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") return sanitizeBackendErrorMessage(error.message);
+  return sanitizeBackendErrorMessage(String(error));
+}
+
+function translateStructuredBackendError(t: BackendErrorTranslate, error: BackendError): string {
+  const translated = t(error.messageKey, error.messageParams);
+  const summary = translated !== error.messageKey ? translated : t("backendErrors.unknown");
+  const detail = error.detail ? sanitizeBackendErrorMessage(error.detail).trim() : undefined;
+  const rawAdapterCode = error.diagnostics?.adapterCode;
+  const adapterCode = typeof rawAdapterCode === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(rawAdapterCode) ? rawAdapterCode : undefined;
+  const diagnosticDetail = detail && adapterCode ? `[${adapterCode}] ${detail}` : (detail ?? adapterCode);
+  return diagnosticDetail && diagnosticDetail !== summary ? `${summary}\n\n${diagnosticDetail}` : summary;
+}
+
+export function translateBackendError(t: BackendErrorTranslate, error: unknown): string {
+  const structured = normalizeBackendError(error);
+  if (structured) return translateStructuredBackendError(t, structured);
+
+  const message = backendErrorMessage(error);
+  const exactKey = exactMessageKeys[message];
+  if (exactKey) return t(exactKey);
+
   const tagged = message.match(/^\[([A-Za-z][A-Za-z0-9]+)\]\s*([\s\S]*)$/);
   if (tagged) {
     const [, code, rawDetail] = tagged;
@@ -75,9 +212,15 @@ export function translateBackendError(t: ComposerTranslation, message: string): 
   for (const [regex, key] of patterns) {
     const match = message.match(regex);
     if (match) {
-      const name = paramNames[key];
-      if (name && match[1]) {
-        return t(key, { [name]: match[1] });
+      const names = paramNames[key];
+      if (names) {
+        const ordered = Array.isArray(names) ? names : [names];
+        const params: Record<string, string> = {};
+        ordered.forEach((name, index) => {
+          const captured = match[index + 1];
+          if (captured !== undefined) params[name] = captured;
+        });
+        if (Object.keys(params).length > 0) return t(key, params);
       }
       return t(key);
     }

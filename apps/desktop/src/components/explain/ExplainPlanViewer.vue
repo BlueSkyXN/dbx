@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertCircle, Braces, GitBranch, Table2, FileText } from "@lucide/vue";
+import { AlertCircle, Braces, GitBranch, Table2, FileText, Workflow } from "@lucide/vue";
 import type { ParsedExplainPlan, ExplainPlanNode } from "@/lib/diagram/explainPlan";
 import { flattenExplainPlanNodes } from "@/lib/diagram/explainPlan";
+import { extractActualRows } from "@/lib/diagram/planCanvas";
 import { Button } from "@/components/ui/button";
 import type { QueryResult } from "@/types/database";
 import ExplainPlanNodeTree from "./ExplainPlanNodeTree.vue";
+import ExplainPlanDiagram from "./ExplainPlanDiagram.vue";
 
 const props = defineProps<{
   plan?: ParsedExplainPlan;
@@ -19,12 +21,18 @@ const props = defineProps<{
 }>();
 
 const { t } = useI18n();
-const activeView = ref<"tree" | "summary" | "raw" | "table">("tree");
+const activeView = ref<"canvas" | "tree" | "summary" | "raw" | "table">("canvas");
 const hasTableView = computed(() => !!props.tableResult || !!props.tableError);
 
-watch(hasTableView, (available) => {
-  if (!available && activeView.value === "table") activeView.value = "tree";
-});
+watch(
+  [hasTableView, () => !!props.tableResult, () => !!props.plan, () => props.loading],
+  ([available, hasTableResult, hasPlan, loading]) => {
+    if (!available && activeView.value === "table") activeView.value = "canvas";
+    // Wait for JSON EXPLAIN to finish so regular MySQL still defaults to its visual tree.
+    if (!loading && hasTableResult && !hasPlan) activeView.value = "table";
+  },
+  { immediate: true },
+);
 
 const flatRows = computed(() => {
   const rows: Array<{ node: ExplainPlanNode; depth: number }> = [];
@@ -47,6 +55,14 @@ const rawContent = computed(() => {
 const isRawString = computed(() => typeof props.plan?.raw === "string");
 const rawFormatLabel = computed(() => (props.plan?.databaseType === "sqlserver" ? "XML" : isRawString.value ? "TEXT" : "JSON"));
 const nodeCount = computed(() => (props.plan ? flattenExplainPlanNodes(props.plan.nodes).length : 0));
+// Measured rows exist only when the plan was produced by a mode that ran the query:
+// EXPLAIN ANALYZE on Postgres, SET STATISTICS XML on SQL Server.
+const measuredRowsLabel = computed(() => {
+  const databaseType = props.plan?.databaseType;
+  if (databaseType !== "postgres" && databaseType !== "sqlserver") return undefined;
+  if (!flattenExplainPlanNodes(props.plan!.nodes).some((node) => extractActualRows(node) !== undefined)) return undefined;
+  return databaseType === "sqlserver" ? "ACTUAL" : "ANALYZE";
+});
 
 function tableCellText(value: unknown): string {
   if (value === null) return "NULL";
@@ -56,17 +72,24 @@ function tableCellText(value: unknown): string {
 
 <template>
   <div class="flex h-full min-h-0 flex-col bg-background">
-    <div class="h-9 shrink-0 border-b px-3 flex items-center gap-2 text-xs">
-      <span class="inline-flex items-center gap-1 rounded border bg-muted px-2 py-0.5 font-medium">
+    <div class="h-9 shrink-0 border-b px-3 flex items-center gap-2 text-xs overflow-x-auto overflow-y-hidden">
+      <span class="shrink-0 whitespace-nowrap inline-flex items-center gap-1 rounded border bg-muted px-2 py-0.5 font-medium">
         <GitBranch class="h-3.5 w-3.5" />
         {{ t("explain.title") }}
       </span>
-      <span v-if="plan || hasTableView" class="text-muted-foreground">
+      <span v-if="plan || hasTableView" class="shrink-0 whitespace-nowrap text-muted-foreground">
         {{ plan?.databaseType.toUpperCase() || "MYSQL" }}<template v-if="plan"> · {{ t("explain.nodeCount", { count: nodeCount }) }}</template>
       </span>
-      <span v-if="plan?.databaseType === 'dameng' && isRawString && rawContent.includes('->')" class="ml-1 inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 font-semibold text-green-700 dark:bg-green-900/30 dark:text-green-300" style="font-size: 10px">A-TRACE</span>
-      <span class="flex-1" />
-      <div v-if="plan || hasTableView" class="inline-flex rounded-md border bg-muted/40 p-0.5">
+      <span v-if="plan?.databaseType === 'dameng' && isRawString && rawContent.includes('->')" class="shrink-0 whitespace-nowrap ml-1 inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 font-semibold text-green-700 dark:bg-green-900/30 dark:text-green-300" style="font-size: 10px"
+        >A-TRACE</span
+      >
+      <span v-if="measuredRowsLabel" class="shrink-0 whitespace-nowrap ml-1 inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 font-semibold text-green-700 dark:bg-green-900/30 dark:text-green-300" style="font-size: 10px">{{ measuredRowsLabel }}</span>
+      <span class="flex-1 min-w-2" />
+      <div v-if="plan || hasTableView" class="shrink-0 inline-flex rounded-md border bg-muted/40 p-0.5">
+        <Button v-if="plan" size="sm" :variant="activeView === 'canvas' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" @click="activeView = 'canvas'">
+          <Workflow class="h-3.5 w-3.5" />
+          {{ t("explain.canvas") }}
+        </Button>
         <Button v-if="plan" size="sm" :variant="activeView === 'tree' ? 'secondary' : 'ghost'" class="h-6 px-2 text-xs gap-1" @click="activeView = 'tree'">
           <GitBranch class="h-3.5 w-3.5" />
           {{ t("explain.tree") }}
@@ -128,6 +151,10 @@ function tableCellText(value: unknown): string {
 
     <div v-else-if="!plan" class="flex-1 min-h-0 flex items-center justify-center text-sm text-muted-foreground">
       {{ t("explain.empty") }}
+    </div>
+
+    <div v-else-if="activeView === 'canvas'" class="flex-1 min-h-0">
+      <ExplainPlanDiagram :nodes="plan.nodes" />
     </div>
 
     <div v-else class="flex-1 min-h-0 overflow-auto">

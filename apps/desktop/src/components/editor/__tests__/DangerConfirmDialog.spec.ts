@@ -20,7 +20,7 @@ vi.mock("@/lib/common/clipboard", () => ({
 
 const mountedApps: App[] = [];
 
-async function mountDialog(sql: string) {
+async function mountDialog(sql: string, extraProps: Record<string, unknown> = {}, listeners: Record<string, (...args: any[]) => void> = {}) {
   const state = reactive({ open: true });
   const container = document.createElement("div");
   document.body.append(container);
@@ -30,6 +30,8 @@ async function mountDialog(sql: string) {
         h(DangerConfirmDialog, {
           open: state.open,
           sql,
+          ...extraProps,
+          ...listeners,
           "onUpdate:open": (value: boolean) => {
             state.open = value;
           },
@@ -51,6 +53,28 @@ afterEach(() => {
 });
 
 describe("DangerConfirmDialog SQL preview", () => {
+  it("wraps SQL by default, including long unbroken identifiers", async () => {
+    await mountDialog(`UPDATE ${"very_long_identifier_".repeat(20)} SET value = 1;`);
+
+    const container = document.body.querySelector('[data-testid="danger-code-container"]');
+    const preview = container?.querySelector('[data-testid="danger-code-preview"]');
+    const code = preview?.querySelector("pre");
+    expect(code?.classList).toContain("whitespace-pre-wrap");
+    expect(code?.classList).toContain("break-all");
+    expect(preview?.classList).toContain("overflow-auto");
+    const actions = container?.querySelector('[data-testid="danger-code-actions"]');
+    expect(actions?.classList).toContain("justify-end");
+    expect(actions?.nextElementSibling).toBe(preview);
+    expect(actions?.classList).not.toContain("absolute");
+
+    actions?.querySelectorAll("button")[1]?.click();
+    await nextTick();
+
+    expect(code?.classList).toContain("whitespace-pre");
+    expect(code?.classList).toContain("w-max");
+    expect(code?.classList).toContain("min-w-full");
+  });
+
   it("fully highlights short SQL without a truncation notice", async () => {
     const sql = "DROP TABLE IF EXISTS users;";
 
@@ -82,5 +106,53 @@ describe("DangerConfirmDialog SQL preview", () => {
     await nextTick();
 
     expect(copyToClipboard).toHaveBeenCalledWith(sql);
+  });
+});
+
+describe("DangerConfirmDialog running/cancel footer state", () => {
+  function footerButtons() {
+    const footer = document.body.querySelectorAll("button");
+    return Array.from(footer);
+  }
+
+  it("keeps the default Cancel button unchanged when cancelable is not set (existing callers)", async () => {
+    await mountDialog("DROP TABLE users;", { loading: true });
+
+    const buttons = footerButtons();
+    const cancelButton = buttons.find((button) => button.textContent?.trim() === "Cancel");
+    expect(cancelButton).toBeDefined();
+    expect(cancelButton?.disabled).toBe(true);
+    expect(buttons.some((button) => button.textContent?.trim() === "Cancel Query")).toBe(false);
+  });
+
+  it("shows an active Cancel Query button while loading when cancelable is true", async () => {
+    const onCancelRunning = vi.fn();
+    await mountDialog("DELETE FROM big_orders;", { loading: true, cancelable: true }, { onCancelRunning });
+
+    const buttons = footerButtons();
+    const cancelRunningButton = buttons.find((button) => button.textContent?.trim() === "Cancel Query");
+    expect(cancelRunningButton).toBeDefined();
+    expect(cancelRunningButton?.disabled).toBe(false);
+
+    cancelRunningButton?.click();
+    await nextTick();
+
+    expect(onCancelRunning).toHaveBeenCalledOnce();
+  });
+
+  it("disables the Cancel Query button while the cancel itself is in flight", async () => {
+    await mountDialog("DELETE FROM big_orders;", { loading: true, cancelable: true, cancelRunningLoading: true });
+
+    const buttons = footerButtons();
+    const cancelRunningButton = buttons.find((button) => button.textContent?.trim() === "Cancel Query");
+    expect(cancelRunningButton?.disabled).toBe(true);
+  });
+
+  it("does not show the Cancel Query button when cancelable is true but not loading", async () => {
+    await mountDialog("DELETE FROM big_orders;", { loading: false, cancelable: true });
+
+    const buttons = footerButtons();
+    expect(buttons.some((button) => button.textContent?.trim() === "Cancel Query")).toBe(false);
+    expect(buttons.some((button) => button.textContent?.trim() === "Cancel")).toBe(true);
   });
 });

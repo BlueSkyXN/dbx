@@ -9,6 +9,7 @@ import {
   normalizeJsonArgument,
   parseCollectionMethodTarget,
   parseMongoAggregateCommand,
+  parseMongoObjectArgument,
   quoteUnquotedObjectKeys,
   splitTopLevel,
   type MongoAggregateCommand,
@@ -24,6 +25,16 @@ export interface MongoFindCommand {
   skip: number;
   limit: number;
   sort?: string;
+  collation?: string;
+}
+
+export interface MongoFindPaginationPlan {
+  pageOffset: number;
+  pageLimit: number;
+  requestSkip: number;
+  requestLimit: number;
+  logicalSkip: number;
+  logicalLimit?: number;
 }
 
 export interface MongoFindOneCommand {
@@ -51,6 +62,19 @@ export interface MongoVersionCommand {
   kind: "version";
 }
 
+export interface MongoShowDatabasesCommand {
+  kind: "showDatabases";
+}
+
+export interface MongoCreateUserCommand {
+  userJson: string;
+  writeConcernJson?: string;
+}
+
+export interface MongoRunCommand {
+  commandJson: string;
+}
+
 export type MongoCollectionStatsMetric = "stats" | "dataSize" | "storageSize" | "totalIndexSize";
 
 export interface MongoCollectionStatsCommand {
@@ -65,18 +89,21 @@ export interface MongoDistinctCommand {
   filter?: string;
 }
 
-type MongoWriteKind = "insert" | "update" | "delete" | "createIndex" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
+type MongoWriteKind = "runCommand" | "insert" | "update" | "delete" | "createIndex" | "createUser" | "dropIndex" | "dropIndexes" | "dropCollection" | "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete";
 
 export type MongoCommand =
   | ({ kind: "find" } & MongoFindCommand)
   | ({ kind: "findOne" } & MongoFindOneCommand)
   | MongoVersionCommand
+  | MongoShowDatabasesCommand
   | ({ kind: "countDocuments" } & MongoCountDocumentsCommand)
   | ({ kind: "aggregate" } & MongoAggregateCommand)
   | ({ kind: "distinct" } & MongoDistinctCommand)
   | ({ kind: "getIndexes" } & MongoGetIndexesCommand)
   | ({ kind: "collectionStats" } & MongoCollectionStatsCommand)
   | ({ kind: "use" } & MongoUseCommand)
+  | ({ kind: "createUser" } & MongoCreateUserCommand)
+  | ({ kind: "runCommand" } & MongoRunCommand)
   | { kind: "insert"; collection: string; docsJson: string }
   | { kind: "update"; collection: string; filter: string; update: string; options?: string; many: boolean }
   | { kind: "delete"; collection: string; filter: string; many: boolean }
@@ -153,6 +180,14 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
     sort = parsedSort;
   }
 
+  const collationArg = readChainedCallArgument(chain, "collation");
+  let collation: string | undefined;
+  if (collationArg !== undefined) {
+    const parsedCollation = normalizeJsonArgument(collationArg);
+    if (!parsedCollation) return null;
+    collation = parsedCollation;
+  }
+
   const skip = readChainedIntegerArgument(chain, "skip", 0);
   const limit = readChainedIntegerArgument(chain, "limit", DEFAULT_LIMIT);
   if (skip === null || limit === null) return null;
@@ -164,7 +199,44 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
     skip,
     limit,
     sort,
+    ...(collation ? { collation } : {}),
   };
+}
+
+export function planMongoFindPagination(input: string, command: MongoFindCommand, pageOffset: number, pageLimit: number): MongoFindPaginationPlan | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseFindTarget(source);
+  if (!target) return null;
+
+  const findOpenIndex = source.indexOf("(", target.findCallIndex);
+  const findCloseIndex = findMatchingParen(source, findOpenIndex);
+  if (findCloseIndex < 0) return null;
+  const chain = source.slice(findCloseIndex + 1).trim();
+  if (chain && !chain.startsWith(".")) return null;
+
+  const normalizedPageOffset = Math.max(0, Math.trunc(pageOffset));
+  const normalizedPageLimit = Math.max(1, Math.trunc(pageLimit));
+  const hasExplicitSkip = findChainedMethodCallIndex(chain, "skip") >= 0;
+  const hasExplicitLimit = findChainedMethodCallIndex(chain, "limit") >= 0;
+  const logicalSkip = hasExplicitSkip ? Math.max(0, Math.trunc(command.skip)) : 0;
+  // limit(0) is unbounded in MongoDB; a negative limit keeps the same row
+  // bound while requesting single-batch cursor semantics.
+  const logicalLimit = hasExplicitLimit && command.limit !== 0 ? Math.abs(Math.trunc(command.limit)) : undefined;
+  const remaining = logicalLimit === undefined ? normalizedPageLimit : Math.max(0, logicalLimit - normalizedPageOffset);
+
+  return {
+    pageOffset: normalizedPageOffset,
+    pageLimit: normalizedPageLimit,
+    requestSkip: logicalSkip + normalizedPageOffset,
+    requestLimit: Math.min(normalizedPageLimit, remaining),
+    logicalSkip,
+    logicalLimit,
+  };
+}
+
+export function mongoFindLogicalTotal(total: number, plan: Pick<MongoFindPaginationPlan, "logicalSkip" | "logicalLimit">): number {
+  const afterSkip = Math.max(0, Math.trunc(total) - plan.logicalSkip);
+  return plan.logicalLimit === undefined ? afterSkip : Math.min(afterSkip, plan.logicalLimit);
 }
 
 export function parseMongoFindOneCommand(input: string): MongoFindOneCommand | null {
@@ -416,6 +488,42 @@ export function parseMongoVersionCommand(input: string): MongoVersionCommand | n
   return /^db\s*\.\s*version\s*\(\s*\)$/i.test(source) ? { kind: "version" } : null;
 }
 
+export function parseMongoCreateUserCommand(input: string): MongoCreateUserCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const match = /^db\s*\.\s*createUser\s*\(/i.exec(source);
+  if (!match) return null;
+  const openIndex = source.indexOf("(", match.index);
+  const closeIndex = findMatchingParen(source, openIndex);
+  if (closeIndex < 0 || source.slice(closeIndex + 1).trim()) return null;
+  const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
+  if (args.length < 1 || args.length > 2) return null;
+  const userJson = parseMongoObjectArgument(args[0]);
+  if (!userJson) return null;
+  const user = JSON.parse(userJson) as Record<string, unknown>;
+  if (typeof user.user !== "string" || !user.user.trim()) return null;
+  const writeConcernJson = args[1]?.trim() ? parseMongoObjectArgument(args[1]) : undefined;
+  if (args[1]?.trim() && !writeConcernJson) return null;
+  return {
+    userJson: JSON.stringify(user),
+    ...(writeConcernJson ? { writeConcernJson: JSON.stringify(JSON.parse(writeConcernJson)) } : {}),
+  };
+}
+
+export function parseMongoRunCommand(input: string): MongoRunCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const match = /^db\s*\.\s*runCommand\s*\(/i.exec(source);
+  if (!match) return null;
+  const openIndex = source.indexOf("(", match.index);
+  const closeIndex = findMatchingParen(source, openIndex);
+  if (closeIndex < 0 || source.slice(closeIndex + 1).trim()) return null;
+  const args = splitTopLevel(source.slice(openIndex + 1, closeIndex));
+  if (args.length !== 1) return null;
+  const commandJson = parseMongoObjectArgument(args[0]);
+  if (!commandJson) return null;
+  const command = JSON.parse(commandJson) as Record<string, unknown>;
+  return Object.keys(command).length > 0 ? { commandJson: JSON.stringify(command) } : null;
+}
+
 export function parseMongoWriteCommand(input: string): MongoWriteCommand | null {
   const source = input.trim().replace(/;$/, "").trim();
   const insertOne = parseCollectionMethodTarget(source, "insertOne");
@@ -516,9 +624,18 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
   // Keep the more specific readers ahead of generic write parsing so the
   // returned kind matches the result renderer we want to use downstream.
   const parsers: Array<(source: string) => MongoCommand | null> = [
+    parseMongoShowDatabasesCommand,
     (source) => {
       const version = parseMongoVersionCommand(source);
       return version ?? null;
+    },
+    (source) => {
+      const createUser = parseMongoCreateUserCommand(source);
+      return createUser ? { kind: "createUser", ...createUser } : null;
+    },
+    (source) => {
+      const runCommand = parseMongoRunCommand(source);
+      return runCommand ? { kind: "runCommand", ...runCommand } : null;
     },
     (source) => {
       // Legacy Mongo shell uses count()/find().count(); keep accepting it
@@ -578,6 +695,11 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
   }
 
   return null;
+}
+
+export function parseMongoShowDatabasesCommand(input: string): MongoShowDatabasesCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  return /^show\s+(?:dbs|databases)$/i.test(source) ? { kind: "showDatabases" } : null;
 }
 
 export function splitMongoCommands(input: string): ParsedMongoCommand[] {
@@ -645,7 +767,7 @@ export function evaluateMongoAggregateSafety(command: MongoAggregateCommand, opt
   return { allowed: true };
 }
 
-export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeMs: number, total: number): QueryResult {
+export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeMs: number, total: number, copyDocuments?: unknown[], totalIsExact = true): QueryResult {
   const columns: string[] = [];
 
   for (const doc of documents) {
@@ -667,9 +789,32 @@ export function mongoDocumentsToQueryResult(documents: unknown[], executionTimeM
     columns,
     rows,
     mongo_documents: documents,
+    ...(copyDocuments?.length === documents.length ? { mongo_copy_documents: copyDocuments } : {}),
+    ...(totalIsExact ? {} : { total_is_exact: false }),
     affected_rows: total,
     execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
     truncated: total > documents.length,
+  };
+}
+
+export function mongoDatabasesToQueryResult(documents: unknown[], executionTimeMs: number, maxRows: number): QueryResult {
+  const response = documents[0];
+  const databases = isRecord(response) ? response.databases : undefined;
+  if (!Array.isArray(databases)) throw new Error("MongoDB listDatabases response is missing the databases array.");
+  if (!databases.every(isRecord)) {
+    throw new Error("MongoDB listDatabases response contains an invalid database entry.");
+  }
+
+  const rowLimit = Number.isFinite(maxRows) ? Math.max(1, Math.trunc(maxRows)) : databases.length;
+  const rows = databases.slice(0, rowLimit).map((database) => [toCellValue(database.name), toCellValue(database.sizeOnDisk), toCellValue(database.empty)]);
+  const truncated = rows.length < databases.length;
+  return {
+    columns: ["name", "sizeOnDisk", "empty"],
+    rows,
+    affected_rows: databases.length,
+    execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+    truncated,
+    has_more: truncated,
   };
 }
 
@@ -709,7 +854,15 @@ export function mongoCreateIndexToQueryResult(name: string, executionTimeMs: num
   };
 }
 
-export function mongoDroppedIndexesToQueryResult(names: string[], executionTimeMs: number): QueryResult {
+export function mongoDroppedIndexesToQueryResult(names: string[], executionTimeMs: number, failures: Array<{ name: string; message: string }> = []): QueryResult {
+  if (failures.length > 0) {
+    return {
+      columns: ["name", "status", "message"],
+      rows: [...names.map((name) => [name, "dropped", null] as [string, string, null]), ...failures.map((failure) => [failure.name, "failed", failure.message])],
+      affected_rows: names.length,
+      execution_time_ms: Math.max(0, Math.round(executionTimeMs)),
+    };
+  }
   return {
     columns: ["name"],
     rows: names.map((name) => [name]),
@@ -989,7 +1142,7 @@ function mongoTopLevelCommandLineStarts(segment: string): number[] {
 
 function isMongoCommandLineStart(segment: string, index: number): boolean {
   const rest = segment.slice(index);
-  return /^use\b/i.test(rest) || /^db(?:\s*\.|\b)/i.test(rest);
+  return /^use\b/i.test(rest) || /^show\s+(?:dbs|databases)\b/i.test(rest) || /^db(?:\s*\.|\b)/i.test(rest);
 }
 
 function pushMongoSegment(segments: MongoTextRange[], source: string, from: number, to: number) {

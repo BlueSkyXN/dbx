@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getAiConfigModelIds, isAiConfigModelCandidate } from "@/lib/ai/aiConfigCandidates";
+import { isAiConfigModelCandidate } from "@/lib/ai/aiConfigCandidates";
 import type { AiConfig } from "@/types/ai";
 
 function config(overrides: Partial<AiConfig> = {}): AiConfig {
@@ -24,7 +24,7 @@ describe("isAiConfigModelCandidate", () => {
     expect(isAiConfigModelCandidate(config({ apiKey: "" }), true)).toBe(false);
   });
 
-  it.each(["codex-cli", "claude-code-cli"] as const)("keeps %s configs eligible without endpoint, API key, or model metadata", (provider) => {
+  it.each(["codex-cli", "claude-code-cli", "opencode-cli", "pi-agent-cli", "cursor-cli", "grok-cli", "codebuddy-cli", "qoder-cli"] as const)("keeps %s configs eligible without endpoint, API key, or model metadata", (provider) => {
     expect(
       isAiConfigModelCandidate(
         config({
@@ -38,17 +38,19 @@ describe("isAiConfigModelCandidate", () => {
       ),
     ).toBe(true);
   });
-});
 
-describe("getAiConfigModelIds", () => {
-  it("includes the default model once while preserving configured model order", () => {
+  it.each(["codex-cli", "claude-code-cli", "opencode-cli", "pi-agent-cli", "cursor-cli", "grok-cli", "codebuddy-cli", "qoder-cli"] as const)("filters existing %s configs when local CLI providers are unavailable", (provider) => {
     expect(
-      getAiConfigModelIds(
+      isAiConfigModelCandidate(
         config({
-          model: "gpt-default",
-          models: [{ name: "gpt-fast" }, { name: "gpt-default" }, { name: "gpt-default" }],
+          provider,
+          endpoint: "",
+          apiKey: "",
+          model: "default",
         }),
+        false,
+        false,
       ),
-    ).toEqual(["gpt-fast", "gpt-default"]);
+    ).toBe(false);
   });
 });

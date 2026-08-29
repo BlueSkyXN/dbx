@@ -41,8 +41,8 @@ impl std::fmt::Display for SqlRisk {
 /// Mirrors the logic in `sql_analysis::normalize_dialect`.
 fn normalize_dialect(dialect: &str) -> &'static str {
     match dialect.to_ascii_lowercase().as_str() {
-        "postgres" | "postgresql" | "redshift" | "opengauss" | "gaussdb" | "kingbase" | "highgo" | "vastbase"
-        | "kwdb" => "postgres",
+        "postgres" | "postgresql" | "redshift" | "opengauss" | "gaussdb" | "kingbase" | "highgo" | "uxdb"
+        | "vastbase" | "kwdb" => "postgres",
         "mysql" | "mariadb" | "doris" | "starrocks" | "manticoresearch" | "oceanbase" => "mysql",
         "sqlite" => "sqlite",
         "sqlserver" | "mssql" => "sqlserver",
@@ -88,12 +88,19 @@ fn classify_statement(stmt: &Statement, detect_select_into: bool) -> SqlRisk {
         // Show/Describe variants
         Statement::ShowTables { .. }
         | Statement::ShowColumns { .. }
+        | Statement::ShowCatalogs { .. }
         | Statement::ShowDatabases { .. }
         | Statement::ShowSchemas { .. }
+        | Statement::ShowViews { .. }
+        | Statement::ShowFunctions { .. }
         | Statement::ShowCreate { .. }
+        | Statement::ShowVariable { .. }
         | Statement::ShowVariables { .. }
         | Statement::ShowStatus { .. }
-        | Statement::ShowProcessList { .. } => SqlRisk::ReadOnly,
+        | Statement::ShowProcessList { .. }
+        | Statement::ShowCharset(_)
+        | Statement::ShowObjects(_)
+        | Statement::ShowCollation { .. } => SqlRisk::ReadOnly,
 
         // Write operations
         Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge { .. } => {
@@ -136,6 +143,9 @@ fn classify_statement(stmt: &Statement, detect_select_into: bool) -> SqlRisk {
 
 fn statement_is_dangerous(stmt: &Statement, detect_select_into: bool) -> bool {
     match stmt {
+        // `USE` only changes connection-local state. MCP separately requires
+        // a pinned session for it, so it does not need dangerous-SQL approval.
+        Statement::Use(_) => false,
         Statement::Query(query) => query_is_dangerous(query, detect_select_into),
         Statement::Insert(insert) => {
             insert.replace_into
@@ -592,6 +602,7 @@ const SIDE_EFFECT_SELECT_FUNCTIONS: &[&str] = &[
     "pg_try_advisory_lock",
     "pg_try_advisory_xact_lock",
     "setval",
+    "sys_cancel_backend",
 ];
 
 fn query_is_write_capable(query: &Query, detect_select_into: bool) -> bool {
@@ -673,6 +684,13 @@ pub fn classify_sql_risk(sql: &str, dialect: &str) -> Result<SqlRisk, String> {
 /// Classify SQL risk using both the parser dialect and the concrete database
 /// type so dialect-specific write forms cannot be mistaken for read queries.
 pub fn classify_sql_risk_for_database(sql: &str, database_type: DatabaseType) -> Result<SqlRisk, String> {
+    if let Some(risk) = crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type) {
+        return Ok(match risk {
+            crate::query_execution_sql::SearchEngineQueryRisk::ReadOnly => SqlRisk::ReadOnly,
+            crate::query_execution_sql::SearchEngineQueryRisk::Write => SqlRisk::Write,
+            crate::query_execution_sql::SearchEngineQueryRisk::Dangerous => SqlRisk::Ddl,
+        });
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     classify_sql_risk_with_database(sql, normalized, Some(database_type))
@@ -683,11 +701,14 @@ pub fn classify_sql_risk_for_database(sql: &str, database_type: DatabaseType) ->
 /// and single-table UPDATE/DELETE statements with an effective predicate;
 /// broader or opaque mutations require central high-risk permission.
 pub fn is_dangerous_sql_for_database(sql: &str, database_type: DatabaseType) -> bool {
+    if let Some(risk) = crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type) {
+        return risk == crate::query_execution_sql::SearchEngineQueryRisk::Dangerous;
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     let parser_dialect = resolve_dialect(normalized);
     let detect_select_into = supports_select_into_table_creation(database_type);
-    let has_locking_clause = sql_contains_top_level_locking_clause(sql, parser_dialect.as_ref());
+    let has_locking_clause = sql_contains_locking_clause(sql, parser_dialect.as_ref());
     // PostgreSQL-family and SQL Server SELECT INTO forms are represented in
     // the AST. Their text fallback also matches ordinary INSERT INTO, so only
     // use it for dialect-specific writes that the selected AST cannot express
@@ -709,6 +730,9 @@ pub fn is_dangerous_sql_for_database(sql: &str, database_type: DatabaseType) -> 
 /// A `USE` statement mutates pooled/session state and could redirect later SQL,
 /// so it is forbidden independently of read/write and high-risk permissions.
 pub fn mcp_sql_has_forbidden_database_switch(sql: &str, database_type: DatabaseType) -> bool {
+    if crate::query_execution_sql::classify_search_engine_query_risk(sql, database_type).is_some() {
+        return false;
+    }
     let database_type_name = format!("{database_type:?}");
     let normalized = normalize_dialect(&database_type_name);
     let dialect = resolve_dialect(normalized);
@@ -766,6 +790,7 @@ fn supports_select_into_table_creation(database_type: DatabaseType) -> bool {
             | DatabaseType::OpenGauss
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
+            | DatabaseType::Uxdb
             | DatabaseType::Vastbase
             | DatabaseType::Kwdb
             | DatabaseType::SqlServer
@@ -779,9 +804,16 @@ fn classify_sql_risk_with_database(
 ) -> Result<SqlRisk, String> {
     let parser_dialect = resolve_dialect(normalized_dialect);
     let detect_select_into = database_type.is_none();
-    let has_locking_clause = sql_contains_top_level_locking_clause(sql, parser_dialect.as_ref());
-    let has_dialect_specific_write = database_type
-        .is_some_and(|database_type| crate::query_execution_sql::has_dialect_specific_write(sql, database_type));
+    let has_locking_clause = sql_contains_locking_clause(sql, parser_dialect.as_ref());
+    let has_dialect_specific_write = match database_type {
+        Some(database_type) => crate::query_execution_sql::has_dialect_specific_write(sql, database_type),
+        // Preserve MySQL executable-comment and file-output detection even
+        // when callers provide a dialect string instead of a database type.
+        None if normalized_dialect == "mysql" => {
+            crate::query_execution_sql::has_dialect_specific_write(sql, DatabaseType::Mysql)
+        }
+        None => false,
+    };
 
     match Parser::parse_sql(parser_dialect.as_ref(), sql) {
         Ok(stmts) if !stmts.is_empty() => {
@@ -813,32 +845,35 @@ fn classify_sql_risk_with_database(
     }
 }
 
-fn sql_contains_top_level_locking_clause(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
+fn sql_contains_locking_clause(sql: &str, dialect: &dyn sqlparser::dialect::Dialect) -> bool {
     let Ok(tokens) = Tokenizer::new(dialect, sql).tokenize() else {
         return false;
     };
-    let mut depth: usize = 0;
-    let mut words = Vec::new();
+    let mut words: Vec<String> = Vec::with_capacity(4);
     for token in tokens {
         match token {
-            Token::LParen => depth += 1,
-            Token::RParen => depth = depth.saturating_sub(1),
-            token if depth == 0 => {
-                let word = token.to_string();
-                if word.chars().all(|character| character.is_ascii_alphabetic() || character == '_') {
-                    words.push(word.to_ascii_uppercase());
+            Token::Word(word) if word.quote_style.is_none() => {
+                words.push(word.value.to_ascii_uppercase());
+                if words.len() > 4 {
+                    words.remove(0);
+                }
+                if words.windows(2).any(|window| {
+                    matches!(window, [r#for, lock] if r#for == "FOR" && matches!(lock.as_str(), "UPDATE" | "SHARE"))
+                }) || words.windows(3).any(|window| {
+                    matches!(window, [r#for, key, share] if r#for == "FOR" && key == "KEY" && share == "SHARE")
+                }) || words.windows(4).any(|window| {
+                    matches!(window, [r#for, no, key, update] if r#for == "FOR" && no == "NO" && key == "KEY" && update == "UPDATE")
+                }) || words.windows(4).any(|window| {
+                    matches!(window, [lock, r#in, share, mode] if lock == "LOCK" && r#in == "IN" && share == "SHARE" && mode == "MODE")
+                }) {
+                    return true;
                 }
             }
-            _ => {}
+            Token::Whitespace(_) => {}
+            _ => words.clear(),
         }
     }
-    words.windows(2).any(|window| matches!(window, [r#for, lock] if r#for == "FOR" && matches!(lock.as_str(), "UPDATE" | "SHARE")))
-        || words.windows(3).any(|window| {
-            matches!(window, [r#for, key, share] if r#for == "FOR" && key == "KEY" && share == "SHARE")
-        })
-        || words.windows(4).any(|window| {
-            matches!(window, [r#for, no, key, update] if r#for == "FOR" && no == "NO" && key == "KEY" && update == "UPDATE")
-        })
+    false
 }
 
 #[cfg(test)]
@@ -855,6 +890,91 @@ mod tests {
         assert_eq!(classify_sql_risk("SHOW TABLES", "mysql").unwrap(), SqlRisk::ReadOnly);
         assert_eq!(classify_sql_risk("DESCRIBE users", "mysql").unwrap(), SqlRisk::ReadOnly);
         assert_eq!(classify_sql_risk("EXPLAIN SELECT * FROM users", "postgres").unwrap(), SqlRisk::ReadOnly);
+    }
+
+    #[test]
+    fn classify_mysql_show_triggers_as_read_only() {
+        for sql in [
+            "SHOW TRIGGERS;",
+            "SHOW TRIGGERS FROM `rs_main` LIKE 'trg_order_items_after_%';",
+            "show triggers in `rs_main` where `Event` = 'INSERT';",
+        ] {
+            assert_eq!(classify_sql_risk(sql, "mysql").unwrap(), SqlRisk::ReadOnly, "expected read-only: {sql}");
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                SqlRisk::ReadOnly,
+                "expected read-only: {sql}"
+            );
+            assert!(!is_dangerous_sql_for_database(sql, DatabaseType::Mysql), "expected safe SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn classify_supported_show_statements_as_read_only() {
+        for (sql, database_type) in [
+            ("SHOW COLLATION", DatabaseType::Mysql),
+            ("SHOW CHARACTER SET", DatabaseType::Mysql),
+            ("SHOW search_path", DatabaseType::Postgres),
+        ] {
+            assert_eq!(
+                classify_sql_risk_for_database(sql, database_type).unwrap(),
+                SqlRisk::ReadOnly,
+                "expected read-only: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_show_triggers_preserves_write_detection() {
+        for (sql, expected_risk) in [
+            ("SHOW TRIGGERS; DELETE FROM order_items", SqlRisk::Write),
+            ("SHOW TRIGGERS; DROP TABLE order_items", SqlRisk::Ddl),
+            ("SHOW TRIGGERS; /*!50000 DELETE FROM order_items */", SqlRisk::Write),
+        ] {
+            assert_eq!(classify_sql_risk(sql, "mysql").unwrap(), expected_risk, "expected write detection: {sql}");
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                expected_risk,
+                "expected write detection: {sql}"
+            );
+            assert!(is_dangerous_sql_for_database(sql, DatabaseType::Mysql), "expected dangerous SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn classify_mysql_legacy_shared_lock_reads_like_for_share() {
+        // MySQL's pre-8.0.1 spelling of `FOR SHARE` is still valid in 8.0.x and
+        // takes the same shared row locks, so it must not classify as a plain read.
+        for sql in [
+            "SELECT * FROM users LOCK IN SHARE MODE",
+            "SELECT * FROM users lock in share mode",
+            "SELECT id FROM users WHERE id = 1 LOCK IN SHARE MODE",
+            "WITH c AS (SELECT 1) SELECT * FROM users LOCK IN SHARE MODE",
+            "SELECT * FROM (SELECT * FROM users LOCK IN SHARE MODE) AS locked_users",
+            "WITH locked AS (SELECT * FROM users LOCK IN SHARE MODE) SELECT * FROM locked",
+            "SELECT (SELECT id FROM users LOCK IN SHARE MODE)",
+        ] {
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                SqlRisk::Write,
+                "expected locking read to be write-capable: {sql}"
+            );
+            assert!(is_dangerous_sql_for_database(sql, DatabaseType::Mysql), "expected high-risk SQL: {sql}");
+        }
+
+        // A column or alias literally named "mode" must stay a plain read.
+        for sql in [
+            "SELECT lock_in_share_mode FROM settings",
+            "SELECT mode FROM share WHERE id = 1",
+            "SELECT 'LOCK IN SHARE MODE'",
+            "SELECT lock, `in`, share, mode FROM settings",
+        ] {
+            assert_eq!(
+                classify_sql_risk_for_database(sql, DatabaseType::Mysql).unwrap(),
+                SqlRisk::ReadOnly,
+                "expected plain read: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -951,6 +1071,24 @@ mod tests {
                 "expected write-capable SQL: {sql}"
             );
             assert!(is_dangerous_sql_for_database(sql, DatabaseType::Postgres), "expected high-risk SQL: {sql}");
+        }
+    }
+
+    #[test]
+    fn classify_backend_query_cancellation_as_a_side_effect() {
+        for (sql, database_type) in [
+            ("SELECT pg_cancel_backend(42)", DatabaseType::Postgres),
+            ("SELECT sys_cancel_backend(42)", DatabaseType::Kingbase),
+        ] {
+            assert_eq!(
+                classify_sql_risk_for_database(sql, database_type).unwrap(),
+                SqlRisk::Write,
+                "expected query cancellation to be write-capable: {sql}"
+            );
+            assert!(
+                is_dangerous_sql_for_database(sql, database_type),
+                "expected query cancellation to require production protection: {sql}"
+            );
         }
     }
 
@@ -1229,5 +1367,26 @@ mod tests {
         // Statements not explicitly handled should be conservative (Write)
         // This depends on sqlparser's coverage, but we can test the catch-all
         assert_eq!(classify_sql_risk("GRANT SELECT ON users TO admin", "postgres").unwrap(), SqlRisk::Ddl);
+    }
+
+    #[test]
+    fn classifies_search_engine_rest_risk_by_method_and_path() {
+        for database_type in [DatabaseType::Elasticsearch, DatabaseType::Easysearch] {
+            assert_eq!(
+                classify_sql_risk_for_database("GET /_cluster/health", database_type).unwrap(),
+                SqlRisk::ReadOnly
+            );
+            assert_eq!(
+                classify_sql_risk_for_database("POST /products/_search\n{}", database_type).unwrap(),
+                SqlRisk::ReadOnly
+            );
+            assert_eq!(
+                classify_sql_risk_for_database("PUT /products/_doc/1\n{}", database_type).unwrap(),
+                SqlRisk::Write
+            );
+            assert!(!is_dangerous_sql_for_database("PUT /products/_doc/1\n{}", database_type));
+            assert_eq!(classify_sql_risk_for_database("DELETE /products", database_type).unwrap(), SqlRisk::Ddl);
+            assert!(is_dangerous_sql_for_database("DELETE /products", database_type));
+        }
     }
 }

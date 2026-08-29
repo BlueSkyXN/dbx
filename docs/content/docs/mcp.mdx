@@ -1,6 +1,6 @@
 ---
 title: MCP Integration
-description: Let AI coding agents query your databases through the Model Context Protocol.
+description: Let AI coding agents read metadata, query data, and use stateful sessions within DBX-managed Model Context Protocol policy.
 ---
 
 <Callout type="info">Connect your AI assistant to DBX and let it inspect schemas, query data, and open results in DBX.</Callout>
@@ -65,10 +65,29 @@ AI agent → DBX MCP → your database → results
 | Cursor | `.cursor/mcp.json` |
 | Windsurf | MCP configuration |
 | VS Code + Copilot | MCP extension/configuration |
+| DeepSeek Harness | `$DSH_HOME/profiles/<profile>/cordis.patch.yml` |
+
+### DeepSeek Harness
+
+DeepSeek Harness loads MCP servers through Cordis plugin entries instead of an `mcpServers` JSON object. After installing `@dbx-app/mcp-server`, merge the following entry into `$DSH_HOME/profiles/web/cordis.patch.yml` for the `web` profile: If `DSH_HOME` is unset, it defaults to `~/.dsh`.
+
+```yaml
+- insert:
+    - id: mcp-dbx
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: dbx
+        transport: stdio
+        command: dbx-mcp-server
+```
+
+Keep the top-level `- insert:` wrapper and do not overwrite other patch entries. For another DSH profile, replace `web` in the path with that profile name. The `dbx-mcp-server` command must be available on the DSH process's `PATH`; use the full executable path when necessary.
+
+Run `dsh web --dump-config` to verify the composed configuration, then restart DSH or let its hot reload apply the patch. The tools are exposed to the model as `mcp__dbx__<tool>`. Keep `serverName: dbx` stable so tool names and permission rules remain stable. Connection access and execution mode continue to be managed in **DBX Settings → MCP**.
 
 ## Tools
 
-DBX MCP currently provides 10 tools:
+DBX MCP currently provides 12 tools:
 
 | Tool | Description |
 | --- | --- |
@@ -79,17 +98,32 @@ DBX MCP currently provides 10 tools:
 | `dbx_describe_table` | Return columns and table metadata |
 | `dbx_get_schema_context` | Return compact schema context for an AI model |
 | `dbx_execute_query` | Execute SQL or a supported MongoDB shell command, returning at most 100 rows |
+| `dbx_open_session` | Open a stateful SQL query session pinned to one backend connection |
+| `dbx_close_session` | Close a session and release its pinned connection resources |
 | `dbx_execute_redis_command` | Execute a Redis command |
 | `dbx_open_table` | Open a table in the running DBX desktop app |
 | `dbx_execute_and_show` | Execute a query and display the result in DBX |
 
 Connection-scoped sessions hide connection-mutating and desktop UI tools.
 
+## Stateful Query Sessions
+
+Regular `dbx_execute_query` calls are independent. When a workflow must preserve database session state, call `dbx_open_session` first and pass its returned `sessionId` to later `dbx_execute_query` calls. Typical uses include:
+
+- `USE` or database-context changes
+- Temporary tables
+- Session variables and settings
+- Explicit transactions or multi-step diagnostics that require one connection
+
+Sessions support SQL connections only and are bound to one connection and database. Unknown, closed, or expired IDs fail instead of silently falling back to an ordinary query. Call `dbx_close_session` when finished. Idle sessions are reclaimed after 30 minutes, and the server allows at most 32 concurrent sessions.
+
+<Callout type="warn">A stateful session does not widen SQL policy. `USE` is meaningful only inside a session, while writes, DDL, production protection, connection read-only state, and database privileges are rechecked for every request.</Callout>
+
 ## Database Access
 
 ### Local connections
 
-MCP uses the connections saved in DBX. DBX does not need to remain open for database queries.
+MCP uses the connections saved in DBX. Connections that execute natively do not require the Desktop app to stay open; bridge-backed or installed Agent/driver paths still depend on their runtime.
 
 Common local paths include:
 
@@ -101,19 +135,25 @@ Common local paths include:
 
 Set `DBX_DATA_DIR` to the directory containing `dbx.db`. Do not set it to the file itself.
 
-PostgreSQL, MySQL, SQLite, compatible SQL databases, standalone Redis, and MongoDB can be queried locally. Some SSH, cluster, vendor-specific, and Agent/JDBC connections require their DBX components to be installed.
+Native SQL, standalone Redis, and MongoDB paths can execute directly through MCP. SSH, cluster, vendor-specific, external-driver, and Agent/JDBC availability depends on the connection configuration and installed DBX components. Do not assume that every database supported by the DBX product is bundled into the standalone MCP binary.
+
+DuckDB uses the standalone DBX DuckDB driver. Install it from **DBX Driver Manager** before querying a DuckDB connection through local MCP. The MCP binary includes the sidecar client but does not bundle the DuckDB engine.
 
 ### Agent/JDBC databases
 
-Oracle, KingBase, and XuguDB require their matching native DBX Agent but no JRE. Dameng, DB2, Hive, Trino, Snowflake, SAP HANA, and other JDBC Agent connections require the matching Agent, JDBC driver, and JRE. Install the required component in DBX before using MCP.
+Oracle, KingbaseES, and XuguDB require their matching native DBX Agent but no JRE. Dameng, DB2, Hive, Trino, Snowflake, SAP HANA, and other JDBC Agent connections require the matching Agent, JDBC driver, and JRE. Install the required component in DBX before using MCP.
 
 ### DBX Web and Docker mode
 
 Set `DBX_WEB_URL` to use a deployed DBX Web backend instead of local connections. If the Web login is protected, also set `DBX_WEB_PASSWORD` to the same login password.
 
+DBX Web requests honor the standard system proxy environment variables: `HTTPS_PROXY`/`https_proxy` for https URLs, `HTTP_PROXY`/`http_proxy` for http URLs, with `ALL_PROXY`/`all_proxy` as the fallback and `NO_PROXY`/`no_proxy` (comma-separated hosts, e.g. `localhost,127.0.0.1,.internal.example`) as the bypass list. An empty or unset proxy value means direct connection (no proxy). HTTP, HTTPS, and SOCKS5 proxies are supported (`http://127.0.0.1:7890` or `socks5://127.0.0.1:1080`); proxies requiring authentication use the standard `user:password@host:port` URL form, e.g. `http://admin:admin123@127.0.0.1:7890`. To attach extra headers to every DBX Web request (for example token auth in front of a gateway), set `DBX_WEB_HEADERS` to a JSON object of header names and string values, e.g. `{"Authorization":"Bearer <token>"}`. For self-signed HTTPS backends, certificate verification is on by default; set `DBX_WEB_INSECURE_SKIP_VERIFY=1` to disable verification, or set `DBX_WEB_CA_CERT` to a PEM/DER CA file to trust a private CA. The same variables are honored by the DBX CLI in Web mode.
+
+DBX Web and Docker require the same standalone DuckDB driver. Install it from Driver Manager after the first launch. Docker stores installed drivers under `/app/data/agents`, so they persist when `/app/data` is mounted as a volume.
+
 ### Desktop UI tools
 
-`dbx_open_table` and `dbx_execute_and_show` require the DBX desktop app to be running. Other query tools can run while DBX is closed.
+`dbx_open_table` and `dbx_execute_and_show` require the DBX desktop app and are unavailable in Web mode or when scoped policy hides UI tools. Whether other tools need Desktop depends on whether the connection uses native execution or a bridge/Agent path.
 
 ## Safety and Environment Variables
 
@@ -134,6 +174,11 @@ Updated servers do not let `DBX_MCP_ALLOW_WRITES` or `DBX_MCP_ALLOW_DANGEROUS_SQ
 | `DBX_DATA_DIR` | Override the local DBX data directory |
 | `DBX_WEB_URL` | Use a DBX Web/Docker backend |
 | `DBX_WEB_PASSWORD` | Authenticate to DBX Web |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | Standard system proxy variables for DBX Web requests; empty value means no proxy. Auth via `http://user:pass@host:port` |
+| `NO_PROXY` | Standard bypass list for the proxy above (comma-separated hosts) |
+| `DBX_WEB_HEADERS` | JSON object of extra HTTP headers for DBX Web requests, e.g. `{"Authorization":"Bearer token"}` |
+| `DBX_WEB_INSECURE_SKIP_VERIFY` | `1`/`true` disables TLS certificate verification for self-signed DBX Web backends (default: verify) |
+| `DBX_WEB_CA_CERT` | PEM/DER CA file to trust for DBX Web TLS verification |
 | `DBX_MCP_ALLOW_WRITES` | Upgrade compatibility only: `0`/`false` keeps an unconfigured policy read-only |
 | `DBX_MCP_SCOPE_CONNECTION_ID` | Compatibility scope for one connection ID |
 | `DBX_MCP_SCOPE_CONNECTION_IDS` | Compatibility scope for multiple connection IDs |
@@ -148,6 +193,7 @@ Updated servers do not let `DBX_MCP_ALLOW_WRITES` or `DBX_MCP_ALLOW_DANGEROUS_SQ
   <Accordion title="dbx.db cannot be found">Set `DBX_DATA_DIR` to the folder containing `dbx.db`. For Windows portable builds, this is normally the `data` folder beside `DBX.exe`.</Accordion>
   <Accordion title="DBX is not running">Only `dbx_open_table` and `dbx_execute_and_show` require the desktop app. Local query tools can run without DBX open.</Accordion>
   <Accordion title="An Agent/JDBC database cannot start">Install or update the matching DBX agent, JDBC driver, and JRE through DBX Driver Manager. Proprietary drivers are not included in the native MCP package.</Accordion>
+  <Accordion title="A DuckDB connection cannot start">Install or update the DuckDB driver through DBX Driver Manager. Local MCP, DBX Web, and Docker use the standalone driver rather than embedding the DuckDB engine.</Accordion>
   <Accordion title="I see a better-sqlite3 or Node ABI error">MCP does not require `better-sqlite3`. Upgrade `@dbx-app/mcp-server`; if the error comes from `@dbx-app/cli`, follow the CLI installation requirements because it is a separate package.</Accordion>
 </Accordions>
 

@@ -83,6 +83,13 @@ impl ProxyTunnelManager {
             }
         }
     }
+
+    pub async fn stop_all_tunnels(&self) {
+        let tunnels = std::mem::take(&mut *self.tunnels.lock().await);
+        for (handle, _) in tunnels.into_values() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -127,6 +134,28 @@ async fn connect_via_proxy(proxy: &ProxyEndpoint, remote: &RemoteEndpoint) -> Re
         ProxyType::Http => http_connect(stream, proxy, remote).await,
         ProxyType::Socks5 => socks5_connect(stream, proxy, remote).await,
     }
+}
+
+#[cfg(feature = "mq-admin")]
+pub(crate) async fn connect_via_socks5_proxy(
+    proxy_host: &str,
+    proxy_port: u16,
+    proxy_username: &str,
+    proxy_password: &str,
+    remote_host: &str,
+    remote_port: u16,
+) -> Result<TcpStream, String> {
+    connect_via_proxy(
+        &ProxyEndpoint {
+            proxy_type: ProxyType::Socks5,
+            host: proxy_host.to_string(),
+            port: proxy_port,
+            username: proxy_username.to_string(),
+            password: proxy_password.to_string(),
+        },
+        &RemoteEndpoint { host: remote_host.to_string(), port: remote_port },
+    )
+    .await
 }
 
 async fn http_connect(

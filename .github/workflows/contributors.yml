@@ -1,6 +1,8 @@
 name: Update Contributors
 
 on:
+  schedule:
+    - cron: "0 18 * * *"
   workflow_dispatch:
 
 permissions:

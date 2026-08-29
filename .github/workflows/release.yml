@@ -1,7 +1,9 @@
 name: Release
 
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -12,8 +14,34 @@ env:
   CNB_REGISTRY: "docker.cnb.cool"
 
 jobs:
+  release-ready:
+    name: Verify draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            RELEASE_JSON="$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json tagName,isDraft,body 2>/dev/null || true)"
+            if [ -n "$RELEASE_JSON" ] \
+              && [ "$(jq -r '.tagName' <<<"$RELEASE_JSON")" = "${GITHUB_REF_NAME}" ] \
+              && [ "$(jq -r '.isDraft' <<<"$RELEASE_JSON")" = true ] \
+              && [ -n "$(jq -r '.body' <<<"$RELEASE_JSON")" ]; then
+              echo "Agent-created draft release is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Agent-created draft release was not ready for ${GITHUB_REF_NAME}." >&2
+          exit 1
+
   nix-packaging:
     runs-on: ubuntu-22.04
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -34,6 +62,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          token: ${{ secrets.MCP_RELEASE_TOKEN }}
 
       - name: Find previous release tag
         id: prev-tag
@@ -59,24 +88,36 @@ jobs:
         shell: bash
         run: |
           TMP_DIR="$(mktemp -d)"
-          cp plugins/jdbc/pom.xml "$TMP_DIR/pom.xml"
+          cp plugins/jdbc/build.gradle "$TMP_DIR/build.gradle"
           cp plugins/jdbc/manifest.json "$TMP_DIR/manifest.json"
+          git restore plugins/jdbc/build.gradle plugins/jdbc/manifest.json
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git switch -C jdbc-plugin-version-bump origin/main
-          cp "$TMP_DIR/pom.xml" plugins/jdbc/pom.xml
+          cp "$TMP_DIR/build.gradle" plugins/jdbc/build.gradle
           cp "$TMP_DIR/manifest.json" plugins/jdbc/manifest.json
-          git add plugins/jdbc/pom.xml plugins/jdbc/manifest.json
+          git add plugins/jdbc/build.gradle plugins/jdbc/manifest.json
           if git diff --cached --quiet; then
             echo "JDBC plugin version ${{ steps.bump.outputs.new_version }} is already on main."
             exit 0
           fi
           git commit -m "chore(jdbc): bump plugin version [skip ci]"
-          git push origin HEAD:main
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Unable to push JDBC plugin version bump after ${attempt} attempts."
+              exit 1
+            fi
+            git fetch origin main --no-tags
+            git rebase origin/main
+          done
 
   build:
+    needs: release-ready
     strategy:
       fail-fast: false
       matrix:
@@ -89,12 +130,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - platform: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - platform: windows-2022
-            target: x86_64-pc-windows-msvc
-            arch: x64
-          - platform: windows-2022
-            target: aarch64-pc-windows-msvc
-            arch: arm64
 
     runs-on: ${{ matrix.platform }}
     env:
@@ -145,6 +180,23 @@ jobs:
             echo "SCCACHE_S3_USE_SSL=true"
             echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
             echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
+            # Linking, bundling, and signing run for 30+ minutes after the last
+            # rustc call; the server's 10-minute default idle timeout would
+            # exit first and zero the counters shown by "Show sccache stats".
+            echo "SCCACHE_IDLE_TIMEOUT=0"
+            # Also cache the C/C++ compilation of -sys crates. All matrix legs
+            # are native builds, so plain CC/CXX select the target compiler;
+            # MSVC stays unwrapped. SCCACHE_PATH avoids depending on PATH.
+            case "${RUNNER_OS}" in
+              Linux)
+                echo "CC=${SCCACHE_PATH} cc"
+                echo "CXX=${SCCACHE_PATH} c++"
+                ;;
+              macOS)
+                echo "CC=${SCCACHE_PATH} clang"
+                echo "CXX=${SCCACHE_PATH} clang++"
+                ;;
+            esac
           } >> "$GITHUB_ENV"
 
       - name: Compute Rust dependency hash
@@ -191,7 +243,9 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils
+          # Bundle GTK input-method modules from the same Jammy ABI baseline
+          # instead of loading potentially incompatible modules from the host.
+          sudo apt-get install -y fcitx5-frontend-gtk3 ibus-gtk3 libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils
 
       - name: Setup Tauri signing key
         shell: bash
@@ -203,25 +257,6 @@ jobs:
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
           fi
 
-      - name: Generate release notes
-        id: release-notes
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-            -f tag_name="${GITHUB_REF_NAME}" \
-            --jq '.body')"
-          if [ -z "$BODY" ]; then
-            BODY="DBX ${GITHUB_REF_NAME}"
-          fi
-          DELIM="RELEASE_NOTES_$(date +%s%N)"
-          {
-            echo "body<<$DELIM"
-            printf '%s\n' "$BODY"
-            echo "$DELIM"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -232,11 +267,13 @@ jobs:
           APPLE_TEAM_ID: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_TEAM_ID || '' }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "DBX ${{ github.ref_name }}"
-          releaseBody: ${{ steps.release-notes.outputs.body }}
           releaseDraft: true
-          prerelease: false
           args: --target ${{ matrix.target }}
+
+      - name: Verify AppImage input methods
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: ./.github/scripts/verify-appimage-input-methods.sh "target/${{ matrix.target }}/release/bundle/appimage"
 
       - name: Show sccache stats
         if: always()
@@ -244,12 +281,201 @@ jobs:
         shell: bash
         run: ${SCCACHE_PATH} --show-stats
 
+  build-windows:
+    needs: release-ready
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+    runs-on: windows-2022
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
+      VSIGN_CERT_HASH: ${{ vars.VSIGN_CERT_HASH }}
+      VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
+      VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
+      VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.10.0"
+
+      - name: Configure S3 sccache
+        if: env.SCCACHE_GHA_ENABLED != 'true'
+        shell: bash
+        env:
+          CACHE_BUCKET: ${{ secrets.SCCACHE_S3_BUCKET }}
+          CACHE_ENDPOINT: ${{ secrets.SCCACHE_S3_ENDPOINT }}
+          CACHE_REGION: ${{ secrets.SCCACHE_S3_REGION }}
+          CACHE_KEY_PREFIX: ${{ secrets.SCCACHE_S3_KEY_PREFIX }}
+          CACHE_ACCESS_KEY_ID: ${{ secrets.SCCACHE_S3_ACCESS_KEY_ID }}
+          CACHE_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_S3_SECRET_ACCESS_KEY }}
+        run: |
+          {
+            echo "SCCACHE_BUCKET=${CACHE_BUCKET}"
+            echo "SCCACHE_ENDPOINT=${CACHE_ENDPOINT}"
+            echo "SCCACHE_REGION=${CACHE_REGION}"
+            echo "SCCACHE_S3_KEY_PREFIX=${CACHE_KEY_PREFIX}"
+            echo "SCCACHE_S3_USE_SSL=true"
+            echo "AWS_ACCESS_KEY_ID=${CACHE_ACCESS_KEY_ID}"
+            echo "AWS_SECRET_ACCESS_KEY=${CACHE_SECRET_ACCESS_KEY}"
+            # Linking, bundling, and signing run for 30+ minutes after the last
+            # rustc call; the server's 10-minute default idle timeout would
+            # exit first and zero the counters shown by "Show sccache stats".
+            echo "SCCACHE_IDLE_TIMEOUT=0"
+            # Also cache the C/C++ compilation of -sys crates. All matrix legs
+            # are native builds, so plain CC/CXX select the target compiler;
+            # MSVC stays unwrapped. SCCACHE_PATH avoids depending on PATH.
+            case "${RUNNER_OS}" in
+              Linux)
+                echo "CC=${SCCACHE_PATH} cc"
+                echo "CXX=${SCCACHE_PATH} c++"
+                ;;
+              macOS)
+                echo "CC=${SCCACHE_PATH} clang"
+                echo "CXX=${SCCACHE_PATH} clang++"
+                ;;
+            esac
+          } >> "$GITHUB_ENV"
+
+      - name: Compute Rust dependency hash
+        id: deps-hash
+        shell: bash
+        run: |
+          {
+            find . -name Cargo.toml -not -path './target/*' -print0 \
+              | sort -z \
+              | xargs -0 sed -E '/^version = /d'
+            grep -v '^version = ' Cargo.lock
+          } | sha256sum | cut -d' ' -f1 | {
+            read -r hash
+            echo "hash=${hash:0:20}" >> "$GITHUB_OUTPUT"
+          }
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: release-${{ matrix.target }}-${{ steps.deps-hash.outputs.hash }}
+          add-rust-environment-hash-key: false
+          cache-targets: false
+          cache-on-failure: true
+
+      - name: Setup Tauri signing key
+        shell: bash
+        run: |
+          echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/updater.key"
+          KEY_B64=$(base64 < "$RUNNER_TEMP/updater.key" | tr -d '\r\n')
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Setup TrustAsia VSign
+        shell: pwsh
+        env:
+          VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
+          VSIGN_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+        run: ./.github/scripts/setup-vsign.ps1
+
+      - name: Build and sign Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseDraft: true
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.vsign.conf.json
+
+      - name: Verify Windows bundles
+        shell: pwsh
+        run: |
+          $bundleRoot = "target/${{ matrix.target }}/release/bundle"
+          $nsisInstallers = @(
+            Get-ChildItem (Join-Path $bundleRoot "nsis") -Filter "*.exe" -File -ErrorAction SilentlyContinue
+          )
+          $msiInstallers = @(
+            Get-ChildItem (Join-Path $bundleRoot "msi") -Filter "*.msi" -File -ErrorAction SilentlyContinue
+          )
+          if ($nsisInstallers.Count -eq 0) {
+            throw "No NSIS installer was produced for ${{ matrix.target }}"
+          }
+          if ($msiInstallers.Count -eq 0) {
+            throw "No MSI installer was produced for ${{ matrix.target }}"
+          }
+          ./.github/scripts/assert-authenticode.ps1 -Path @(
+            $nsisInstallers.FullName
+            $msiInstallers.FullName
+          )
+
+      - name: Upload Windows WebView2 offline installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $arch = "${{ matrix.arch }}"
+          $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
+          $offlineName = "DBX_${version}_${arch}-webview2-offline-setup.exe"
+          $before = @{}
+
+          if (Test-Path $bundleDir) {
+            Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
+          }
+
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} `
+            --config src-tauri/tauri.webview2-offline.conf.json `
+            --config src-tauri/tauri.vsign.conf.json
+
+          $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
+            Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+
+          if (!$installer) {
+            throw "Missing WebView2 offline installer in ${bundleDir}"
+          }
+
+          ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
+          Copy-Item $installer.FullName $offlineName -Force
+          gh release upload "${env:GITHUB_REF_NAME}" $offlineName --repo "${env:GITHUB_REPOSITORY}" --clobber
+
       - name: Upload Windows portable ZIP
-        if: matrix.arch == 'x64' || matrix.arch == 'arm64'
         timeout-minutes: 20
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
           $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
           $arch = "${{ matrix.arch }}"
@@ -261,13 +487,14 @@ jobs:
           $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
 
           if (!(Test-Path $exePath)) {
-            Write-Error "Missing Windows executable: $exePath"
-            exit 1
+            throw "Missing Windows executable: $exePath"
           }
           if (!$appVersion -or $appVersion -ne $version) {
-            Write-Error "Release tag version $version does not match the built DBX package version $appVersion"
-            exit 1
+            throw "Release tag version $version does not match the built DBX package version $appVersion"
           }
+
+          ./.github/scripts/vsign-sign.ps1 -FilePath $exePath
+          ./.github/scripts/assert-authenticode.ps1 -Path $exePath
 
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
           Copy-Item $exePath (Join-Path $portableDir "DBX.exe") -Force
@@ -296,45 +523,255 @@ jobs:
 
           $signatureName = "${zipName}.sig"
           if (!(Test-Path $signatureName)) {
-            Write-Error "Missing portable update signature: $signatureName"
-            exit 1
+            throw "Missing portable update signature: $signatureName"
           }
 
           gh release upload "${env:GITHUB_REF_NAME}" $zipName $signatureName --repo "${env:GITHUB_REPOSITORY}" --clobber
 
-      - name: Upload Windows WebView2 offline installer
-        if: matrix.arch == 'x64' || matrix.arch == 'arm64'
+      - name: Show sccache stats
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Remove temporary VSign files
+        if: always()
+        shell: pwsh
+        run: |
+          $workDir = if ([string]::IsNullOrWhiteSpace($env:VSIGN_WORK_DIR)) {
+            Join-Path $env:RUNNER_TEMP "vsign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          } else {
+            $env:VSIGN_WORK_DIR
+          }
+          if (Test-Path -LiteralPath $workDir) {
+            Remove-Item -LiteralPath $workDir -Recurse -Force
+          }
+
+  build-windows-7-offline:
+    needs: release-ready
+    runs-on: windows-2022
+    environment: release-signing
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
+      VSIGN_CERT_HASH: ${{ vars.VSIGN_CERT_HASH }}
+      VSIGN_OPERATOR_SHA1: ${{ vars.VSIGN_OPERATOR_SHA1 }}
+      VSIGN_SERVER: ${{ vars.VSIGN_SERVER }}
+      VSIGN_TOOL_SHA256: ${{ vars.VSIGN_TOOL_SHA256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust for Windows 7
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-07-22
+          components: rust-src
+
+      - name: Prepare Win7-compatible WebView2 loader
+        shell: pwsh
+        run: ./.github/scripts/prepare-webview2-win7-loader.ps1
+
+      - name: Prepare WebView2 109 fixed runtime
+        shell: pwsh
+        run: ./.github/scripts/prepare-webview2-win7-runtime.ps1
+
+      - name: Probe WebView2 109 fixed runtime
+        shell: pwsh
+        run: ./.github/scripts/assert-webview2-win7-runtime.ps1
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: release-x86_64-win7-windows-msvc
+          add-rust-environment-hash-key: true
+          cache-targets: false
+          cache-on-failure: true
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build DBX for Windows 7
+        shell: pwsh
+        run: |
+          $env:TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw
+          cargo build --locked --package dbx --release --features custom-protocol --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
+
+      - name: Audit Windows 7 PE imports
+        shell: pwsh
+        run: ./.github/scripts/assert-win7-pe-compat.ps1 -BinaryPath target/x86_64-win7-windows-msvc/release/dbx.exe
+
+      - name: Setup TrustAsia VSign
+        shell: pwsh
+        env:
+          VSIGN_OPERATOR_PFX_B64: ${{ secrets.VSIGN_OPERATOR_PFX_B64 }}
+          VSIGN_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+        run: ./.github/scripts/setup-vsign.ps1
+
+      - name: Bundle and upload Windows 7 fixed-runtime installer
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSIGNCODE_OPERATOR_PWD: ${{ secrets.VSIGN_OPERATOR_PWD }}
+          VSIGN_KEY_PIN: ${{ secrets.VSIGN_KEY_PIN }}
         run: |
           $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
-          $arch = "${{ matrix.arch }}"
-          $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
-          $offlineName = "DBX_${version}_${arch}-webview2-offline-setup.exe"
-          $before = @{}
+          $bundleDir = "target/x86_64-win7-windows-msvc/release/bundle/nsis"
+          $offlineName = "DBX_${version}_x64-win7-webview2-109-offline-setup.exe"
+          $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx" } | Select-Object -First 1).version
 
-          if (Test-Path $bundleDir) {
-            Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
-          }
-
-          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json
-
-          $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
-            Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
-            Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-
-          if (!$installer) {
-            Write-Error "Missing WebView2 offline installer in ${bundleDir}"
+          if (!$appVersion -or $appVersion -ne $version) {
+            Write-Error "Release tag version $version does not match the built DBX package version $appVersion"
             exit 1
           }
+
+          pnpm tauri bundle --bundles nsis --target x86_64-win7-windows-msvc `
+            --config src-tauri/tauri.webview2-win7-fixed.conf.json `
+            --config src-tauri/tauri.vsign.conf.json
+
+          $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (!$installer) {
+            Write-Error "Missing Windows 7 fixed-runtime installer in ${bundleDir}"
+            exit 1
+          }
+
+          ./.github/scripts/assert-win7-installer-content.ps1 -InstallerPath $installer.FullName
+          ./.github/scripts/assert-authenticode.ps1 -Path $installer.FullName
 
           Copy-Item $installer.FullName $offlineName -Force
           gh release upload "${env:GITHUB_REF_NAME}" $offlineName --repo "${env:GITHUB_REPOSITORY}" --clobber
 
+      - name: Remove temporary VSign files
+        if: always()
+        shell: pwsh
+        run: |
+          $workDir = if ([string]::IsNullOrWhiteSpace($env:VSIGN_WORK_DIR)) {
+            Join-Path $env:RUNNER_TEMP "vsign-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          } else {
+            $env:VSIGN_WORK_DIR
+          }
+          if (Test-Path -LiteralPath $workDir) {
+            Remove-Item -LiteralPath $workDir -Recurse -Force
+          }
+
+  static-browser:
+    # Fully static musl builds of the browser (dbx-web) variant. No glibc
+    # dependency, so the tarball runs on any Linux distribution (verified in
+    # the oldest pullable Ubuntu container for each arch).
+    needs: release-ready
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            arch: x64
+            rustflags: "-C target-feature=+crt-static"
+          - platform: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+            # 64K max-page-size keeps the binary compatible with 4K/16K/64K
+            # page-size ARM64 kernels.
+            rustflags: "-C target-feature=+crt-static -C link-arg=-z -C link-arg=max-page-size=65536"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./ -> target"
+          shared-key: static-browser-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build static web binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          cargo zigbuild --release -p dbx-web --target ${{ matrix.target }} \
+            --no-default-features --features "duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
+
+      - name: Package static browser runtime
+        env:
+          DBX_STATIC_TARGET: ${{ matrix.target }}
+        run: |
+          chmod +x scripts/package-web-static.sh scripts/verify-web-static.sh
+          ./scripts/package-web-static.sh
+
+      - name: Verify inside oldest available Ubuntu container
+        run: |
+          VERIFY_IMAGE=""
+          for image in ubuntu:14.04 ubuntu:16.04; do
+            if docker pull "$image" >/dev/null 2>&1; then
+              VERIFY_IMAGE="$image"
+              break
+            fi
+          done
+          if [ -z "$VERIFY_IMAGE" ]; then
+            echo "no legacy Ubuntu image available for $(uname -m)" >&2
+            exit 1
+          fi
+          echo "Verifying in $VERIFY_IMAGE"
+          docker run --rm -v "$PWD:/workspace" -w /workspace "$VERIFY_IMAGE" \
+            bash scripts/verify-web-static.sh \
+            "dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "dbx-web") | .version')"
+          if [ "$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "Release tag version $VERSION does not match dbx-web package version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          SOURCE="dist-web-static/dbx-linux-${{ matrix.arch }}-browser-static.tar.gz"
+          ASSET="DBX_${VERSION}_${{ matrix.arch }}-browser-static.tar.gz"
+          CHECKSUM="${ASSET}.sha256"
+          cp "$SOURCE" "$ASSET"
+          sha256sum "$ASSET" | tee "$CHECKSUM"
+          gh release upload "${GITHUB_REF_NAME}" "$ASSET" "$CHECKSUM" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
   cleanup-release-signatures:
-    needs: build
+    needs: [build, build-windows, build-windows-7-offline]
     runs-on: ubuntu-latest
     steps:
       - name: Remove standalone updater signature assets
@@ -373,8 +810,8 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
-          cache: maven
+          java-version: "21"
+          cache: gradle
 
       - name: Apply automatic JDBC plugin version bump
         shell: bash
@@ -384,7 +821,7 @@ jobs:
         id: jdbc-plugin
         shell: bash
         run: |
-          VERSION="$(grep -m1 '<version>' plugins/jdbc/pom.xml | sed -E 's/.*<version>([^<]+)<.*/\1/')"
+          VERSION="$(sed -nE "s/^version[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" plugins/jdbc/build.gradle | head -n 1)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Package JDBC plugin
@@ -421,8 +858,9 @@ jobs:
             --clobber
 
   publish:
-    # Keep the release as a draft until every platform and the Nix package pass.
-    needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin, nix-packaging]
+    # Keep the release as a draft until every release-blocking platform job passes.
+    # Nix packaging is advisory and runs independently from publication.
+    needs: [cleanup-release-signatures, docker-manifest, jdbc-plugin, static-browser]
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
@@ -463,6 +901,18 @@ jobs:
           node .github/scripts/sync-cnb-release.mjs \
             --github-release "$RUNNER_TEMP/github-release/release.json" \
             --assets-dir "$RUNNER_TEMP/release-assets"
+
+      - name: Keep latest five app releases in CNB
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          node .github/scripts/cleanup-cnb-releases.mjs \
+            --current-tag "$CURRENT_TAG" \
+            --tag-pattern '^v[0-9]+[.][0-9]+[.][0-9]+([.-][0-9A-Za-z.-]+)?$' \
+            --retain 5 \
+            --apply
 
   docker:
     runs-on: ubuntu-latest

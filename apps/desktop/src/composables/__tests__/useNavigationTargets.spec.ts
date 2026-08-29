@@ -5,12 +5,13 @@ import type { QueryTab } from "@/types/database";
 
 const mocks = vi.hoisted(() => ({
   tabs: [] as QueryTab[],
-  reuseDataTab: true,
   activeTabId: "",
+  buildTableSelectSql: vi.fn(),
   databaseType: "postgres" as string,
   ensureConnected: vi.fn(),
   executeTabSql: vi.fn(),
   getColumns: vi.fn(),
+  invalidateCompletionTableCache: vi.fn(),
   listIndexes: vi.fn(),
   setTableMeta: vi.fn(),
   updateSql: vi.fn(),
@@ -27,7 +28,9 @@ vi.mock("@/stores/connectionStore", () => ({
     getConfig: () => ({ id: "connection-1", db_type: mocks.databaseType }),
     ensureConnected: mocks.ensureConnected,
     connectionIdentifierQuote: () => undefined,
+    metadataGenerationFor: () => 0,
     refreshObjectListTreeNode: vi.fn(),
+    invalidateCompletionTableCache: mocks.invalidateCompletionTableCache,
   }),
 }));
 
@@ -78,11 +81,11 @@ vi.mock("@/stores/queryStore", () => ({
 }));
 
 vi.mock("@/stores/settingsStore", () => ({
-  useSettingsStore: () => ({ editorSettings: { reuseDataTab: mocks.reuseDataTab } }),
+  useSettingsStore: () => ({ editorSettings: { dataTabReuseMode: "same-table" } }),
 }));
 
 vi.mock("@/lib/table/tableSelectSql", () => ({
-  buildTableSelectSql: async ({ tableName }: { tableName: string }) => `SELECT * FROM ${tableName}`,
+  buildTableSelectSql: mocks.buildTableSelectSql,
 }));
 
 const dialogs = {
@@ -100,15 +103,15 @@ describe("useNavigationTargets openTableTarget", () => {
     clearTableMetadataCache();
     vi.clearAllMocks();
     mocks.tabs.length = 0;
-    mocks.reuseDataTab = true;
     mocks.databaseType = "postgres";
     mocks.ensureConnected.mockResolvedValue(undefined);
+    mocks.buildTableSelectSql.mockImplementation(async ({ tableName }: { tableName: string }) => `SELECT * FROM ${tableName}`);
     mocks.executeTabSql.mockResolvedValue(undefined);
     mocks.getColumns.mockResolvedValue([column("id")]);
     mocks.listIndexes.mockResolvedValue([]);
   });
 
-  it("marks row identity pending until real metadata lands", async () => {
+  it("loads stable row identity before the first PostgreSQL table query", async () => {
     let releaseColumns: (columns: unknown[]) => void = () => {};
     mocks.getColumns.mockReturnValueOnce(
       new Promise((resolve) => {
@@ -124,10 +127,15 @@ describe("useNavigationTargets openTableTarget", () => {
     releaseColumns([column("id")]);
     await open;
 
-    // 数据查询执行期间元数据未落地：行标识等待必须已挂起
-    expect(pendingDuringQuery).toBe(true);
+    expect(pendingDuringQuery).toBe(false);
     expect(mocks.tabs[0]?.tableMeta?.primaryKeys).toEqual(["id"]);
     expect(mocks.tabs[0]?.tableMetaPending).toBe(false);
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledWith(
+      expect.objectContaining({
+        columns: ["id"],
+        primaryKeys: ["id"],
+      }),
+    );
   });
 
   it("reuses cached metadata and force-refreshes it once per catalog after a structure save", async () => {
@@ -138,17 +146,17 @@ describe("useNavigationTargets openTableTarget", () => {
     await navigation.openLineageTarget(target);
     expect(mocks.getColumns).toHaveBeenCalledTimes(1);
 
-    const firstTab = mocks.tabs[0]!;
-    mocks.tabs.push({ ...firstTab, id: "tab-2", tableMeta: { ...firstTab.tableMeta! } });
     mocks.getColumns.mockResolvedValueOnce([column("fresh_id")]);
 
     await navigation.onStructureEditorSaved(vi.fn().mockResolvedValue(undefined), vi.fn(), {
       connectionId: target.connectionId,
       database: target.database,
       schema: target.schema,
+      catalog: target.catalog,
       tableName: target.tableName,
     });
 
+    expect(mocks.invalidateCompletionTableCache).toHaveBeenCalledWith("connection-1", "app", "users", "public", "catalog-1");
     expect(mocks.getColumns).toHaveBeenCalledTimes(2);
     expect(mocks.tabs.map((tab) => tab.tableMeta?.primaryKeys)).toEqual([["fresh_id"], ["fresh_id"]]);
   });
@@ -172,8 +180,7 @@ describe("useNavigationTargets openTableTarget", () => {
     expect(mocks.getColumns.mock.calls.some(([connectionId, database, schema, tableName]) => connectionId === "connection-1" && database === "analytics" && schema === "analytics" && tableName === "events")).toBe(true);
   });
 
-  it("does not let a stale navigation land metadata over a newer target on a reused tab", async () => {
-    // A 的 getColumns 挂起；B 复用同一 tab 后 A 才返回
+  it("opens different targets in separate tabs even when sidebar data-tab reuse is enabled", async () => {
     const columnGates = new Map<string, (columns: unknown[]) => void>();
     mocks.getColumns.mockImplementation(
       (_connectionId: string, _database: string, _schema: string, tableName: string) =>
@@ -182,25 +189,19 @@ describe("useNavigationTargets openTableTarget", () => {
         }),
     );
     const navigation = useNavigationTargets(dialogs);
-    const openA = navigation.openLineageTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_a" });
+    const openA = navigation.openTableTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_a" });
     await vi.waitFor(() => expect(columnGates.has("table_a")).toBe(true));
 
-    const openB = navigation.openLineageTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_b" });
+    const openB = navigation.openTableTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_b" });
     await vi.waitFor(() => expect(columnGates.has("table_b")).toBe(true));
-    expect(mocks.tabs).toHaveLength(1);
+    expect(mocks.tabs).toHaveLength(2);
+    expect(mocks.tabs.map((tab) => tab.tableMeta?.tableName)).toEqual(["table_a", "table_b"]);
 
-    // 旧 A 晚返回：不得覆盖 B 的占位身份，不得解除 B 的行标识等待
     columnGates.get("table_a")?.([column("a_id")]);
-    await openA;
-    expect(mocks.tabs[0]?.tableMeta?.tableName).toBe("table_b");
-    expect(mocks.tabs[0]?.tableMetaPending).toBe(true);
-
-    // B 返回后正常落地
     columnGates.get("table_b")?.([column("b_id")]);
-    await openB;
-    expect(mocks.tabs[0]?.tableMeta?.tableName).toBe("table_b");
-    expect(mocks.tabs[0]?.tableMeta?.primaryKeys).toEqual(["b_id"]);
-    expect(mocks.tabs[0]?.tableMetaPending).toBe(false);
+    await Promise.all([openA, openB]);
+    expect(mocks.tabs.map((tab) => tab.tableMeta?.primaryKeys)).toEqual([["a_id"], ["b_id"]]);
+    expect(mocks.tabs.every((tab) => tab.tableMetaPending === false)).toBe(true);
   });
 
   it("stops landing when another entry point takes over the tab, even for the same table", async () => {
@@ -256,29 +257,5 @@ describe("useNavigationTargets openTableTarget", () => {
 
     // 无取消请求：元数据落地后按既有行为执行第二次查询
     expect(mocks.executeTabSql).toHaveBeenCalledTimes(2);
-  });
-
-  it("invalidates the previous execution id when a new navigation reuses the tab", async () => {
-    const columnGates = new Map<string, (columns: unknown[]) => void>();
-    mocks.getColumns.mockImplementation(
-      (_connectionId: string, _database: string, _schema: string, tableName: string) =>
-        new Promise((resolve) => {
-          columnGates.set(tableName, resolve);
-        }),
-    );
-    const navigation = useNavigationTargets(dialogs);
-    const openA = navigation.openLineageTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_a" });
-    await vi.waitFor(() => expect(columnGates.has("table_a")).toBe(true));
-    const executionIdForA = mocks.tabs[0]?.executionId;
-
-    const openB = navigation.openLineageTarget({ connectionId: "connection-1", database: "app", schema: "public", tableName: "table_b" });
-    // B 开始即作废 A 的执行代次，A 在途查询结果无法再按旧 executionId 落地
-    expect(mocks.tabs[0]?.executionId).toBeDefined();
-    expect(mocks.tabs[0]?.executionId).not.toBe(executionIdForA);
-
-    columnGates.get("table_a")?.([column("a_id")]);
-    await vi.waitFor(() => expect(columnGates.has("table_b")).toBe(true));
-    columnGates.get("table_b")?.([column("b_id")]);
-    await Promise.all([openA, openB]);
   });
 });

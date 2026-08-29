@@ -55,15 +55,25 @@ impl ChClient {
     }
 }
 
-/// 归一化用户填写的「URL 参数」：去除首尾空白与开头的 `?`/`&`，
-/// 返回可直接拼接到 query string 的片段；为空时返回 None。
+const CLICKHOUSE_CLIENT_ONLY_PARAMS: [&str; 2] = ["secure", "ssl"];
+
+/// 归一化用户填写的「URL 参数」，并排除传输层参数。ClickHouse HTTP
+/// 会把其余 URL 参数解释为服务端 setting，因此 JDBC 风格的 SSL 参数
+/// 不能继续透传，否则连接测试本身就会触发 UNKNOWN_SETTING。
 fn normalize_extra_params(params: Option<&str>) -> Option<String> {
-    let trimmed = params?.trim().trim_start_matches('?').trim_start_matches('&').trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    let trimmed = params?.trim().trim_start_matches(['?', '&', ';']).trim();
+    let params = trimmed
+        .split(['&', ';'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part).trim();
+            let key = percent_encoding::percent_decode_str(key).decode_utf8_lossy();
+            !CLICKHOUSE_CLIENT_ONLY_PARAMS.iter().any(|candidate| key.eq_ignore_ascii_case(candidate))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    (!params.is_empty()).then_some(params)
 }
 
 fn expand_cert_path(path: &str) -> String {
@@ -119,6 +129,7 @@ struct ChColumn {
     _type: String,
 }
 
+#[derive(Clone, Copy)]
 enum QueryResultLimit {
     Unlimited,
     Limited(usize),
@@ -169,11 +180,21 @@ fn build_query_url_with_format(
     if let QueryResultLimit::Limited(max_rows) = limit {
         url.push_str(&format!("&max_result_rows={max_rows}&result_overflow_mode=break"));
     }
-    // 用户自定义 URL 参数放在最后追加，允许其覆盖前面的默认设置（ClickHouse 取同名参数的最后一个值）
-    if let Some(params) = normalize_extra_params(extra_params) {
+    append_extra_params(&mut url, extra_params);
+    url
+}
+
+fn append_extra_params(url: &mut String, extra_params: Option<&str>) {
+    // 用户自定义服务端 setting 放在最后，允许其覆盖驱动默认值。
+    if let Some(params) = extra_params.filter(|params| !params.is_empty()) {
         url.push('&');
-        url.push_str(&params);
+        url.push_str(params);
     }
+}
+
+fn build_connection_test_url(base_url: &str, extra_params: Option<&str>) -> String {
+    let mut url = format!("{}/?query=SELECT%201", base_url);
+    append_extra_params(&mut url, extra_params);
     url
 }
 
@@ -283,6 +304,10 @@ async fn ch_query_with_limit(
     database: Option<&str>,
     limit: QueryResultLimit,
 ) -> Result<ChJsonResult, String> {
+    let max_rows = match limit {
+        QueryResultLimit::Unlimited => None,
+        QueryResultLimit::Limited(max_rows) => Some(max_rows),
+    };
     let url = build_query_url(&client.base_url, database, limit, client.extra_params.as_deref());
     log::info!("[clickhouse] query url={url} user={:?} has_pass={}", client.username, client.password.is_some());
     let req = build_request(client, client.http.post(&url).body(sql.to_string()));
@@ -291,24 +316,68 @@ async fn ch_query_with_limit(
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         log::error!("[clickhouse] error body: {body}");
-        return Err(format!("ClickHouse error: {body}"));
+        let error = format!("ClickHouse error: {body}");
+        if let Some(max_rows) = max_rows.filter(|_| is_readonly_result_limit_error(&error)) {
+            log::warn!(
+                "[clickhouse] server-side result limit rejected by readonly profile; retrying with client-side limit"
+            );
+            return ch_query_with_client_limit(client, sql, database, max_rows).await;
+        }
+        return Err(error);
     }
     resp.json::<ChJsonResult>().await.map_err(|e| format!("ClickHouse parse error: {e}"))
 }
 
-pub async fn stream_query_with_max_rows(
+fn is_readonly_result_limit_error(error: &str) -> bool {
+    let readonly_error = error.contains("Code: 164") || error.contains("(READONLY)");
+    readonly_error
+        && ["max_result_rows", "result_overflow_mode"]
+            .iter()
+            .any(|setting| error.contains(&format!("Cannot modify '{setting}' setting in readonly mode")))
+}
+
+async fn ch_query_with_client_limit(
     client: &ChClient,
-    database: &str,
+    sql: &str,
+    database: Option<&str>,
+    max_rows: usize,
+) -> Result<ChJsonResult, String> {
+    let mut meta = Vec::new();
+    let mut data = Vec::new();
+    let mut collect_item = |item| {
+        match item {
+            ClickHouseQueryStreamItem::Columns { columns, column_types } => {
+                if columns.len() != column_types.len() {
+                    return Err("ClickHouse stream returned mismatched column names and types".to_string());
+                }
+                meta = columns.into_iter().zip(column_types).map(|(name, _type)| ChColumn { name, _type }).collect();
+            }
+            ClickHouseQueryStreamItem::Row(row) => data.push(row),
+        }
+        Ok(())
+    };
+
+    stream_query_once(client, database, sql, Some(max_rows), None, false, &mut collect_item).await?;
+    Ok(ChJsonResult { rows: data.len(), meta, data })
+}
+
+async fn stream_query_once(
+    client: &ChClient,
+    database: Option<&str>,
     sql: &str,
     max_rows: Option<usize>,
-    cancel_token: Option<CancellationToken>,
-    mut on_item: impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
+    cancel_token: Option<&CancellationToken>,
+    use_server_limit: bool,
+    on_item: &mut impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
 ) -> Result<(), String> {
-    let max_rows = max_rows.map(|max_rows| max_rows.max(1));
-    let limit = max_rows.map(QueryResultLimit::Limited).unwrap_or(QueryResultLimit::Unlimited);
+    let limit = if use_server_limit {
+        max_rows.map(QueryResultLimit::Limited).unwrap_or(QueryResultLimit::Unlimited)
+    } else {
+        QueryResultLimit::Unlimited
+    };
     let url = build_query_url_with_format(
         &client.base_url,
-        Some(database),
+        database,
         limit,
         QueryResultFormat::JsonCompactEachRowWithNamesAndTypes,
         client.extra_params.as_deref(),
@@ -339,7 +408,7 @@ pub async fn stream_query_with_max_rows(
     };
 
     loop {
-        let chunk = match cancel_token.as_ref() {
+        let chunk = match cancel_token {
             Some(token) => {
                 tokio::select! {
                     biased;
@@ -362,6 +431,28 @@ pub async fn stream_query_with_max_rows(
 
     match process_stream_remainder(&mut buffer, &mut parser, &mut emit_item) {
         Err(error) if error == CLICKHOUSE_STREAM_ROW_LIMIT_REACHED => Ok(()),
+        result => result,
+    }
+}
+
+pub async fn stream_query_with_max_rows(
+    client: &ChClient,
+    database: &str,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    mut on_item: impl FnMut(ClickHouseQueryStreamItem) -> Result<(), String>,
+) -> Result<(), String> {
+    let max_rows = max_rows.map(|max_rows| max_rows.max(1));
+    let result =
+        stream_query_once(client, Some(database), sql, max_rows, cancel_token.as_ref(), true, &mut on_item).await;
+    match result {
+        Err(error) if max_rows.is_some() && is_readonly_result_limit_error(&error) => {
+            log::warn!(
+                "[clickhouse] server-side stream limit rejected by readonly profile; retrying with client-side limit"
+            );
+            stream_query_once(client, Some(database), sql, max_rows, cancel_token.as_ref(), false, &mut on_item).await
+        }
         result => result,
     }
 }
@@ -449,6 +540,7 @@ fn clickhouse_index_from_skipping_row(row: &[serde_json::Value]) -> IndexInfo {
         }),
         included_columns: None,
         comment: None,
+        key_is_expression: Vec::new(),
     }
 }
 
@@ -487,21 +579,21 @@ fn limited_query_result(result: ChJsonResult, execution_time_ms: u128, max_rows:
         columns,
         column_types,
         column_sortables: vec![],
+        spatial_columns: vec![],
+        spatial_values: vec![],
         rows,
         affected_rows: 0,
         execution_time_ms,
         truncated,
         session_id: None,
         has_more: false,
+        elasticsearch_raw_body: None,
+        messages: Vec::new(),
     }
 }
 
 pub async fn test_connection(client: &ChClient, timeout: Duration) -> Result<(), String> {
-    let mut url = format!("{}/?query=SELECT%201", client.base_url);
-    if let Some(params) = normalize_extra_params(client.extra_params.as_deref()) {
-        url.push('&');
-        url.push_str(&params);
-    }
+    let url = build_connection_test_url(&client.base_url, client.extra_params.as_deref());
     let req = build_request(client, client.http.get(&url));
     let resp = with_connection_timeout("ClickHouse", timeout, async {
         req.send().await.map_err(|e| format!("ClickHouse connection failed: {e}"))
@@ -516,22 +608,107 @@ pub async fn test_connection(client: &ChClient, timeout: Duration) -> Result<(),
 
 pub async fn list_databases(client: &ChClient) -> Result<Vec<DatabaseInfo>, String> {
     let result = ch_query(client, "SELECT name FROM system.databases ORDER BY name", None).await?;
-    Ok(result.data.iter().map(|row| DatabaseInfo { name: row[0].as_str().unwrap_or("").to_string() }).collect())
+    Ok(result
+        .data
+        .iter()
+        .map(|row| DatabaseInfo { name: row[0].as_str().unwrap_or("").to_string(), ..Default::default() })
+        .collect())
 }
 
 pub async fn list_tables(client: &ChClient, database: &str) -> Result<Vec<TableInfo>, String> {
-    let database_lit = clickhouse_literal(database);
-    let sql_with_comment =
-        format!("SELECT name, engine, comment FROM system.tables WHERE database = '{database_lit}' ORDER BY name");
+    list_tables_by_kind(client, database, None, None, None, false).await
+}
+
+/// Lists physical tables with server-side name filtering and pagination.
+pub async fn list_table_objects_filtered(
+    client: &ChClient,
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<TableInfo>, String> {
+    list_tables_by_kind(client, database, filter, limit, offset, true).await
+}
+
+async fn list_tables_by_kind(
+    client: &ChClient,
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    table_objects_only: bool,
+) -> Result<Vec<TableInfo>, String> {
+    let sql_with_comment = clickhouse_tables_sql(database, filter, limit, offset, table_objects_only, true);
     let result = match ch_query(client, &sql_with_comment, Some(database)).await {
         Ok(result) => result,
         Err(error) => {
             log::debug!("Falling back to ClickHouse table list without comments: {error}");
-            let sql = format!("SELECT name, engine FROM system.tables WHERE database = '{database_lit}' ORDER BY name");
+            let sql = clickhouse_tables_sql(database, filter, limit, offset, table_objects_only, false);
             ch_query(client, &sql, Some(database)).await?
         }
     };
     Ok(result.data.iter().map(|row| clickhouse_table_info_from_row(row)).collect())
+}
+
+fn clickhouse_tables_sql(
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    table_objects_only: bool,
+    include_comment: bool,
+) -> String {
+    let columns = if include_comment { "name, engine, comment" } else { "name, engine" };
+    let database_lit = clickhouse_literal(database);
+    let table_kind_filter = if table_objects_only { " AND position(engine, 'View') = 0" } else { "" };
+    let name_filter = clickhouse_table_name_filter_sql(filter, include_comment);
+    let pagination = limit.map(|limit| format!(" LIMIT {limit} OFFSET {}", offset.unwrap_or(0))).unwrap_or_default();
+
+    format!(
+        "SELECT {columns} FROM system.tables WHERE database = '{database_lit}'{table_kind_filter}{name_filter} ORDER BY name{pagination}"
+    )
+}
+
+fn clickhouse_table_name_filter_sql(filter: Option<&str>, include_comment: bool) -> String {
+    let filter = filter.unwrap_or("").trim();
+    if filter.is_empty() {
+        return String::new();
+    }
+
+    let mut patterns = vec![clickhouse_like_contains_pattern(filter)];
+    if crate::sql::fuzzy_filter_enabled(filter) {
+        patterns.push(crate::sql::fuzzy_like_pattern_with_escape(filter, clickhouse_escape_like_literal));
+    }
+    let predicates = patterns
+        .into_iter()
+        .map(|pattern| {
+            // Keep comment-based search parity with the name predicate; the comment
+            // column is absent from the no-comment fallback query, so the extra
+            // predicate must be gated on include_comment.
+            let name_predicate = format!("lowerUTF8(name) LIKE '{}'", clickhouse_literal(&pattern));
+            if include_comment {
+                format!("{name_predicate} OR lowerUTF8(coalesce(comment, '')) LIKE '{}'", clickhouse_literal(&pattern))
+            } else {
+                name_predicate
+            }
+        })
+        .collect::<Vec<_>>();
+    format!(" AND ({})", predicates.join(" OR "))
+}
+
+fn clickhouse_like_contains_pattern(value: &str) -> String {
+    format!("%{}%", clickhouse_escape_like_literal(value))
+}
+
+fn clickhouse_escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 1);
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch == '\\' || ch == '%' || ch == '_' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 pub async fn list_object_statistics(client: &ChClient, database: &str) -> Result<Vec<ObjectStatistics>, String> {
@@ -614,6 +791,7 @@ pub async fn list_indexes(client: &ChClient, database: &str, table: &str) -> Res
             index_type: Some("primary".to_string()),
             included_columns: None,
             comment: None,
+            key_is_expression: Vec::new(),
         });
     }
 
@@ -655,12 +833,16 @@ pub async fn execute_query_with_max_rows(
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
             truncated: false,
             session_id: None,
             has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
         })
     }
 }
@@ -668,6 +850,73 @@ pub async fn execute_query_with_max_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before headers were complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before body was complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn write_http_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn spawn_readonly_fallback_server(
+        success_body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut targets = Vec::new();
+            for request_index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                targets.push(request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string());
+                if request_index == 0 {
+                    write_http_response(
+                        &mut socket,
+                        "500 Internal Server Error",
+                        "Code: 164. DB::Exception: Cannot modify 'max_result_rows' setting in readonly mode. (READONLY)",
+                    )
+                    .await;
+                } else {
+                    write_http_response(&mut socket, "200 OK", success_body).await;
+                }
+            }
+            targets
+        });
+
+        (format!("http://{address}"), server)
+    }
 
     #[test]
     fn query_url_for_result_sets_adds_row_limit_break_settings() {
@@ -682,6 +931,70 @@ mod tests {
             url,
             "http://localhost:8123/?default_format=JSONCompact&database=analytics&max_result_rows=10001&result_overflow_mode=break"
         );
+    }
+
+    #[test]
+    fn recognizes_only_readonly_result_limit_errors() {
+        assert!(is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'max_result_rows' setting in readonly mode. (READONLY)"
+        ));
+        assert!(is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'result_overflow_mode' setting in readonly mode. (READONLY)"
+        ));
+        assert!(!is_readonly_result_limit_error(
+            "Code: 164. DB::Exception: Cannot modify 'max_execution_time' setting in readonly mode. (READONLY)"
+        ));
+        assert!(!is_readonly_result_limit_error("Code: 62. DB::Exception: Syntax error near max_result_rows"));
+    }
+
+    #[tokio::test]
+    async fn readonly_result_query_retries_without_server_limit_and_truncates_client_side() {
+        let (base_url, server) = spawn_readonly_fallback_server("[\"number\"]\n[\"UInt64\"]\n[0]\n[1]\n[2]\n").await;
+        let client = ChClient::new(&base_url, None, None, Duration::from_secs(5));
+
+        let result =
+            execute_query_with_max_rows(&client, "default", "SELECT number FROM numbers(10)", Some(2)).await.unwrap();
+        let targets = server.await.unwrap();
+
+        assert_eq!(result.columns, vec!["number"]);
+        assert_eq!(result.column_types, vec!["UInt64"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(0)], vec![serde_json::json!(1)]]);
+        assert!(result.truncated);
+        assert!(targets[0].contains("max_result_rows=3"));
+        assert!(targets[0].contains("result_overflow_mode=break"));
+        assert!(!targets[1].contains("max_result_rows"));
+        assert!(!targets[1].contains("result_overflow_mode"));
+    }
+
+    #[tokio::test]
+    async fn readonly_stream_query_retries_without_server_limit_and_stops_client_side() {
+        let (base_url, server) = spawn_readonly_fallback_server("[\"number\"]\n[\"UInt64\"]\n[0]\n[1]\n[2]\n").await;
+        let client = ChClient::new(&base_url, None, None, Duration::from_secs(5));
+        let mut items = Vec::new();
+
+        stream_query_with_max_rows(&client, "default", "SELECT number FROM numbers(10)", Some(2), None, |item| {
+            items.push(item);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let targets = server.await.unwrap();
+
+        assert_eq!(
+            items,
+            vec![
+                ClickHouseQueryStreamItem::Columns {
+                    columns: vec!["number".to_string()],
+                    column_types: vec!["UInt64".to_string()],
+                },
+                ClickHouseQueryStreamItem::Row(vec![serde_json::json!(0)]),
+                ClickHouseQueryStreamItem::Row(vec![serde_json::json!(1)]),
+            ]
+        );
+        assert!(targets[0].contains("max_result_rows=2"));
+        assert!(targets[0].contains("result_overflow_mode=break"));
+        assert!(!targets[1].contains("max_result_rows"));
+        assert!(!targets[1].contains("result_overflow_mode"));
     }
 
     #[test]
@@ -700,17 +1013,57 @@ mod tests {
     #[test]
     fn query_url_normalizes_leading_symbols_and_ignores_blank_params() {
         // 允许用户带上开头的 ? 或 &，也允许多个参数
-        let url = build_query_url(
-            "http://localhost:8123",
-            None,
-            QueryResultLimit::Unlimited,
-            Some("?dialect_type=ANSI&max_threads=8"),
-        );
+        let params = normalize_extra_params(Some("?dialect_type=ANSI&max_threads=8"));
+        let url = build_query_url("http://localhost:8123", None, QueryResultLimit::Unlimited, params.as_deref());
         assert_eq!(url, "http://localhost:8123/?default_format=JSONCompact&dialect_type=ANSI&max_threads=8");
 
         // 空白参数不产生多余的 &
-        let url = build_query_url("http://localhost:8123", None, QueryResultLimit::Unlimited, Some("   "));
+        let params = normalize_extra_params(Some("   "));
+        let url = build_query_url("http://localhost:8123", None, QueryResultLimit::Unlimited, params.as_deref());
         assert_eq!(url, "http://localhost:8123/?default_format=JSONCompact");
+    }
+
+    #[test]
+    fn clickhouse_transport_params_are_not_forwarded_as_server_settings() {
+        let client = ChClient::new_with_ca_cert(
+            "http://localhost:8123",
+            None,
+            None,
+            None,
+            Some("?%53SL=true;secure=false&dialect_type=ANSI&unknown_setting=1"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(client.extra_params.as_deref(), Some("dialect_type=ANSI&unknown_setting=1"));
+        assert_eq!(
+            build_query_url(&client.base_url, None, QueryResultLimit::Unlimited, client.extra_params.as_deref()),
+            "http://localhost:8123/?default_format=JSONCompact&dialect_type=ANSI&unknown_setting=1"
+        );
+        assert_eq!(
+            build_connection_test_url(&client.base_url, client.extra_params.as_deref()),
+            "http://localhost:8123/?query=SELECT%201&dialect_type=ANSI&unknown_setting=1"
+        );
+        assert_eq!(
+            build_query_url_with_format(
+                &client.base_url,
+                None,
+                QueryResultLimit::Unlimited,
+                QueryResultFormat::JsonCompactEachRowWithNamesAndTypes,
+                client.extra_params.as_deref(),
+            ),
+            "http://localhost:8123/?default_format=JSONCompactEachRowWithNamesAndTypes&dialect_type=ANSI&unknown_setting=1"
+        );
+
+        assert_eq!(
+            normalize_extra_params(Some("&ssl=false;secure=false&max_execution_time=30")),
+            Some("max_execution_time=30".to_string())
+        );
+        assert_eq!(normalize_extra_params(Some("SSL=true&secure=true")), None);
+        assert_eq!(
+            normalize_extra_params(Some("sslmode=strict&sslrootcert=%2Ftmp%2Fca.pem")),
+            Some("sslmode=strict&sslrootcert=%2Ftmp%2Fca.pem".to_string())
+        );
     }
 
     #[test]
@@ -855,5 +1208,37 @@ mod tests {
         assert_eq!(table.name, "active_users");
         assert_eq!(table.table_type, "VIEW");
         assert_eq!(table.comment, None);
+    }
+
+    #[test]
+    fn table_object_query_filters_before_pagination() {
+        let sql = clickhouse_tables_sql("analytics", Some("orders"), Some(102), Some(100), true, true);
+
+        assert!(sql.contains("SELECT name, engine, comment FROM system.tables"));
+        assert!(sql.contains("database = 'analytics'"));
+        assert!(sql.contains("position(engine, 'View') = 0"));
+        assert!(sql.contains("lowerUTF8(name) LIKE '%orders%'"));
+        assert!(sql.contains("lowerUTF8(coalesce(comment, '')) LIKE '%orders%'"));
+        assert!(sql.contains("ORDER BY name LIMIT 102 OFFSET 100"));
+        assert!(sql.find("position(engine, 'View') = 0").unwrap() < sql.find("ORDER BY name").unwrap());
+        assert!(sql.find("lowerUTF8(name) LIKE '%orders%'").unwrap() < sql.find("ORDER BY name").unwrap());
+    }
+
+    #[test]
+    fn table_object_query_supports_fuzzy_name_filtering() {
+        let sql = clickhouse_tables_sql("analytics", Some("ord"), Some(100), None, true, false);
+
+        assert!(sql.contains("lowerUTF8(name) LIKE '%ord%'"));
+        assert!(sql.contains("lowerUTF8(name) LIKE '%o%r%d%'"));
+        assert!(!sql.contains("comment"));
+        assert!(sql.ends_with("ORDER BY name LIMIT 100 OFFSET 0"));
+    }
+
+    #[test]
+    fn table_object_query_matches_fuzzy_filter_against_comments() {
+        let sql = clickhouse_tables_sql("analytics", Some("ord"), Some(100), None, true, true);
+
+        assert!(sql.contains("lowerUTF8(coalesce(comment, '')) LIKE '%ord%'"));
+        assert!(sql.contains("lowerUTF8(coalesce(comment, '')) LIKE '%o%r%d%'"));
     }
 }

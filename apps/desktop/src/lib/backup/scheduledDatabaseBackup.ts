@@ -8,11 +8,39 @@ export const DATABASE_BACKUP_CONFIG_CHANGED_EVENT = "dbx:database-backup-config-
 export const MAX_DATABASE_BACKUP_HISTORY = 200;
 
 export type DatabaseBackupFrequency = "hourly" | "daily" | "weekly";
+export type DatabaseBackupExportStatus = "Running" | "Done" | "Error" | "Cancelled";
 export type DatabaseBackupRunStatus = "running" | "success" | "failed" | "cancelled";
 export type DatabaseBackupRunTrigger = "manual" | "scheduled";
+export type DatabaseBackupRunSource = "scheduled" | "one-shot";
 export type DatabaseBackupTableFilterMode = "all" | "include" | "exclude";
 
 const CONSISTENT_BACKUP_DATABASE_TYPES = new Set(["mysql", "postgres"]);
+
+export class DatabaseBackupConnectionQueue {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  async run<T>(connectionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(connectionId) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => gate);
+    this.tails.set(connectionId, tail);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.tails.get(connectionId) === tail) this.tails.delete(connectionId);
+    }
+  }
+}
+
+export function databaseBackupAggregateExportStatus(status: DatabaseBackupExportStatus, isFinal: boolean): DatabaseBackupExportStatus {
+  return isFinal ? status : "Running";
+}
 
 export function supportsScheduledDatabaseBackup(databaseType: string | undefined): boolean {
   return !!databaseType && CONSISTENT_BACKUP_DATABASE_TYPES.has(databaseType);
@@ -51,7 +79,7 @@ function tablePatternRegex(pattern: string, caseSensitive: boolean): RegExp {
 export function databaseBackupTableMatchesPattern(table: string, patterns: readonly string[], database = "", schema = "", caseSensitive = true): boolean {
   const candidates = [table];
   if (schema) candidates.push(`${schema}.${table}`);
-  if (database && schema && database !== schema) candidates.push(`${database}.${schema}.${table}`);
+  if (database && schema) candidates.push(`${database}.${schema}.${table}`);
   return patterns.some((pattern) => {
     const matcher = tablePatternRegex(pattern, caseSensitive);
     return candidates.some((candidate) => matcher.test(candidate));
@@ -79,29 +107,46 @@ export function resolveScheduledDatabaseBackupTableScope(mode: DatabaseBackupTab
   };
 }
 
-export interface DatabaseBackupSchedule {
-  id: string;
-  name: string;
-  enabled: boolean;
+export interface DatabaseBackupExecutionConfig {
   connectionId: string;
   databases: string[];
   tableFilterMode: DatabaseBackupTableFilterMode;
   tablePatterns: string[];
   destinationDirectory: string;
-  frequency: DatabaseBackupFrequency;
-  intervalHours: number;
-  timeOfDay: string;
-  weekday: number;
   includeStructure: boolean;
   includeData: boolean;
   includeObjects: boolean;
   dropTableIfExists: boolean;
+}
+
+export interface DatabaseBackupSchedule extends DatabaseBackupExecutionConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  frequency: DatabaseBackupFrequency;
+  intervalHours: number;
+  timeOfDay: string;
+  weekday: number;
   retentionCount: number;
   createdAt: string;
   updatedAt: string;
   nextRunAt: string;
   lastRunAt?: string;
   lastRunStatus?: Exclude<DatabaseBackupRunStatus, "running">;
+}
+
+export function toDatabaseBackupExecutionConfig(schedule: DatabaseBackupSchedule): DatabaseBackupExecutionConfig {
+  return {
+    connectionId: schedule.connectionId,
+    databases: [...schedule.databases],
+    tableFilterMode: schedule.tableFilterMode,
+    tablePatterns: [...schedule.tablePatterns],
+    destinationDirectory: schedule.destinationDirectory,
+    includeStructure: schedule.includeStructure,
+    includeData: schedule.includeData,
+    includeObjects: schedule.includeObjects,
+    dropTableIfExists: schedule.dropTableIfExists,
+  };
 }
 
 export interface DatabaseBackupFile {
@@ -113,16 +158,30 @@ export interface DatabaseBackupFile {
 
 export interface DatabaseBackupRun {
   id: string;
-  scheduleId: string;
+  scheduleId?: string;
   scheduleName: string;
+  displayName?: string;
   connectionId: string;
   connectionName: string;
   trigger: DatabaseBackupRunTrigger;
+  source: DatabaseBackupRunSource;
   status: DatabaseBackupRunStatus;
   startedAt: string;
   completedAt?: string;
   files: DatabaseBackupFile[];
+  progressPercent?: number;
   error?: string;
+}
+
+export interface DatabaseBackupProgressInput {
+  completedDatabases: number;
+  totalDatabases: number;
+  completedExports: number;
+  totalExports: number;
+  currentObjectIndex?: number;
+  currentTotalObjects?: number;
+  currentExportComplete?: boolean;
+  backupComplete?: boolean;
 }
 
 type UnknownRecord = Record<string, unknown>;
@@ -238,23 +297,42 @@ function normalizeDatabaseBackupFile(value: unknown): DatabaseBackupFile | null 
 export function normalizeDatabaseBackupRun(value: unknown): DatabaseBackupRun | null {
   const input = recordValue(value);
   const id = stringValue(input.id).trim();
-  const scheduleId = stringValue(input.scheduleId).trim();
+  const scheduleId = stringValue(input.scheduleId).trim() || undefined;
   const startedAt = validIsoDate(input.startedAt, "");
-  if (!id || !scheduleId || !startedAt) return null;
+  if (!id || !startedAt) return null;
   const status: DatabaseBackupRunStatus = input.status === "success" || input.status === "failed" || input.status === "cancelled" ? input.status : "failed";
   return {
     id,
     scheduleId,
     scheduleName: stringValue(input.scheduleName).trim() || "Database backup",
+    displayName: stringValue(input.displayName).trim() || undefined,
     connectionId: stringValue(input.connectionId).trim(),
     connectionName: stringValue(input.connectionName).trim(),
     trigger: input.trigger === "scheduled" ? "scheduled" : "manual",
+    source: input.source === "one-shot" ? "one-shot" : "scheduled",
     status,
     startedAt,
     completedAt: typeof input.completedAt === "string" && Number.isFinite(Date.parse(input.completedAt)) ? input.completedAt : undefined,
     files: Array.isArray(input.files) ? input.files.map(normalizeDatabaseBackupFile).filter((file): file is DatabaseBackupFile => !!file) : [],
+    progressPercent: input.progressPercent === undefined ? undefined : boundedInteger(input.progressPercent, 0, 0, 100),
     error: stringValue(input.error).trim() || undefined,
   };
+}
+
+export function databaseBackupProgressPercent(input: DatabaseBackupProgressInput): number {
+  if (input.backupComplete) return 100;
+
+  const totalDatabases = Math.max(1, Math.round(input.totalDatabases));
+  const completedDatabases = Math.max(0, Math.min(totalDatabases, Math.round(input.completedDatabases)));
+  const totalExports = Math.max(0, Math.round(input.totalExports));
+  const completedExports = Math.max(0, Math.min(totalExports, Math.round(input.completedExports)));
+  const totalObjects = Math.max(0, Math.round(input.currentTotalObjects ?? 0));
+  const objectIndex = Math.max(0, Math.min(totalObjects, Math.round(input.currentObjectIndex ?? 0)));
+  const currentExportFraction = input.currentExportComplete ? 1 : totalObjects > 0 ? objectIndex / totalObjects : 0;
+  const currentDatabaseFraction = totalExports > 0 ? Math.min(1, (completedExports + currentExportFraction) / totalExports) : 0;
+  const overallFraction = Math.min(1, (completedDatabases + currentDatabaseFraction) / totalDatabases);
+
+  return Math.min(99, Math.max(0, Math.round(overallFraction * 100)));
 }
 
 function parseStoredArray(key: string): unknown[] {

@@ -41,6 +41,8 @@ const profileMap: Record<string, ConnectionProfile> = {
   mariadb: { dbType: "mysql", profile: "mariadb", label: "MariaDB", port: 3306, user: "root" },
   postgresql: { dbType: "postgres", profile: "postgres", label: "PostgreSQL", port: 5432, user: "postgres" },
   postgres: { dbType: "postgres", profile: "postgres", label: "PostgreSQL", port: 5432, user: "postgres" },
+  cloudberry: { dbType: "postgres", profile: "cloudberry", label: "Apache Cloudberry", port: 5432, user: "postgres" },
+  opentenbase: { dbType: "postgres", profile: "opentenbase", label: "OpenTenBase", port: 11000, user: "opentenbase" },
   sqlite: { dbType: "sqlite", profile: "sqlite", label: "SQLite", port: 0, user: "" },
   sqlserver: { dbType: "sqlserver", profile: "sqlserver", label: "SQL Server", port: 1433, user: "sa" },
   mssql: { dbType: "sqlserver", profile: "sqlserver", label: "SQL Server", port: 1433, user: "sa" },
@@ -51,6 +53,7 @@ const profileMap: Record<string, ConnectionProfile> = {
   mongo: { dbType: "mongodb", profile: "mongodb", label: "MongoDB", port: 27017, user: "" },
   redshift: { dbType: "redshift", profile: "redshift", label: "Redshift", port: 5439, user: "awsuser" },
   elasticsearch: { dbType: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", port: 9200, user: "" },
+  easysearch: { dbType: "easysearch", profile: "easysearch", label: "Easysearch", port: 9200, user: "" },
   doris: { dbType: "doris", profile: "doris", label: "Doris", port: 9030, user: "root" },
   starrocks: { dbType: "starrocks", profile: "starrocks", label: "StarRocks", port: 9030, user: "root" },
   dameng: { dbType: "dameng", profile: "dm", label: "达梦 Dameng", port: 5236, user: "SYSDBA" },
@@ -78,8 +81,18 @@ function getNumber(value: unknown) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
+function firstNonEmptyString(...values: unknown[]) {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const normalized = value.trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
 function inferProfile(entry: DbeaverConnectionEntry): ConnectionProfile {
   if (/^jdbcx:/i.test(getString(entry.configuration?.url))) return profileMap.jdbcx;
+  if (normalizeKey(entry.provider) === "opentenbase") return profileMap.opentenbase;
   const driverProfile = profileMap[normalizeKey(entry.driver)];
   if (driverProfile) return driverProfile;
   const candidates = [entry.provider, entry.driver, entry.configuration?.url, entry.name].map(normalizeKey).join(" ");
@@ -170,12 +183,12 @@ function parseJdbcUrl(url: string, profile: ConnectionProfile) {
   const sqliteMatch = withoutJdbc.match(/^sqlite:(.+)$/i);
   if (sqliteMatch) {
     result.host = sqliteMatch[1];
-    result.database = sqliteMatch[1];
     return result;
   }
 
   try {
     const parsed = new URL(withoutJdbc);
+    if (!parsed.hostname) return result;
     result.host = parsed.hostname;
     result.port = parsed.port ? Number(parsed.port) : profile.port;
     result.database = parsed.pathname.replace(/^\/+/, "").split("/")[0] || undefined;
@@ -220,8 +233,10 @@ function buildConnection(entry: DbeaverConnectionEntry, credentials: ReturnType<
   const config = entry.configuration || {};
   const url = getString(config.url);
   const parsedUrl = parseJdbcUrl(url, profile);
-  const host = getString(config.host || config["host-name"] || parsedUrl.host || (profile.dbType === "sqlite" ? "" : "127.0.0.1"));
-  const database = getString(config.database || config["database-name"] || config.schema || parsedUrl.database);
+  const configuredPort = getNumber(config.port || config["host-port"] || parsedUrl.port) || profile.port;
+  const configuredDatabase = firstNonEmptyString(config.database, config["database-name"], config.schema, parsedUrl.database);
+  const host = getString(config.host || config["host-name"] || parsedUrl.host || (profile.dbType === "sqlite" ? configuredDatabase : "127.0.0.1"));
+  const database = profile.dbType === "sqlite" ? "" : configuredDatabase;
   const name = getString(entry.name || database || host || profile.label);
   if (!entry.id || !name) return null;
 
@@ -232,7 +247,7 @@ function buildConnection(entry: DbeaverConnectionEntry, credentials: ReturnType<
     driver_label: profile.label,
     url_params: getString(parsedUrl.params),
     host,
-    port: getNumber(config.port || config["host-port"] || parsedUrl.port) || profile.port,
+    port: configuredPort,
     username: credentials.username || getString(parsedUrl.username) || profile.user,
     password: credentials.password || getString(parsedUrl.password),
     database: database || undefined,

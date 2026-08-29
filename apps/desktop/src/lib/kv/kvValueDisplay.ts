@@ -8,6 +8,8 @@ export interface PrettyPrintJsonResult {
   error?: "invalid_json";
 }
 
+export type Base64Utf8PreviewResult = { ok: true; value: string; lossy: boolean } | { ok: false; error: "invalid_base64" };
+
 export interface DisplayItem {
   label: string;
   value: string;
@@ -20,6 +22,33 @@ export interface ZooKeeperSummaryLabels {
   size?: string;
 }
 
+const strictBase64Pattern = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+export function decodeBase64Utf8Preview(value: string): Base64Utf8PreviewResult {
+  const normalized = value.replace(/\s+/g, "");
+  if (!strictBase64Pattern.test(normalized)) return { ok: false, error: "invalid_base64" };
+
+  try {
+    const binary = atob(normalized);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    try {
+      return {
+        ok: true,
+        value: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        lossy: false,
+      };
+    } catch {
+      return {
+        ok: true,
+        value: new TextDecoder("utf-8").decode(bytes),
+        lossy: true,
+      };
+    }
+  } catch {
+    return { ok: false, error: "invalid_base64" };
+  }
+}
+
 export function prettyPrintJsonText(text: string): PrettyPrintJsonResult {
   try {
     return { ok: true, value: safeJsonFormat(text, 2) };
@@ -28,7 +57,7 @@ export function prettyPrintJsonText(text: string): PrettyPrintJsonResult {
   }
 }
 
-function valueLabel(value: number | null | undefined): string {
+function valueLabel(value: string | number | null | undefined): string {
   return value == null ? "-" : String(value);
 }
 

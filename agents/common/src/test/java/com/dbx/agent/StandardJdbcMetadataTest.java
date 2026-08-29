@@ -219,6 +219,101 @@ class StandardJdbcMetadataTest {
     }
 
     @Test
+    void listTablesEscapesUnderscoreInHanaSysSchema() {
+        // HANA 的 _SYS_RT 等 schema 名含下划线，JDBC schemaPattern 把 _ 当作通配符，
+        // 若不转义会误匹配 _xSYSxRT 等其他 schema。HANA 驱动 getSearchStringEscape() 返回 "\\"。
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        Connection conn = schemaEscapeConnection("\\", rows(
+            row("TABLE_NAME", "RT_OBJECTS", "TABLE_TYPE", "TABLE", "REMARKS", null)
+        ), capturedArgs);
+
+        List<TableInfo> tables = StandardJdbcMetadata.INSTANCE.listTables(conn, profile, "", "_SYS_RT");
+
+        assertEquals(1, tables.size());
+        assertEquals("RT_OBJECTS", tables.get(0).getName());
+        // schema 第二个参数应转义为 _\_S\_Y\_S\_R\_T（HANA 转义符为反斜杠）
+        assertEquals("\\_SYS\\_RT", capturedArgs.get()[1]);
+    }
+
+    @Test
+    void listTablesEscapesPercentInQuotedSchema() {
+        // 被引号引用、含 % 的 schema（如 "SALES%2024"），% 是通配符，必须转义。
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        Connection conn = schemaEscapeConnection("\\", rows(
+            row("TABLE_NAME", "ORDERS_2024", "TABLE_TYPE", "TABLE", "REMARKS", null)
+        ), capturedArgs);
+
+        List<TableInfo> tables = StandardJdbcMetadata.INSTANCE.listTables(conn, profile, "", "SALES%2024");
+
+        assertEquals(1, tables.size());
+        assertEquals("ORDERS_2024", tables.get(0).getName());
+        assertEquals("SALES\\%2024", capturedArgs.get()[1]);
+    }
+
+    @Test
+    void listTablesLeavesPlainSchemaUntouched() {
+        // 普通 schema（无 _ 和 %）不应被转义，且仍作为 schemaPattern 传入。
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        Connection conn = schemaEscapeConnection("\\", rows(
+            row("TABLE_NAME", "ORDERS", "TABLE_TYPE", "TABLE", "REMARKS", null)
+        ), capturedArgs);
+
+        List<TableInfo> tables = StandardJdbcMetadata.INSTANCE.listTables(conn, profile, "", "SALES");
+
+        assertEquals(1, tables.size());
+        assertEquals("ORDERS", tables.get(0).getName());
+        assertEquals("SALES", capturedArgs.get()[1]);
+    }
+
+    @Test
+    void listTablesFallsBackWhenSearchEscapeUnavailable() {
+        // 驱动不支持 getSearchStringEscape() 时，schema 原样返回（不做转义），不抛异常。
+        AtomicReference<Object[]> capturedArgs = new AtomicReference<>();
+        Connection conn = schemaEscapeConnection(null, rows(
+            row("TABLE_NAME", "ORDERS", "TABLE_TYPE", "TABLE", "REMARKS", null)
+        ), capturedArgs);
+
+        List<TableInfo> tables = StandardJdbcMetadata.INSTANCE.listTables(conn, profile, "", "SALES");
+
+        assertEquals(1, tables.size());
+        assertEquals("SALES", capturedArgs.get()[1]);
+    }
+
+    private static Connection schemaEscapeConnection(String searchEscape, ResultSet tables, AtomicReference<Object[]> capturedArgs) {
+        DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                String name = method.getName();
+                if ("getTables".equals(name)) {
+                    if (capturedArgs != null) {
+                        capturedArgs.set(args);
+                    }
+                    return tables;
+                }
+                if ("getTableTypes".equals(name)) {
+                    return rows(row("TABLE_TYPE", "TABLE"));
+                }
+                if ("getSearchStringEscape".equals(name)) {
+                    if (searchEscape == null) {
+                        throw new UnsupportedOperationException("escape unavailable");
+                    }
+                    return searchEscape;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+        return proxy(Connection.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getMetaData".equals(method.getName())) {
+                    return meta;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
+    @Test
     void mapsColumnsWithPrimaryKeysAndLengths() {
         Connection conn = connection(
             rows(),
@@ -324,11 +419,60 @@ class StandardJdbcMetadataTest {
             rows()
         );
 
-        List<IndexInfo> indexes = StandardJdbcMetadata.INSTANCE.listIndexes(conn, "APP", "ORDERS");
+        List<IndexInfo> indexes = StandardJdbcMetadata.INSTANCE.listIndexes(conn, profile, null, "APP", "ORDERS");
 
         assertEquals(1, indexes.size());
         assertEquals(Arrays.asList("A", "B"), indexes.get(0).getColumns());
         assertFalse(indexes.get(0).getIs_unique());
+    }
+
+    @Test
+    void listIndexesUsesConfiguredCatalogOnlyWhenProfileAllowsFallback() {
+        Connection enabledConn = catalogIndexFallbackConnection(
+            "TENANTDB",
+            rows(),
+            rows(row("INDEX_NAME", "IDX_ORDERS", "COLUMN_NAME", "ID", "ORDINAL_POSITION", (short) 1, "NON_UNIQUE", false))
+        );
+
+        List<IndexInfo> enabledIndexes = StandardJdbcMetadata.INSTANCE.listIndexes(
+            enabledConn,
+            profile,
+            "TENANTDB",
+            "APP",
+            "ORDERS"
+        );
+
+        assertEquals(1, enabledIndexes.size());
+
+        JdbcAgentProfile fallbackDisabledProfile = new JdbcAgentProfile(
+            "example.Driver",
+            "jdbc:example://{host}:{port}/{database}",
+            0,
+            false,
+            Collections.emptySet(),
+            Collections.singletonList("TABLE"),
+            "\"",
+            "SET SCHEMA",
+            false,
+            false,
+            false,
+            false
+        );
+        Connection disabledConn = catalogIndexFallbackConnection(
+            "TENANTDB",
+            rows(),
+            rows(row("INDEX_NAME", "IDX_ORDERS", "COLUMN_NAME", "ID", "ORDINAL_POSITION", (short) 1, "NON_UNIQUE", false))
+        );
+
+        List<IndexInfo> disabledIndexes = StandardJdbcMetadata.INSTANCE.listIndexes(
+            disabledConn,
+            fallbackDisabledProfile,
+            "TENANTDB",
+            "APP",
+            "ORDERS"
+        );
+
+        assertTrue(disabledIndexes.isEmpty());
     }
 
     @Test
@@ -566,6 +710,31 @@ class StandardJdbcMetadataTest {
                 }
                 if ("getCatalog".equals(method.getName())) {
                     return null;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+    }
+
+    private static Connection catalogIndexFallbackConnection(
+        String fallbackCatalog,
+        ResultSet defaultIndexes,
+        ResultSet fallbackIndexes
+    ) {
+        DatabaseMetaData meta = proxy(DatabaseMetaData.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getIndexInfo".equals(method.getName())) {
+                    return fallbackCatalog.equals(args[0]) ? fallbackIndexes : defaultIndexes;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        });
+        return proxy(Connection.class, new MethodHandler() {
+            @Override
+            public Object handle(Method method, Object[] args) {
+                if ("getMetaData".equals(method.getName())) {
+                    return meta;
                 }
                 return defaultValue(method.getReturnType());
             }

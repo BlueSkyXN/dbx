@@ -28,6 +28,17 @@ test("mongo document table passes copy context to the data grid", () => {
   assert.match(source, /const customSaveHandler = computed<CustomSaveHandler>\(\(\) => \(\{[\s\S]*?targetLabel: props\.collection,[\s\S]*?\}\)\);/);
   assert.match(source, /mongo_copy_documents: copyDocuments\.value/);
   assert.match(source, /result\.extended_documents\?\.length === nextDocuments\.length/);
+  assert.match(source, /props\.databaseType === "mongodb" && mongoCopyDocumentsAvailable\.value/);
+});
+
+test("mongo document row clones reuse the type-preserving source document for saves and previews", () => {
+  const source = documentBrowserSource();
+  assert.match(source, /type DocumentGridChanges = \{[\s\S]*?newRowMeta: GridNewRowMeta\[\];/);
+  assert.match(source, /function buildMongoGridInsertDocument\([\s\S]*?copyDocuments\.value\[sourceIndex\][\s\S]*?buildMongoCopyDocumentFromOriginal\([\s\S]*?excludePrimaryKeys: true/);
+  assert.match(source, /buildMongoGridInsertDocument\(newRow, cols, newRowMeta\)/);
+  assert.match(source, /buildMongoGridInsertDocument\(newRow, columns, newRowMeta\[newRowIndex\]\)/);
+  assert.match(source, /preserveBsonTypes = sourceIndex !== undefined && copyDocuments\.value\[sourceIndex\] !== undefined/);
+  assert.match(source, /documentInsertDocument\(props\.connectionId, props\.database, props\.collection, JSON\.stringify\(doc\), undefined, preserveBsonTypes\)/);
 });
 
 test("document edit mode toggles whole JSON editing for insert and save", () => {
@@ -60,6 +71,26 @@ test("document save uses shared identity plan and write helpers", () => {
   // No local rekey/replace triple-copy orchestration.
   assert.doesNotMatch(source, /async function rekeyDocumentStoreDocument/);
   assert.doesNotMatch(source, /async function replaceDocumentStoreDocument/);
+});
+
+test("document table wires on-demand exact total counting for estimated mongo totals", () => {
+  const source = documentBrowserSource();
+  assert.match(source, /:count-total-rows="countExactDocumentTotal"/);
+  assert.match(source, /:inexact-total-row-count-mode="documentStoreProvider\.kind === 'mongodb' \? 'estimated' : 'at-least'"/);
+  assert.match(source, /async function countExactDocumentTotal/);
+  assert.match(source, /const request = loadedDocumentQueryTotalCountRequest/);
+  assert.match(source, /if \(!request \|\| !isCurrentDocumentQueryTotalCountRequest\(request\)\) return undefined;/);
+  assert.match(source, /api\.mongoCountDocuments\(request\.connectionId, request\.database, request\.collection, request\.filter, "accurate"\)/);
+  assert.equal(source.match(/if \(!isCurrentDocumentQueryTotalCountRequest\(request\)\) return undefined;/g)?.length, 2);
+  assert.match(source, /"accurate"/);
+});
+
+test("document pagination commits page index with fetched rows", () => {
+  const source = documentBrowserSource();
+  assert.match(source, /async function load\(options: \{ page\?: number; append\?: boolean; offset\?: number; limit\?: number \} = \{\}\)/);
+  assert.match(source, /await load\(\{ page: nextPage, append: true, offset: normalizedOffset, limit: normalizedLimit \}\)/);
+  assert.match(source, /await load\(\{ page: nextPage, offset: nextPage \* normalizedLimit, limit: normalizedLimit \}\)/);
+  assert.match(source, /if \(options\.page !== undefined\) page\.value = options\.page;/);
 });
 
 test("document query inputs apply on Enter and reserve Shift+Enter for newlines", () => {

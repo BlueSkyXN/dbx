@@ -1,3 +1,5 @@
+import { extractSingleSqlCodeBlock } from "@/lib/ai/aiSqlExecutionPolicy";
+
 /**
  * Pure detectors for recognizing AI assistant action proposals and user
  * short replies (affirmative / negative). Used by the chat UI to render
@@ -22,7 +24,7 @@ function stripOuterPunctuation(input: string): string {
 }
 
 /** Returns the last non-empty line/sentence-ish chunk of the assistant message. */
-function lastNonEmptyLine(content: string): string {
+export function lastNonEmptyLine(content: string): string {
   const lines = content.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const trimmed = lines[i].trim();
@@ -165,4 +167,168 @@ export function isShortNegative(content: string): boolean {
   if (cleaned.length > 24) return false;
   const all = [...ZH_NEGATIVE, ...EN_NEGATIVE];
   return all.some((re) => re.test(cleaned));
+}
+
+/**
+ * Regular expression matching common SQL write/DDL keywords.
+ * Shared between AiAssistant.vue and tests so the regex stays in one place.
+ */
+export const WRITE_SQL_KEYWORD_RE = /\b(insert|update|delete|replace|merge|create|alter|drop|truncate|rename|grant|revoke)\b/i;
+
+/**
+ * Returns true when the text contains SQL write or DDL keywords.
+ */
+export function containsWriteSql(text: string): boolean {
+  return WRITE_SQL_KEYWORD_RE.test(text);
+}
+
+/**
+ * Returns true when the assistant message ends with an action proposal AND
+ * the message as a whole contains write/DDL SQL keywords.
+ *
+ * Check order:
+ * 1. Last non-empty line must be an action proposal (question mark + ask
+ *    phrase + action verb).
+ * 2. The *entire message* (not just the last line) must contain at least
+ *    one write/DDL keyword (INSERT, DELETE, CREATE, etc.).
+ *
+ * This two-step check handles the common pattern where the model outputs
+ * a SQL code block followed by a generic confirmation question like
+ * "需要我执行这条 SQL 吗？" — the write keywords live in the code block,
+ * not in the last line.
+ *
+ * **Safety rule**: the last line (the proposal itself) MUST explicitly
+ * reference the write SQL or the write operation.  A message where the
+ * last line asks about a read operation but a write keyword appears
+ * elsewhere is NOT treated as a write-SQL proposal — the assistant is
+ * offering a read, not a write.  Without this rule, confirming "need me
+ * to query the remaining records?" could inadvertently grant write
+ * permission because DELETE appeared earlier in the message.
+ */
+export function looksLikeWriteSqlProposal(content: string): boolean {
+  if (!content) return false;
+  const lastLine = lastNonEmptyLine(content);
+  if (!lastLine) return false;
+
+  // Step 1: last line must be an action proposal (ask + action + question mark).
+  if (!/[?？]\s*$/.test(lastLine)) return false;
+
+  const isZh = containsChinese(lastLine);
+  const askPhrases = isZh ? ZH_ASK_PHRASES : EN_ASK_PHRASES;
+  const actionPhrases = isZh ? ZH_ACTION_PHRASES : EN_ACTION_PHRASES;
+
+  if (!askPhrases.some((re) => re.test(lastLine))) return false;
+  if (!actionPhrases.some((re) => re.test(lastLine))) return false;
+
+  // Step 2: the full message must contain write/DDL SQL keywords somewhere
+  // (typically in a code block or earlier sentence).
+  if (!containsWriteSql(content)) return false;
+
+  // Safety check: the last line must explicitly reference the write SQL or
+  // the write/DDL operation itself.  A last line that asks about a read
+  // ("查询"/"query") but happens to have a write keyword elsewhere in the
+  // message is NOT a write-SQL proposal — it is a read proposal.
+  // We check for three signals:
+  //   a) The last line contains a write/DDL keyword directly, OR
+  //   b) The last line contains a "this SQL" / "这条 SQL" reference that
+  //      points back to the code block with the write SQL, OR
+  //   c) The content has a SQL code block AND the last line mentions
+  //      SQL / 执行 without specifying a different action (e.g. 查询).
+  return lastLineMentionsWriteSql(lastLine, isZh, content);
+}
+
+/**
+ * A write proposal is actionable only when the user can review exactly one
+ * SQL statement. A generic “execute this INSERT?” prompt cannot safely bind
+ * the next agent run, so the UI must not present it as an executable action.
+ */
+export function isActionableWriteSqlProposal(content: string): boolean {
+  return looksLikeWriteSqlProposal(content) && extractSingleSqlCodeBlock(content) !== undefined;
+}
+
+/** A chat message that the write-confirmation gate inspects. */
+export interface WriteSqlGrantMessage {
+  role: "user" | "assistant";
+  content: string;
+  kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
+}
+
+/**
+ * True when a chat message can bind the next agent run to one exact SQL
+ * statement. Backend-generated confirmations are marked with a structural
+ * `kind` and carry exactly one SQL block, so they are actionable regardless of
+ * the locale their localized wording is in; model-authored proposals still
+ * have to pass the English/Chinese text detectors.
+ */
+export function isActionableWriteProposalMessage(msg: WriteSqlGrantMessage): boolean {
+  if (msg.role !== "assistant" || !msg.content) return false;
+  if (msg.kind === "writeSqlConfirmation") return extractSingleSqlCodeBlock(msg.content) !== undefined;
+  return isActionableWriteSqlProposal(msg.content);
+}
+
+/**
+ * Returns true when the proposal line explicitly references a write/DDL
+ * SQL operation (not a read-only action that happens to coexist with a
+ * write keyword elsewhere in the message).
+ */
+function lastLineMentionsWriteSql(lastLine: string, isZh: boolean, fullContent: string): boolean {
+  // Signal (a): last line contains a write/DDL keyword itself.
+  if (containsWriteSql(lastLine)) return true;
+
+  // Signal (b): last line references "this SQL" / "这条 SQL" / "这条语句"
+  // pointing back to a code block that contains the write SQL.
+  if (isZh) {
+    if (/这条\s*SQL|这条\s*语句|这个\s*SQL|这段\s*SQL|上述\s*SQL|以上\s*SQL/.test(lastLine)) return true;
+  } else {
+    if (/this\s+SQL|the\s+SQL|this\s+statement|the\s+statement|this\s+query|the\s+query|above\s+SQL/.test(lastLine)) return true;
+  }
+
+  // Signal (c): message has a SQL code block AND the last line mentions
+  // 执行/execute/run without specifying a different action like 查询/query.
+  const hasCodeBlock = /```sql|```mysql|```postgresql|```sqlite|```tsql|```clickhouse|```\s*\n/.test(fullContent);
+  if (hasCodeBlock) {
+    if (isZh) {
+      // Must mention 执行 or 运行 (execute/write-like), NOT 查询/查看 (read-like).
+      if (/(?:执行|运行)/.test(lastLine) && !/(?:查询|查看|看看|看一下|读取)/.test(lastLine)) return true;
+    } else {
+      if (/\b(?:execute|run)\b/i.test(lastLine) && !/\b(?:query|read|fetch|retrieve|list|inspect|check|sample)\b/i.test(lastLine)) return true;
+    }
+  }
+
+  return false;
+}
+
+/** Parameters for {@link shouldGrantWriteSqlOnShortAffirmative}. */
+export interface WriteSqlGrantParams {
+  mode: string;
+  /** True when allowWriteSqlForNextRun has already been set, e.g. by the button path. */
+  alreadyGranted: boolean;
+  isProduction: boolean;
+  userText: string;
+  /**
+   * Conversation history BEFORE the current user text was pushed.
+   * The function scans backward from the last message, skipping
+   * contextSummary entries, and stops at the first user message.
+   */
+  messages: WriteSqlGrantMessage[];
+}
+
+/**
+ * Pure-function extraction of the manual-confirmation gating logic used in
+ * AiAssistant.vue send().  Returns true when the user just typed a short
+ * affirmative reply (e.g. "可以"/"go ahead") and the most recent assistant
+ * message before the user message is a write-SQL action proposal.
+ *
+ * Shared between the component and its unit tests so the two cannot drift.
+ */
+export function shouldGrantWriteSqlOnShortAffirmative(params: WriteSqlGrantParams): boolean {
+  if (params.mode !== "agent" || params.isProduction || params.alreadyGranted) return false;
+  if (!isShortAffirmative(params.userText)) return false;
+  for (let i = params.messages.length - 1; i >= 0; i--) {
+    const msg = params.messages[i];
+    if (msg.kind === "contextSummary") continue;
+    if (isActionableWriteProposalMessage(msg)) return true;
+    if (msg.role === "user") return false;
+  }
+  return false;
 }

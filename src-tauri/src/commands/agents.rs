@@ -3,11 +3,18 @@ use std::sync::Arc;
 use tauri::{Emitter, State};
 
 use dbx_core::agent_manager::{AgentDriverInfo, DriverStoreUsage, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
+use dbx_core::agent_offline_export::{
+    export_agents_offline as export_agents_offline_core,
+    preview_agent_offline_export as preview_agent_offline_export_core, AgentOfflineExportPreview,
+    AgentOfflineExportResult,
+};
 use dbx_core::agent_service::{
-    build_agent_list, clear_agent_download_cache, fetch_registry_from, import_agent_driver,
-    import_agents_from_zip as import_agents_from_zip_core, inspect_offline_zip, install_agent_driver_from,
-    invalidate_registry_cache, reinstall_agent_jre_from, uninstall_agent_driver, uninstall_agent_jre,
-    upgrade_all_agent_drivers_from, AgentProgressEvent, OfflineImportPlan, UpgradeAllAgentDriversResult,
+    batch_cancellation_key, build_agent_list, cancel_agent_batch_upgrade, cancel_agent_driver_install,
+    clear_agent_download_cache, fetch_registry_from, fetch_registry_from_claimed, import_agent_driver,
+    import_agents_from_package as import_agents_from_package_core, inspect_offline_package,
+    install_agent_driver_from_claimed, install_cancellation_key, invalidate_registry_cache, reinstall_agent_jre_from,
+    uninstall_agent_driver, uninstall_agent_jre, upgrade_all_agent_drivers_from_claimed, AgentProgressEvent,
+    OfflineImportPlan, UpgradeAllAgentDriversResult,
 };
 use dbx_core::connection::AppState;
 use dbx_core::driver_runtime::DriverRuntimeSummary;
@@ -69,13 +76,31 @@ pub async fn install_agent(
     state: State<'_, Arc<AppState>>,
     db_type: String,
     source: Option<DownloadSource>,
+    operation_id: Option<String>,
 ) -> Result<(), String> {
-    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
-    let app_handle = app.clone();
-    install_agent_driver_from(&state.agent_manager, &db_type, source.unwrap_or_default(), move |event| {
-        emit_agent_progress(&app_handle, event)
-    })
-    .await
+    // Resolve the operation id first, then register the cancellation token
+    // under it BEFORE any awaitable setup (blocker check, lock wait, registry
+    // fetch) so a cancel fired while the UI shows the modal is observed by this
+    // exact install instead of being silently lost or crossing into a second
+    // same-driver install.
+    let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let cancellation = state.agent_manager.begin_install_cancellation(&install_cancellation_key(&operation_id)).await;
+    let result = async {
+        ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
+        let app_handle = app.clone();
+        let progress_operation_id = operation_id.clone();
+        install_agent_driver_from_claimed(
+            &state.agent_manager,
+            &db_type,
+            source.unwrap_or_default(),
+            move |event| emit_agent_progress(&app_handle, &progress_operation_id, event),
+            &cancellation,
+        )
+        .await
+    }
+    .await;
+    state.agent_manager.finish_install_cancellation(&install_cancellation_key(&operation_id), &cancellation).await;
+    result
 }
 
 #[tauri::command]
@@ -83,16 +108,51 @@ pub async fn upgrade_all_agents(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     source: Option<DownloadSource>,
+    operation_id: Option<String>,
 ) -> Result<UpgradeAllAgentDriversResult, String> {
     let source = source.unwrap_or_default();
-    let registry = fetch_registry_from(source).await?;
-    let agents = build_agent_list(&state.agent_manager, Some(&registry));
-    let updatable: Vec<String> =
-        agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
-    ensure_no_agent_update_blockers(state.inner().as_ref(), &updatable).await?;
-    let app_handle = app.clone();
-    upgrade_all_agent_drivers_from(&state.agent_manager, source, move |event| emit_agent_progress(&app_handle, event))
+    // Resolve the batch operation id first, then register the batch token under
+    // it BEFORE the registry fetch + blocker check so a cancel fired while the
+    // batch is still setting up aborts it instead of being lost.
+    let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let cancellation = state.agent_manager.begin_install_cancellation(&batch_cancellation_key(&operation_id)).await;
+    let result = async {
+        let registry = fetch_registry_from_claimed(source, &[cancellation.as_ref()]).await?;
+        let agents = build_agent_list(&state.agent_manager, Some(&registry));
+        let updatable: Vec<String> =
+            agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
+        ensure_no_agent_update_blockers(state.inner().as_ref(), &updatable).await?;
+        let app_handle = app.clone();
+        let progress_operation_id = operation_id.clone();
+        upgrade_all_agent_drivers_from_claimed(
+            &state.agent_manager,
+            source,
+            move |event| emit_agent_progress(&app_handle, &progress_operation_id, event),
+            &cancellation,
+            &operation_id,
+        )
         .await
+    }
+    .await;
+    state.agent_manager.finish_install_cancellation(&batch_cancellation_key(&operation_id), &cancellation).await;
+    result
+}
+
+#[tauri::command]
+pub async fn cancel_agent_install(
+    state: State<'_, Arc<AppState>>,
+    db_type: String,
+    operation_id: Option<String>,
+) -> Result<(), String> {
+    cancel_agent_driver_install(&state.agent_manager, &db_type, operation_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn cancel_agent_upgrade_all(
+    state: State<'_, Arc<AppState>>,
+    operation_id: Option<String>,
+) -> Result<(), String> {
+    cancel_agent_batch_upgrade(&state.agent_manager, operation_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -105,6 +165,7 @@ pub async fn check_agent_update_blockers(
 
 #[tauri::command]
 pub async fn uninstall_agent(state: State<'_, Arc<AppState>>, db_type: String) -> Result<(), String> {
+    ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
     uninstall_agent_driver(&state.agent_manager, &db_type).await
 }
 
@@ -136,9 +197,7 @@ pub async fn set_agent_java_runtime_config(
         config.custom_java_path = None;
     }
 
-    let mut local_state = am.load_state();
-    local_state.java_runtime = config.clone();
-    am.save_state(&local_state)?;
+    am.mutate_state(|local_state| local_state.java_runtime = config.clone())?;
     am.stop_daemons().await;
     Ok(config)
 }
@@ -159,16 +218,54 @@ pub async fn import_agents_from_zip(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     path: String,
+    operation_id: Option<String>,
 ) -> Result<u32, String> {
     let am = &state.agent_manager;
-    let zip_path = std::path::PathBuf::from(&path);
-    let plan = inspect_offline_zip(&zip_path)?;
+    let package_path = std::path::PathBuf::from(&path);
+    let plan = inspect_offline_package(&package_path)?;
     ensure_no_offline_import_blockers(state.inner().as_ref(), &plan).await?;
     let app_handle = app.clone();
-    let result = import_agents_from_zip_core(am, &zip_path, |event| emit_agent_progress(&app_handle, event))?;
+    let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let result = import_agents_from_package_core(am, &package_path, |event| {
+        emit_agent_progress(&app_handle, &operation_id, event)
+    })
+    .await?;
+    dbx_core::jdbc::import_offline_jdbc_payload(state.plugins.root_dir(), &package_path)?;
     let count = result.drivers_installed.len() as u32;
-    emit_agent_progress(&app, AgentProgressEvent::step("done"));
+    emit_agent_progress(&app, &operation_id, AgentProgressEvent::step("done"));
     Ok(count)
+}
+
+#[tauri::command]
+pub async fn preview_agent_offline_export(
+    state: State<'_, Arc<AppState>>,
+) -> Result<AgentOfflineExportPreview, String> {
+    let state = Arc::clone(state.inner());
+    run_blocking_agent_task("Failed to prepare the offline Agent export preview", move || {
+        Ok(preview_agent_offline_export_core(&state.agent_manager))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn export_agents_offline(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    driver_keys: Vec<String>,
+) -> Result<AgentOfflineExportResult, String> {
+    let state = Arc::clone(state.inner());
+    run_blocking_agent_task("Failed to run the offline Agent export task", move || {
+        export_agents_offline_core(&state.agent_manager, std::path::Path::new(&path), &driver_keys)
+    })
+    .await
+}
+
+async fn run_blocking_agent_task<T, F>(context: &'static str, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task).await.map_err(|error| format!("{context}: {error}"))?
 }
 
 #[tauri::command]
@@ -178,7 +275,7 @@ pub async fn import_agent_driver_cmd(
     path: String,
 ) -> Result<(), String> {
     ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
-    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path)).await
 }
 
 #[tauri::command]
@@ -188,7 +285,7 @@ pub async fn import_agent_jar_cmd(
     path: String,
 ) -> Result<(), String> {
     ensure_no_agent_update_blockers(state.inner().as_ref(), std::slice::from_ref(&db_type)).await?;
-    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path))
+    import_agent_driver(&state.agent_manager, &db_type, std::path::Path::new(&path)).await
 }
 
 #[tauri::command]
@@ -197,17 +294,19 @@ pub async fn reinstall_jre(
     state: State<'_, Arc<AppState>>,
     jre_key: Option<String>,
     source: Option<DownloadSource>,
+    operation_id: Option<String>,
 ) -> Result<(), String> {
     let key = jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY);
     let app_handle = app.clone();
+    let operation_id = operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     reinstall_agent_jre_from(&state.agent_manager, key, source.unwrap_or_default(), move |event| {
-        emit_agent_progress(&app_handle, event)
+        emit_agent_progress(&app_handle, &operation_id, event)
     })
     .await
 }
 
-fn emit_agent_progress(app: &tauri::AppHandle, event: AgentProgressEvent) {
-    let _ = app.emit("agent-install-progress", event);
+fn emit_agent_progress(app: &tauri::AppHandle, operation_id: &str, event: AgentProgressEvent) {
+    let _ = app.emit("agent-install-progress", event.with_operation_id(operation_id));
 }
 
 async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) -> Result<(), String> {
@@ -216,7 +315,7 @@ async fn ensure_no_agent_update_blockers(state: &AppState, db_types: &[String]) 
         return Ok(());
     }
     let labels = blockers.into_iter().map(|blocker| blocker.label).collect::<Vec<_>>().join(", ");
-    Err(format!("请先关闭以下数据库连接后再更新驱动: {labels}"))
+    Err(format!("Close these database connections before updating drivers: {labels}"))
 }
 
 async fn ensure_no_offline_import_blockers(state: &AppState, plan: &OfflineImportPlan) -> Result<(), String> {
@@ -254,4 +353,35 @@ fn update_blockers_from_keys(
         .collect::<Vec<_>>();
     blockers.sort_by(|left, right| left.label.cmp(&right.label));
     blockers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_blocking_agent_task;
+
+    #[tokio::test]
+    async fn blocking_agent_task_returns_successful_value() {
+        let result = run_blocking_agent_task("agent task failed", || Ok::<_, String>(42)).await;
+
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn blocking_agent_task_preserves_core_error() {
+        let result = run_blocking_agent_task("agent task failed", || Err::<(), _>("core failure".to_string())).await;
+
+        assert_eq!(result.unwrap_err(), "core failure");
+    }
+
+    #[tokio::test]
+    async fn blocking_agent_task_maps_join_error_with_context() {
+        let result = run_blocking_agent_task("agent task failed", || -> Result<(), String> {
+            panic!("worker panic");
+        })
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.starts_with("agent task failed:"), "unexpected error: {error}");
+        assert!(error.contains("panicked"), "unexpected error: {error}");
+    }
 }

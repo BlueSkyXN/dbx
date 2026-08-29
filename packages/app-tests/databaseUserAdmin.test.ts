@@ -265,6 +265,8 @@ test("routes Doris to a Doris 2.x user admin provider", () => {
   assert.ok(provider, "expected a provider for doris");
   assert.equal(provider?.dialect, "mysql");
   assert.equal(provider?.listUsersSql(), "SHOW ALL GRANTS;");
+  assert.equal(provider?.fallbackListUsersSql?.(), "SHOW GRANTS;");
+  assert.equal(provider?.parseFallbackUsers, dorisUsersResult);
   assert.equal(provider?.showGrantsSql({ user: "root", host: "%" }), "SHOW GRANTS FOR 'root'@'%';");
   assert.equal(provider?.createUserSql?.({ user: "app", host: "%", password: "secret" }), "CREATE USER 'app'@'%' IDENTIFIED BY 'secret';");
   assert.equal(dorisAlterUserPasswordSql({ user: "app", host: "%" }, "new'secret"), "SET PASSWORD FOR 'app'@'%' = PASSWORD('new''secret');");
@@ -331,7 +333,7 @@ test("resolves user admin support from the effective connection type", () => {
   assert.equal(resolveDatabaseUserAdminProviderForConnection(jdbcStarRocks), getDatabaseUserAdminProvider("starrocks"));
   assert.equal(resolveDatabaseUserAdminProviderForConnection(mysqlProtocolDoris), getDatabaseUserAdminProvider("doris"));
   assert.equal(resolveDatabaseUserAdminProviderForConnection(jdbcDoris), getDatabaseUserAdminProvider("doris"));
-  assert.equal(resolveDatabaseUserAdminProviderForConnection(mysql), getDatabaseUserAdminProvider("mysql"));
+  assert.equal(resolveDatabaseUserAdminProviderForConnection(mysql), getDatabaseUserAdminProvider("mysql", mysql));
   assert.equal(resolveDatabaseUserAdminProviderForConnection(goldenDb), getDatabaseUserAdminProvider("goldendb"));
   assert.equal(connectionSupportsDatabaseUserAdmin(mysqlProtocolStarRocks), true);
   assert.equal(connectionSupportsDatabaseUserAdmin(mysqlProtocolDoris), true);

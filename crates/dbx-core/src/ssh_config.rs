@@ -194,6 +194,7 @@ mod tests {
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
             auth_method: "password".to_string(),
+            allow_exec_channel_proxy: false,
         }
     }
 
@@ -262,6 +263,16 @@ mod tests {
         let resolved = apply_host_entry(&ssh, entry("myserver"));
         assert_eq!(resolved.key_path, "~/.ssh/id_ed25519");
         assert_eq!(resolved.auth_method, "password");
+    }
+
+    #[test]
+    fn resolve_preserves_key_plus_password_method() {
+        let mut ssh = config("myserver");
+        ssh.auth_method = "key+password".to_string();
+        ssh.password = "secret".to_string();
+        let resolved = apply_host_entry(&ssh, entry("myserver"));
+        assert_eq!(resolved.key_path, "~/.ssh/id_ed25519");
+        assert_eq!(resolved.auth_method, "key+password");
     }
 
     #[test]

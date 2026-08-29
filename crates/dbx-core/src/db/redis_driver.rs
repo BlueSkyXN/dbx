@@ -1,4 +1,4 @@
-use crate::models::connection::ConnectionConfig;
+use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo};
 use base64::Engine;
 use redis::{
     aio::ConnectionLike,
@@ -14,10 +14,12 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use super::json_value_for_js;
 
-const STREAM_ENTRY_LIMIT: usize = 100;
+const STREAM_ENTRY_PAGE_SIZE: usize = 50;
+const STREAM_PENDING_PAGE_SIZE: usize = 100;
 const COLLECTION_PAGE_SIZE: usize = 200;
 const HASH_FILTER_SCAN_MAX_ITERATIONS: usize = 10;
 const DEFAULT_REDIS_DATABASES: u32 = 16;
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CLUSTER_CURSOR_NODE_BITS: u64 = 16;
 const CLUSTER_CURSOR_NODE_MASK: u64 = (1 << CLUSTER_CURSOR_NODE_BITS) - 1;
 const CLUSTER_CURSOR_SCAN_MASK: u64 = (1 << (64 - CLUSTER_CURSOR_NODE_BITS)) - 1;
@@ -102,6 +104,10 @@ pub struct RedisSetItem {
 pub struct RedisHashItem {
     pub field: RedisBlob,
     pub value: RedisBlob,
+    /// Remaining field TTL in seconds. `-1` means the field is persistent;
+    /// `None` means the Redis server does not expose hash-field expiration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_ttl: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +126,77 @@ pub struct RedisStreamField {
 pub struct RedisStreamEntry {
     pub id: String,
     pub fields: Vec<RedisStreamField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisStreamPage {
+    pub entries: Vec<RedisStreamEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisStreamGroup {
+    pub name: RedisBlob,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub consumers: u64,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub pending: u64,
+    pub last_delivered_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "serialize_optional_redis_u64_for_js")]
+    pub entries_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "serialize_optional_redis_u64_for_js")]
+    pub lag: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisStreamConsumer {
+    pub name: RedisBlob,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub pending: u64,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub idle_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "serialize_optional_redis_u64_for_js")]
+    pub inactive_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisStreamPendingEntry {
+    pub id: String,
+    pub consumer: RedisBlob,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub idle_ms: u64,
+    #[serde(serialize_with = "serialize_redis_u64_for_js")]
+    pub deliveries: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisStreamPendingPage {
+    pub entries: Vec<RedisStreamPendingEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+// JSON and Tauri IPC both deliver numbers to JavaScript, so preserve large Redis counters as text.
+fn serialize_redis_u64_for_js<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *value > JS_MAX_SAFE_INTEGER {
+        serializer.serialize_str(&value.to_string())
+    } else {
+        serializer.serialize_u64(*value)
+    }
+}
+
+fn serialize_optional_redis_u64_for_js<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) => serialize_redis_u64_for_js(value, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +235,14 @@ pub enum RedisValueData {
     },
     Stream {
         entries: Vec<RedisStreamEntry>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_redis_u64_for_js"
+        )]
+        total: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
     },
     Unknown,
 }
@@ -231,15 +316,39 @@ pub struct RedisClusterPool {
 #[derive(Debug, Clone)]
 struct RedisClusterKeyScanSession {
     master_nodes: Vec<RedisNodeEndpoint>,
-    node_index: usize,
-    node_cursor: u64,
+    node_cursors: Vec<u64>,
+    node_complete: Vec<bool>,
+    next_node_index: usize,
     pattern: String,
     last_used: Instant,
 }
 
 impl RedisClusterKeyScanSession {
     fn new(master_nodes: Vec<RedisNodeEndpoint>, pattern: &str) -> Self {
-        Self { master_nodes, node_index: 0, node_cursor: 0, pattern: pattern.to_string(), last_used: Instant::now() }
+        let node_count = master_nodes.len();
+        Self {
+            master_nodes,
+            node_cursors: vec![0; node_count],
+            node_complete: vec![false; node_count],
+            next_node_index: 0,
+            pattern: pattern.to_string(),
+            last_used: Instant::now(),
+        }
+    }
+
+    fn next_unfinished_node_index(&self) -> Option<usize> {
+        let node_count = self.master_nodes.len();
+        (0..node_count)
+            .map(|offset| (self.next_node_index + offset) % node_count)
+            .find(|index| !self.node_complete[*index])
+    }
+
+    fn advance_after(&mut self, node_index: usize) {
+        self.next_node_index = (node_index + 1) % self.master_nodes.len();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.node_complete.iter().all(|complete| *complete)
     }
 }
 
@@ -640,6 +749,41 @@ pub async fn test_connection(connection: &RedisConnection) -> Result<(), String>
     }
 }
 
+/// Read the Redis server identity without making metadata unavailable when the
+/// INFO command is disabled by ACL or server policy.
+pub async fn database_connection_info(connection: &RedisConnection) -> Result<DatabaseConnectionInfo, String> {
+    match connection {
+        RedisConnection::Direct(con) => {
+            let mut con = con.lock().await;
+            redis_database_connection_info(&mut *con).await
+        }
+        RedisConnection::Cluster(pool) => {
+            let mut con = cluster_any_connection(pool).await?;
+            redis_database_connection_info(&mut con).await
+        }
+    }
+}
+
+async fn redis_database_connection_info<C>(con: &mut C) -> Result<DatabaseConnectionInfo, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let info =
+        tokio::time::timeout(super::connection_timeout(), redis::cmd("INFO").arg("server").query_async::<String>(con))
+            .await
+            .map_err(|_| format!("Redis INFO command timed out ({}s)", super::CONNECTION_TIMEOUT_SECS))?
+            .map_err(|error| format!("Redis INFO command failed: {error}"))?;
+    let product_version = info.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        (key.eq_ignore_ascii_case("redis_version") && !value.trim().is_empty()).then(|| value.trim().to_string())
+    });
+    Ok(DatabaseConnectionInfo {
+        product_name: Some("Redis".to_string()),
+        product_version,
+        ..DatabaseConnectionInfo::default()
+    })
+}
+
 async fn redis_ping<C>(con: &mut C, label: &str) -> Result<(), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -972,6 +1116,33 @@ where
     redis::cmd("SELECT").arg(db).query_async(con).await.map_err(|e| e.to_string())
 }
 
+pub async fn execute_console_command<C>(
+    con: &mut C,
+    db: u32,
+    command_text: &str,
+    skip_safety_check: bool,
+) -> Result<RedisCommandResult, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let selection: redis::RedisResult<()> = redis::cmd("SELECT").arg(db).query_async(con).await;
+    if let Err(error) = selection {
+        if !is_unavailable_db_zero_select(&error, db) {
+            return Err(error.to_string());
+        }
+    }
+    execute_command(con, command_text, skip_safety_check).await
+}
+
+fn is_unavailable_db_zero_select(error: &redis::RedisError, db: u32) -> bool {
+    if db != 0 || error.kind() != redis::ErrorKind::ResponseError {
+        return false;
+    }
+    let detail = error.detail().unwrap_or_default().trim_start();
+    let prefix_len = "unknown command".len();
+    detail.get(..prefix_len).is_some_and(|prefix| prefix.eq_ignore_ascii_case("unknown command"))
+}
+
 pub fn ensure_cluster_db(db: u32) -> Result<(), String> {
     if db == 0 {
         Ok(())
@@ -1132,7 +1303,7 @@ where
     Connect: FnMut(RedisNodeEndpoint) -> ConnectFuture,
     ConnectFuture: Future<Output = Result<C, String>>,
 {
-    if session.master_nodes.is_empty() || session.node_index >= session.master_nodes.len() {
+    if session.master_nodes.is_empty() || session.is_complete() {
         return Ok(RedisClusterKeyScanBatch { keys: Vec::new(), total_keys: 0, complete: true });
     }
 
@@ -1153,25 +1324,29 @@ where
     let mut all_keys = Vec::new();
 
     for _ in 0..iterations {
-        if connections[session.node_index].is_none() {
-            connections[session.node_index] =
-                Some(connect_node(session.master_nodes[session.node_index].clone()).await?);
+        let Some(node_index) = session.next_unfinished_node_index() else {
+            return Ok(RedisClusterKeyScanBatch { keys: all_keys, total_keys, complete: true });
+        };
+        if connections[node_index].is_none() {
+            connections[node_index] = Some(connect_node(session.master_nodes[node_index].clone()).await?);
         }
-        let connection = connections[session.node_index].as_mut().ok_or("Redis cluster node connection unavailable")?;
-        let page =
-            scan_keys_batch_inner(connection, session.node_cursor, pattern, count, 1, include_types, false).await?;
+        let connection = connections[node_index].as_mut().ok_or("Redis cluster node connection unavailable")?;
+        let page = scan_keys_batch_inner(
+            connection,
+            session.node_cursors[node_index],
+            pattern,
+            count,
+            1,
+            include_types,
+            false,
+        )
+        .await?;
         all_keys.extend(page.keys);
 
-        let complete = if page.cursor != 0 {
-            session.node_cursor = page.cursor;
-            false
-        } else if session.node_index + 1 < session.master_nodes.len() {
-            session.node_index += 1;
-            session.node_cursor = 0;
-            false
-        } else {
-            true
-        };
+        session.node_cursors[node_index] = page.cursor;
+        session.node_complete[node_index] = page.cursor == 0;
+        session.advance_after(node_index);
+        let complete = session.is_complete();
 
         if complete || all_keys.len() >= target_keys {
             return Ok(RedisClusterKeyScanBatch { keys: all_keys, total_keys, complete });
@@ -1476,9 +1651,11 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
     let mut chars = command_text.chars().peekable();
     let mut quote: Option<char> = None;
     let mut escaping = false;
+    let mut token_started = false;
 
     while let Some(ch) = chars.next() {
         if escaping {
+            token_started = true;
             current.push(match ch {
                 'n' => '\n',
                 'r' => '\r',
@@ -1490,6 +1667,7 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
         }
 
         if ch == '\\' {
+            token_started = true;
             escaping = true;
             continue;
         }
@@ -1504,20 +1682,23 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
         }
 
         if ch == '"' || ch == '\'' {
+            token_started = true;
             quote = Some(ch);
             continue;
         }
 
         if ch.is_whitespace() {
-            if !current.is_empty() {
+            if token_started {
                 argv.push(std::mem::take(&mut current));
             }
+            token_started = false;
             while matches!(chars.peek(), Some(next) if next.is_whitespace()) {
                 chars.next();
             }
             continue;
         }
 
+        token_started = true;
         current.push(ch);
     }
 
@@ -1527,10 +1708,10 @@ pub fn parse_command_argv(command_text: &str) -> Result<Vec<String>, String> {
     if quote.is_some() {
         return Err("Redis command has an unterminated quote".to_string());
     }
-    if !current.is_empty() {
+    if token_started {
         argv.push(current);
     }
-    if argv.is_empty() {
+    if argv.first().is_none_or(String::is_empty) {
         return Err("Redis command is empty".to_string());
     }
     Ok(argv)
@@ -1567,6 +1748,8 @@ pub fn classify_command(command: &str) -> RedisCommandSafety {
         | "HRANDFIELD"
         | "HSCAN"
         | "HSTRLEN"
+        | "HPTTL"
+        | "HTTL"
         | "HVALS"
         | "INFO"
         | "LASTSAVE"
@@ -1678,12 +1861,13 @@ pub fn classify_command(command: &str) -> RedisCommandSafety {
         | "TS.QUERYINDEX"
         | "TS.RANGE" => RedisCommandSafety::Allowed,
         "DEL" | "UNLINK" | "EXPIRE" | "EXPIREAT" | "PEXPIRE" | "PEXPIREAT" | "RENAME" | "RENAMENX" | "GETDEL"
-        | "HDEL" | "JSON.ARRPOP" | "JSON.ARRTRIM" | "JSON.CLEAR" | "JSON.DEL" | "JSON.FORGET" | "BLMOVE" | "BLMPOP"
-        | "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "LPOP" | "LMOVE" | "LMPOP" | "RPOP" | "RPOPLPUSH" | "LREM" | "LTRIM"
-        | "SPOP" | "SREM" | "ZREM" | "ZPOPMAX" | "ZPOPMIN" | "ZMPOP" | "BZMPOP" | "BZPOPMAX" | "BZPOPMIN"
-        | "ZREMRANGEBYLEX" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "XDEL" | "XTRIM" | "MOVE" | "SORT"
-        | "SDIFFSTORE" | "SINTERSTORE" | "SUNIONSTORE" | "ZDIFFSTORE" | "ZINTERSTORE" | "ZRANGESTORE"
-        | "ZUNIONSTORE" | "PFMERGE" | "GEOSEARCHSTORE" => RedisCommandSafety::Confirm,
+        | "HDEL" | "HEXPIRE" | "HEXPIREAT" | "HPEXPIRE" | "HPEXPIREAT" | "HPERSIST" | "JSON.ARRPOP"
+        | "JSON.ARRTRIM" | "JSON.CLEAR" | "JSON.DEL" | "JSON.FORGET" | "BLMOVE" | "BLMPOP" | "BLPOP" | "BRPOP"
+        | "BRPOPLPUSH" | "LPOP" | "LMOVE" | "LMPOP" | "RPOP" | "RPOPLPUSH" | "LREM" | "LTRIM" | "SPOP" | "SREM"
+        | "ZREM" | "ZPOPMAX" | "ZPOPMIN" | "ZMPOP" | "BZMPOP" | "BZPOPMAX" | "BZPOPMIN" | "ZREMRANGEBYLEX"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "XDEL" | "XTRIM" | "MOVE" | "SORT" | "SDIFFSTORE"
+        | "SINTERSTORE" | "SUNIONSTORE" | "ZDIFFSTORE" | "ZINTERSTORE" | "ZRANGESTORE" | "ZUNIONSTORE" | "PFMERGE"
+        | "GEOSEARCHSTORE" | "FLUSHDB" => RedisCommandSafety::Confirm,
         "APPEND" | "BITFIELD" | "BITOP" | "COPY" | "DECR" | "DECRBY" | "GEOADD" | "GEORADIUS" | "GEORADIUSBYMEMBER"
         | "GETEX" | "GETSET" | "INCR" | "INCRBY" | "INCRBYFLOAT" | "SET" | "SETEX" | "PSETEX" | "SETNX"
         | "SETRANGE" | "MSET" | "MSETNX" | "PERSIST" | "HSET" | "HMSET" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX"
@@ -1888,8 +2072,9 @@ fn redis_raw_value_to_command_arg(v: &RedisRawValue) -> Option<String> {
 /// Try to convert a RedisRawValue to a u64.
 fn redis_value_to_u64(v: &RedisRawValue) -> Option<u64> {
     match v {
-        RedisRawValue::Int(i) => Some(*i as u64),
+        RedisRawValue::Int(i) => u64::try_from(*i).ok(),
         RedisRawValue::BulkString(bytes) => std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()),
+        RedisRawValue::SimpleString(value) => value.parse().ok(),
         _ => None,
     }
 }
@@ -1979,8 +2164,8 @@ where
 
 /// Batch-scan keys with server-side multi-SCAN support.
 ///
-/// Performs up to `max_iterations` SCAN cycles in a single call. TYPE metadata
-/// is optional so large key-name searches can avoid extra Redis work.
+/// Performs up to `max_iterations` SCAN cycles in a single call. TYPE and TTL
+/// metadata is optional so large key-name searches can avoid extra Redis work.
 /// DBSIZE is only called on the first iteration (cursor == 0).
 pub async fn scan_keys_batch<C>(
     con: &mut C,
@@ -2021,6 +2206,13 @@ where
                 } else {
                     String::new()
                 };
+                // 精确命中单个 key 时顺带查询一次 TTL（O(1) 命令），
+                // 让前端列表行无需再点开 key 就能看到过期信息。
+                let key_ttl: i64 = if include_types {
+                    redis::cmd("TTL").arg(pattern).query_async(con).await.unwrap_or(-2)
+                } else {
+                    -2
+                };
 
                 let value_preview = if include_types { redis_key_value_preview(&key_type) } else { String::new() };
 
@@ -2028,7 +2220,7 @@ where
                     key_display: redis_key_bytes_to_display(pattern.as_bytes()),
                     key_raw: redis_key_bytes_to_raw(pattern.as_bytes()),
                     key_type,
-                    ttl: -2,
+                    ttl: key_ttl,
                     size: 0,
                     value_preview,
                 };
@@ -2059,14 +2251,28 @@ where
         let (next_cursor, keys) = parse_scan_keys(raw)?;
 
         if !keys.is_empty() {
-            let key_types: Vec<String> = if include_types {
-                let mut pipe = redis::pipe();
+            let (key_types, key_ttls): (Vec<String>, Vec<i64>) = if include_types {
+                let mut type_pipe = redis::pipe();
                 for key in &keys {
-                    pipe.cmd("TYPE").arg(key);
+                    type_pipe.cmd("TYPE").arg(key);
                 }
-                pipe.query_async(con).await.unwrap_or_default()
+                let type_count = type_pipe.len();
+                let type_values = con.req_packed_commands(&type_pipe, 0, type_count).await.unwrap_or_default();
+                let key_types = type_values
+                    .iter()
+                    .map(|value| String::from_redis_value(value).unwrap_or_else(|_| "unknown".to_string()))
+                    .collect();
+
+                let mut ttl_pipe = redis::pipe();
+                for key in &keys {
+                    ttl_pipe.cmd("TTL").arg(key);
+                }
+                let ttl_count = ttl_pipe.len();
+                let ttl_values = con.req_packed_commands(&ttl_pipe, 0, ttl_count).await.unwrap_or_default();
+                let key_ttls = ttl_values.iter().map(|value| i64::from_redis_value(value).unwrap_or(-2)).collect();
+                (key_types, key_ttls)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
 
             for (index, key) in keys.iter().enumerate() {
@@ -2084,7 +2290,7 @@ where
                     key_display: redis_key_bytes_to_display(key),
                     key_raw: redis_key_bytes_to_raw(key),
                     key_type,
-                    ttl: -2,
+                    ttl: key_ttls.get(index).copied().unwrap_or(-2),
                     size: 0,
                     value_preview,
                 });
@@ -2214,7 +2420,14 @@ where
 {
     let redis_type: String = redis::cmd("TYPE").arg(key).query_async(con).await.map_err(|e| e.to_string())?;
 
-    let ttl: i64 = redis::cmd("TTL").arg(key).query_async(con).await.unwrap_or(-1);
+    // For Streams, fetch metadata and the initial page together after TYPE.
+    // This keeps the accurate XLEN without adding another Redis round trip.
+    let stream_initial_page =
+        if redis_type == "stream" { Some(get_stream_initial_page(con, key).await?) } else { None };
+    let ttl: i64 = match stream_initial_page.as_ref() {
+        Some((ttl, _, _)) => *ttl,
+        None => redis::cmd("TTL").arg(key).query_async(con).await.unwrap_or(-1),
+    };
 
     let data = match redis_type.as_str() {
         "string" => {
@@ -2240,15 +2453,21 @@ where
         }
         "zset" => {
             let len: u64 = redis::cmd("ZCARD").arg(key).query_async(con).await.unwrap_or(0);
-            let (cursor, items) = zscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE).await?;
-            RedisValueData::Zset { items, total: len, scan_cursor: (cursor > 0).then_some(cursor) }
+            let end = (COLLECTION_PAGE_SIZE as i64) - 1;
+            let items = zrange_page_raw(con, key, 0, end, false).await?;
+            let cursor = if len > COLLECTION_PAGE_SIZE as u64 { Some(COLLECTION_PAGE_SIZE as u64) } else { None };
+            RedisValueData::Zset { items, total: len, scan_cursor: cursor }
         }
         "hash" => {
             let len: u64 = redis::cmd("HLEN").arg(key).query_async(con).await.unwrap_or(0);
-            let (cursor, items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
+            let (cursor, mut items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
+            attach_hash_field_ttls(con, key, &mut items).await?;
             RedisValueData::Hash { items, total: len, scan_cursor: (cursor > 0).then_some(cursor) }
         }
-        "stream" => RedisValueData::Stream { entries: get_stream_entries(con, key).await? },
+        "stream" => {
+            let (_, total, page) = stream_initial_page.expect("Stream page is loaded with its Stream type");
+            RedisValueData::Stream { entries: page.entries, total, next_cursor: page.next_cursor }
+        }
         key_type if is_redis_json_type(key_type) => {
             let raw: RedisRawValue =
                 redis::cmd("JSON.GET").arg(key).query_async(con).await.map_err(|e| e.to_string())?;
@@ -2264,6 +2483,18 @@ where
         ttl,
         data,
     })
+}
+
+/// Read only a key's TTL without loading its value or collection members.
+///
+/// Redis returns `-2` for a missing key and `-1` for a key without an expiry;
+/// callers preserve those sentinel values so the UI can update its detail view
+/// without an additional round trip.
+pub async fn get_ttl<C>(con: &mut C, key: &[u8]) -> Result<i64, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    redis::cmd("TTL").arg(key).query_async(con).await.map_err(|e| e.to_string())
 }
 
 fn redis_value_matches_query(value: &RedisValue, query: &str) -> bool {
@@ -2303,7 +2534,7 @@ fn redis_search_value_text(value: &RedisValueData) -> String {
             .flat_map(|item| [item.score.clone(), redis_blob_display_text(&item.member)])
             .collect::<Vec<_>>()
             .join(" "),
-        RedisValueData::Stream { entries } => entries
+        RedisValueData::Stream { entries, .. } => entries
             .iter()
             .flat_map(|entry| {
                 entry.fields.iter().flat_map(|field| [field.field.clone(), field.value.clone()]).collect::<Vec<_>>()
@@ -2336,26 +2567,135 @@ fn redis_search_value_size(value: &RedisValue) -> u64 {
         | RedisValueData::Set { total, .. }
         | RedisValueData::Hash { total, .. }
         | RedisValueData::Zset { total, .. } => *total,
-        RedisValueData::Stream { entries } => entries.len() as u64,
+        RedisValueData::Stream { entries, total, .. } => total.unwrap_or(entries.len() as u64),
         RedisValueData::Unknown => 0,
     }
 }
 
-async fn get_stream_entries<C>(con: &mut C, key: &[u8]) -> Result<Vec<RedisStreamEntry>, String>
+pub async fn get_stream_entries_page<C>(
+    con: &mut C,
+    key: &[u8],
+    cursor: Option<&str>,
+) -> Result<RedisStreamPage, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
+    let cursor = cursor.filter(|value| !value.is_empty());
+    let start = cursor.unwrap_or("-");
+    // XRANGE starts inclusively. Fetch a duplicate candidate and a lookahead
+    // row so this works with Redis 5 and does not skip records after trimming.
+    let requested_count = stream_entry_page_request_count(cursor);
     let raw: RedisRawValue = redis::cmd("XRANGE")
         .arg(key)
-        .arg("-")
+        .arg(start)
         .arg("+")
         .arg("COUNT")
-        .arg(STREAM_ENTRY_LIMIT)
+        .arg(requested_count)
         .query_async(con)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(parse_stream_entries(raw))
+    Ok(stream_entries_page_from_raw(raw, cursor))
+}
+
+async fn get_stream_initial_page<C>(con: &mut C, key: &[u8]) -> Result<(i64, Option<u64>, RedisStreamPage), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let mut pipe = redis::pipe();
+    pipe.cmd("TTL").arg(key);
+    pipe.cmd("XLEN").arg(key);
+    pipe.cmd("XRANGE").arg(key).arg("-").arg("+").arg("COUNT").arg(stream_entry_page_request_count(None));
+    match pipe.query_async::<(i64, u64, RedisRawValue)>(con).await {
+        Ok((ttl, total, raw)) => Ok((ttl, Some(total), stream_entries_page_from_raw(raw, None))),
+        Err(_) => {
+            // An ACL may allow XRANGE while rejecting the optional XLEN
+            // metadata. Keep the Stream readable and omit the unknown size.
+            let ttl: i64 = redis::cmd("TTL").arg(key).query_async(con).await.unwrap_or(-1);
+            let total = redis::cmd("XLEN").arg(key).query_async::<u64>(con).await.ok();
+            let page = get_stream_entries_page(con, key, None).await?;
+            Ok((ttl, total, page))
+        }
+    }
+}
+
+fn stream_entry_page_request_count(cursor: Option<&str>) -> usize {
+    STREAM_ENTRY_PAGE_SIZE + 1 + usize::from(cursor.is_some())
+}
+
+fn stream_entries_page_from_raw(raw: RedisRawValue, cursor: Option<&str>) -> RedisStreamPage {
+    let mut entries = parse_stream_entries(raw);
+    if let Some(cursor) = cursor {
+        if entries.first().is_some_and(|entry| entry.id == cursor) {
+            entries.remove(0);
+        }
+    }
+    let next_cursor = if entries.len() > STREAM_ENTRY_PAGE_SIZE {
+        entries.truncate(STREAM_ENTRY_PAGE_SIZE);
+        entries.last().map(|entry| entry.id.clone())
+    } else {
+        None
+    };
+
+    RedisStreamPage { entries, next_cursor }
+}
+
+pub async fn get_stream_groups<C>(con: &mut C, key: &[u8]) -> Result<Vec<RedisStreamGroup>, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let raw: RedisRawValue =
+        redis::cmd("XINFO").arg("GROUPS").arg(key).query_async(con).await.map_err(|e| e.to_string())?;
+
+    Ok(parse_stream_groups(raw))
+}
+
+pub async fn get_stream_consumers<C>(con: &mut C, key: &[u8], group: &[u8]) -> Result<Vec<RedisStreamConsumer>, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let raw: RedisRawValue =
+        redis::cmd("XINFO").arg("CONSUMERS").arg(key).arg(group).query_async(con).await.map_err(|e| e.to_string())?;
+
+    Ok(parse_stream_consumers(raw))
+}
+
+pub async fn get_stream_pending_page<C>(
+    con: &mut C,
+    key: &[u8],
+    group: &[u8],
+    cursor: Option<&str>,
+    consumer: Option<&[u8]>,
+) -> Result<RedisStreamPendingPage, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let cursor = cursor.filter(|value| !value.is_empty());
+    let start = cursor.unwrap_or("-");
+    // Redis before 6.2 has no exclusive XPENDING ranges. A cursor page needs
+    // a duplicate candidate and a lookahead row to page without skipping IDs.
+    let requested_count = STREAM_PENDING_PAGE_SIZE + 1 + usize::from(cursor.is_some());
+    let mut command = redis::cmd("XPENDING");
+    command.arg(key).arg(group).arg(start).arg("+").arg(requested_count);
+    if let Some(consumer) = consumer {
+        command.arg(consumer);
+    }
+    let raw: RedisRawValue = command.query_async(con).await.map_err(|e| e.to_string())?;
+
+    let mut entries = parse_stream_pending_entries(raw);
+    if let Some(cursor) = cursor {
+        if entries.first().is_some_and(|entry| entry.id == cursor) {
+            entries.remove(0);
+        }
+    }
+    let next_cursor = if entries.len() > STREAM_PENDING_PAGE_SIZE {
+        entries.truncate(STREAM_PENDING_PAGE_SIZE);
+        entries.last().map(|entry| entry.id.clone())
+    } else {
+        None
+    };
+
+    Ok(RedisStreamPendingPage { entries, next_cursor })
 }
 
 fn parse_scan_keys(raw: RedisRawValue) -> Result<(u64, Vec<Vec<u8>>), String> {
@@ -2415,6 +2755,81 @@ fn parse_stream_entry(entry: RedisRawValue) -> Option<RedisStreamEntry> {
     }
 
     Some(RedisStreamEntry { id, fields: parsed_fields })
+}
+
+fn parse_stream_groups(raw: RedisRawValue) -> Vec<RedisStreamGroup> {
+    match raw {
+        RedisRawValue::Array(groups) => groups.into_iter().filter_map(parse_stream_group).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_stream_group(group: RedisRawValue) -> Option<RedisStreamGroup> {
+    let mut attributes = parse_stream_info_attributes(group)?;
+    Some(RedisStreamGroup {
+        name: redis_value_to_blob(attributes.remove("name")?)?,
+        consumers: redis_value_to_u64(&attributes.remove("consumers")?)?,
+        pending: redis_value_to_u64(&attributes.remove("pending")?)?,
+        last_delivered_id: redis_value_to_string(attributes.remove("last-delivered-id")?)?,
+        entries_read: attributes.remove("entries-read").and_then(|value| redis_value_to_u64(&value)),
+        lag: attributes.remove("lag").and_then(|value| redis_value_to_u64(&value)),
+    })
+}
+
+fn parse_stream_consumers(raw: RedisRawValue) -> Vec<RedisStreamConsumer> {
+    match raw {
+        RedisRawValue::Array(consumers) => consumers.into_iter().filter_map(parse_stream_consumer).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_stream_consumer(consumer: RedisRawValue) -> Option<RedisStreamConsumer> {
+    let mut attributes = parse_stream_info_attributes(consumer)?;
+    Some(RedisStreamConsumer {
+        name: redis_value_to_blob(attributes.remove("name")?)?,
+        pending: redis_value_to_u64(&attributes.remove("pending")?)?,
+        idle_ms: redis_value_to_u64(&attributes.remove("idle")?)?,
+        inactive_ms: attributes.remove("inactive").and_then(|value| redis_value_to_u64(&value)),
+    })
+}
+
+fn parse_stream_pending_entries(raw: RedisRawValue) -> Vec<RedisStreamPendingEntry> {
+    match raw {
+        RedisRawValue::Array(entries) => entries.into_iter().filter_map(parse_stream_pending_entry).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_stream_pending_entry(entry: RedisRawValue) -> Option<RedisStreamPendingEntry> {
+    let mut parts = match entry {
+        RedisRawValue::Array(parts) if parts.len() == 4 => parts.into_iter(),
+        _ => return None,
+    };
+
+    Some(RedisStreamPendingEntry {
+        id: redis_value_to_string(parts.next()?)?,
+        consumer: redis_value_to_blob(parts.next()?)?,
+        idle_ms: redis_value_to_u64(&parts.next()?)?,
+        deliveries: redis_value_to_u64(&parts.next()?)?,
+    })
+}
+
+fn parse_stream_info_attributes(raw: RedisRawValue) -> Option<HashMap<String, RedisRawValue>> {
+    let RedisRawValue::Array(parts) = raw else {
+        return None;
+    };
+
+    let mut attributes = HashMap::new();
+    let mut parts = parts.into_iter();
+    while let Some(name) = parts.next() {
+        let value = parts.next()?;
+        attributes.insert(redis_value_to_string(name)?, value);
+    }
+    Some(attributes)
+}
+
+fn redis_value_to_blob(value: RedisRawValue) -> Option<RedisBlob> {
+    redis_value_to_bytes(value).map(|bytes| redis_blob_from_bytes(&bytes))
 }
 
 fn redis_value_to_string(value: RedisRawValue) -> Option<String> {
@@ -2558,6 +2973,20 @@ where
     redis::cmd("DEL").arg(key).query_async::<()>(con).await.map_err(|e| e.to_string())
 }
 
+/// Rename a key without overwriting an existing destination.
+pub async fn rename_key<C>(con: &mut C, key: &[u8], new_key: &[u8]) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let renamed =
+        redis::cmd("RENAMENX").arg(key).arg(new_key).query_async::<bool>(con).await.map_err(|e| e.to_string())?;
+    if renamed {
+        Ok(())
+    } else {
+        Err("Target key already exists".to_string())
+    }
+}
+
 async fn apply_expire_if_needed<C>(con: &mut C, key: &[u8], ttl: Option<i64>) -> Result<(), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -2574,7 +3003,12 @@ pub async fn hash_set<C>(con: &mut C, key: &[u8], field: &str, value: &str, ttl:
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
+    let previous_field_ttl = if ttl.is_none() { read_hash_field_ttl(con, key, field.as_bytes()).await? } else { None };
     redis::cmd("HSET").arg(key).arg(field).arg(value).query_async::<()>(con).await.map_err(|e| e.to_string())?;
+    if let Some(previous_ttl) = previous_field_ttl.filter(|ttl| *ttl > 0) {
+        let remaining_ttl = previous_ttl.max(1);
+        set_hash_field_ttl(con, key, field, remaining_ttl).await?;
+    }
     apply_expire_if_needed(con, key, ttl).await
 }
 
@@ -2583,6 +3017,194 @@ where
     C: ConnectionLike + Send + Sync + Unpin,
 {
     redis::cmd("HDEL").arg(key).arg(field).query_async::<()>(con).await.map_err(|e| e.to_string())
+}
+
+/// Atomically update a hash field, optionally moving it to a new name.
+///
+/// The operation is intentionally implemented as one Lua script rather than
+/// as an HSET/HDEL pair.  That keeps destination collision checks and the
+/// source deletion in the same server-side critical section.  Hash-field
+/// expiry commands were introduced after hashes themselves, so the script
+/// probes them with `pcall` and preserves expiry when the server supports
+/// HTTL/HEXPIRE while remaining usable on older Redis versions.  Permission
+/// errors are surfaced instead of being mistaken for an unsupported command,
+/// since silently dropping a field TTL would be data loss.
+pub async fn hash_field_update<C>(
+    con: &mut C,
+    key: &[u8],
+    old_field: &str,
+    new_field: &str,
+    value: &str,
+) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    const SCRIPT: &str = r#"
+        local key = KEYS[1]
+        local old_field = ARGV[1]
+        local new_field = ARGV[2]
+        local value = ARGV[3]
+
+        -- Keep enough source state to undo a destination write if a later
+        -- command fails.  EVAL itself is atomic, but Redis does not roll back
+        -- writes made before a Lua runtime error.
+        if redis.call('HEXISTS', key, old_field) == 0 then
+            return 0
+        end
+        local old_value = redis.call('HGET', key, old_field)
+        if old_value == false then
+            return 0
+        end
+        if old_field ~= new_field and redis.call('HEXISTS', key, new_field) == 1 then
+            return -1
+        end
+
+        if old_field ~= new_field then
+            -- The collision check established that new_field is absent. Probe
+            -- HDEL before writing so a restricted HDEL permission cannot
+            -- leave both fields behind after the later source delete.
+            local delete_probe = redis.pcall('HDEL', key, new_field)
+            if type(delete_probe) == 'table' and delete_probe.err ~= nil then
+                return -3
+            end
+        end
+
+        local function optional_expiry_error(reply)
+            if type(reply) ~= 'table' or reply.err == nil then
+                return false
+            end
+            local detail = string.lower(reply.err)
+            return string.find(detail, 'unknown command', 1, true) ~= nil
+                or string.find(detail, 'syntax error', 1, true) ~= nil
+                or string.find(detail, 'unsupported', 1, true) ~= nil
+        end
+
+        -- HTTL returns an array containing -1 (persistent), -2 (missing), or
+        -- the remaining seconds.  Unsupported commands are deliberately
+        -- ignored so Redis versions without hash-field expiry still work.
+        local source_ttl = -2
+        local ttl_reply = redis.pcall('HTTL', key, 'FIELDS', 1, old_field)
+        if type(ttl_reply) == 'table' and ttl_reply.err ~= nil then
+            if not optional_expiry_error(ttl_reply) then
+                return -3
+            end
+        elseif type(ttl_reply) == 'table' and ttl_reply[1] ~= nil then
+            source_ttl = tonumber(ttl_reply[1])
+            if source_ttl == nil or source_ttl < -2 then
+                return -3
+            end
+            -- The source can expire between the initial HGET and HTTL. Do
+            -- not create a new field when the probe already says it is gone.
+            if source_ttl == -2 then
+                return 0
+            end
+            -- HTTL rounds down to seconds. HEXPIRE 0 deletes a field, so an
+            -- imminent expiry must abort before HSET rather than losing data.
+            if source_ttl == 0 then
+                return -3
+            end
+        end
+
+        local function restore_source()
+            local restored = redis.pcall('HSET', key, old_field, old_value)
+            if type(restored) == 'table' and restored.err ~= nil then
+                return false
+            end
+            if source_ttl > 0 then
+                local expiry = redis.pcall('HEXPIRE', key, source_ttl, 'FIELDS', 1, old_field)
+                if type(expiry) == 'table' and expiry.err ~= nil and not optional_expiry_error(expiry) then
+                    return false
+                end
+            end
+            return true
+        end
+
+        local function apply_source_expiry(field)
+            if source_ttl < 0 then
+                return true
+            end
+            local expiry = redis.pcall('HEXPIRE', key, source_ttl, 'FIELDS', 1, field)
+            if type(expiry) == 'table' and expiry.err ~= nil then
+                -- A missing command is expected on Redis versions before
+                -- hash-field expiry.  Other errors must fail safely.
+                return optional_expiry_error(expiry)
+            end
+            return type(expiry) == 'table' and tonumber(expiry[1]) == 1
+        end
+
+        local written = redis.pcall('HSET', key, new_field, value)
+        if type(written) == 'table' and written.err ~= nil then
+            return -3
+        end
+
+        if not apply_source_expiry(new_field) then
+            if old_field == new_field then
+                restore_source()
+            else
+                redis.pcall('HDEL', key, new_field)
+            end
+            return -3
+        end
+
+        if old_field == new_field then
+            return 1
+        end
+
+        local deleted = redis.pcall('HDEL', key, old_field)
+        if type(deleted) == 'table' and deleted.err ~= nil then
+            redis.pcall('HDEL', key, new_field)
+            return -3
+        end
+        if tonumber(deleted) ~= 1 then
+            redis.pcall('HDEL', key, new_field)
+            return 0
+        end
+        return 2
+    "#;
+
+    let result = redis::cmd("EVAL")
+        .arg(SCRIPT)
+        .arg(1)
+        .arg(key)
+        .arg(old_field)
+        .arg(new_field)
+        .arg(value)
+        .query_async::<i64>(con)
+        .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if is_hash_field_update_acl_compatibility_error(&error) => {
+            return Err(
+                "Atomic Redis hash field updates require the Redis EVAL and hash command permissions. Ask an administrator to grant them."
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    match result {
+        1 | 2 => Ok(()),
+        0 => Err("The Redis hash field no longer exists. Refresh and try again.".to_string()),
+        -1 => Err("A Redis hash field with the new name already exists.".to_string()),
+        -3 => Err("Redis hash field update failed before completion.".to_string()),
+        _ => Err("Unexpected result while updating Redis hash field.".to_string()),
+    }
+}
+
+fn is_hash_field_update_acl_compatibility_error(error: &redis::RedisError) -> bool {
+    if error.code() != Some("NOPERM") {
+        return false;
+    }
+
+    let detail = error.detail().unwrap_or_default().to_ascii_lowercase();
+    detail.contains("eval")
+        || detail.contains("hexists")
+        || detail.contains("hget")
+        || detail.contains("hset")
+        || detail.contains("hdel")
+        || detail.contains("httl")
+        || detail.contains("hexpire")
 }
 
 pub async fn list_push<C>(con: &mut C, key: &[u8], value: &str, ttl: Option<i64>) -> Result<(), String>
@@ -2639,6 +3261,77 @@ where
     redis::cmd("ZREM").arg(key).arg(member).query_async::<()>(con).await.map_err(|e| e.to_string())
 }
 
+pub async fn zset_update<C>(
+    con: &mut C,
+    key: &[u8],
+    original_member: &str,
+    expected_score: &str,
+    member: &str,
+    score: &str,
+) -> Result<bool, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    // Keep the source check, duplicate check, score write, and optional rename
+    // in one Redis operation so a failed save cannot delete the original member.
+    const SCRIPT: &str = r#"
+        local current_score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+        if current_score == false then
+            return 0
+        end
+        if current_score ~= ARGV[3] then
+            return -2
+        end
+        if ARGV[1] ~= ARGV[2] and redis.call('ZSCORE', KEYS[1], ARGV[2]) ~= false then
+            return -1
+        end
+        redis.call('ZADD', KEYS[1], ARGV[4], ARGV[2])
+        if ARGV[1] ~= ARGV[2] then
+            redis.call('ZREM', KEYS[1], ARGV[1])
+        end
+        return 1
+    "#;
+
+    let result = redis::cmd("EVAL")
+        .arg(SCRIPT)
+        .arg(1)
+        .arg(key)
+        .arg(original_member)
+        .arg(member)
+        .arg(expected_score)
+        .arg(score)
+        .query_async::<i64>(con)
+        .await;
+
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if is_zset_update_acl_compatibility_error(&error) => {
+            return Err(
+                "Atomic ZSet updates require the Redis EVAL and ZSCORE permissions. Ask an administrator to grant them."
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    match result {
+        1 => Ok(false),
+        0 => Err("The ZSet member no longer exists. Refresh and try again.".to_string()),
+        -1 => Err("A ZSet member with the new value already exists.".to_string()),
+        -2 => Err("The ZSet score changed after it was loaded. Refresh and try again.".to_string()),
+        _ => Err("Unexpected result while updating ZSet member.".to_string()),
+    }
+}
+
+fn is_zset_update_acl_compatibility_error(error: &redis::RedisError) -> bool {
+    if error.code() != Some("NOPERM") {
+        return false;
+    }
+
+    let detail = error.detail().unwrap_or_default().to_ascii_lowercase();
+    detail.contains("eval") || detail.contains("zscore")
+}
+
 pub async fn stream_add<C>(
     con: &mut C,
     key: &[u8],
@@ -2689,9 +3382,91 @@ where
     C: ConnectionLike + Send + Sync + Unpin,
 {
     if ttl > 0 {
-        redis::cmd("EXPIRE").arg(key).arg(ttl).query_async::<()>(con).await.map_err(|e| e.to_string())
+        let applied =
+            redis::cmd("EXPIRE").arg(key).arg(ttl).query_async::<i64>(con).await.map_err(|e| e.to_string())?;
+        if applied == 1 {
+            Ok(())
+        } else {
+            Err("Redis key no longer exists; EXPIRE was not applied".to_string())
+        }
     } else {
+        // Redis treats PERSIST as idempotent: a zero reply also means the key
+        // was already persistent. Follow-up reads in the UI handle a key that
+        // disappeared concurrently without requiring an extra ACL permission.
         redis::cmd("PERSIST").arg(key).query_async::<()>(con).await.map_err(|e| e.to_string())
+    }
+}
+
+pub async fn set_expire_at<C>(con: &mut C, key: &[u8], expire_at: i64) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let applied =
+        redis::cmd("EXPIREAT").arg(key).arg(expire_at).query_async::<i64>(con).await.map_err(|e| e.to_string())?;
+    if applied == 1 {
+        Ok(())
+    } else {
+        Err("Redis key no longer exists; EXPIREAT was not applied".to_string())
+    }
+}
+
+pub async fn set_hash_field_ttl<C>(con: &mut C, key: &[u8], field: &str, ttl: i64) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    if ttl <= 0 {
+        let raw: RedisRawValue = redis::cmd("HPERSIST")
+            .arg(key)
+            .arg("FIELDS")
+            .arg(1)
+            .arg(field)
+            .query_async(con)
+            .await
+            .map_err(|e| e.to_string())?;
+        return parse_hash_field_expiry_result(raw, "HPERSIST", true);
+    }
+
+    let raw: RedisRawValue = redis::cmd("HEXPIRE")
+        .arg(key)
+        .arg(ttl)
+        .arg("FIELDS")
+        .arg(1)
+        .arg(field)
+        .query_async(con)
+        .await
+        .map_err(|e| e.to_string())?;
+    parse_hash_field_expiry_result(raw, "HEXPIRE", false)
+}
+
+pub async fn set_hash_field_expire_at<C>(con: &mut C, key: &[u8], field: &str, expire_at: i64) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let raw: RedisRawValue = redis::cmd("HEXPIREAT")
+        .arg(key)
+        .arg(expire_at)
+        .arg("FIELDS")
+        .arg(1)
+        .arg(field)
+        .query_async(con)
+        .await
+        .map_err(|e| e.to_string())?;
+    parse_hash_field_expiry_result(raw, "HEXPIREAT", false)
+}
+
+fn parse_hash_field_expiry_result(raw: RedisRawValue, command: &str, allow_persist_noop: bool) -> Result<(), String> {
+    let RedisRawValue::Array(mut values) = raw else {
+        return Err(format!("Invalid {command} response"));
+    };
+    let Some(result) = values.pop().and_then(redis_value_to_string).and_then(|value| value.parse::<i64>().ok()) else {
+        return Err(format!("Invalid {command} response"));
+    };
+    match result {
+        1 => Ok(()),
+        -1 if allow_persist_noop => Ok(()),
+        2 => Err(format!("{command} removed the hash field because it was already expired")),
+        -2 => Err("Redis hash field no longer exists".to_string()),
+        _ => Err(format!("{command} was not applied to the hash field")),
     }
 }
 
@@ -2713,6 +3488,7 @@ pub async fn load_more_collection<C>(
     cursor: u64,
     count: usize,
     filter_query: Option<&str>,
+    sort_direction: Option<&str>,
 ) -> Result<RedisCollectionPage, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -2735,15 +3511,26 @@ where
             Ok(RedisCollectionPage::Set { items, scan_cursor: (next_cursor > 0).then_some(next_cursor) })
         }
         "zset" => {
-            let (next_cursor, items) = zscan_page_raw(con, key, cursor, count).await?;
-            Ok(RedisCollectionPage::Zset { items, scan_cursor: (next_cursor > 0).then_some(next_cursor) })
+            let descending = match sort_direction.unwrap_or("asc") {
+                "asc" => false,
+                "desc" => true,
+                direction => return Err(format!("Invalid ZSet sort direction: {direction}")),
+            };
+            let start = cursor as i64;
+            let end = start + count as i64;
+            let mut items = zrange_page_raw(con, key, start, end, descending).await?;
+            let has_more = items.len() > count;
+            items.truncate(count);
+            let next = cursor + count as u64;
+            Ok(RedisCollectionPage::Zset { items, scan_cursor: has_more.then_some(next) })
         }
         "hash" => {
-            let (next_cursor, items) = if let Some(query) = filter_query.filter(|query| !query.is_empty()) {
+            let (next_cursor, mut items) = if let Some(query) = filter_query.filter(|query| !query.is_empty()) {
                 hscan_filtered_page_raw(con, key, cursor, count, query).await?
             } else {
                 hscan_page_raw(con, key, cursor, count, None).await?
             };
+            attach_hash_field_ttls(con, key, &mut items).await?;
             Ok(RedisCollectionPage::Hash { items, scan_cursor: (next_cursor > 0).then_some(next_cursor) })
         }
         _ => Err(format!("Pagination not supported for type: {key_type}")),
@@ -2797,6 +3584,76 @@ where
     Ok((cur, items))
 }
 
+async fn attach_hash_field_ttls<C>(con: &mut C, key: &[u8], items: &mut [RedisHashItem]) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut command = redis::cmd("HTTL");
+    command.arg(key).arg("FIELDS").arg(items.len());
+    for item in items.iter() {
+        let field = base64::engine::general_purpose::STANDARD
+            .decode(&item.field.raw_base64)
+            .map_err(|error| format!("Invalid Redis hash field encoding: {error}"))?;
+        command.arg(field);
+    }
+
+    let raw: RedisRawValue = match command.query_async(con).await {
+        Ok(raw) => raw,
+        Err(error) if is_optional_hash_field_expiry_error(&error) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if matches!(raw, RedisRawValue::Nil) {
+        return Ok(());
+    }
+    let RedisRawValue::Array(values) = raw else {
+        return Ok(());
+    };
+    if values.len() != items.len() {
+        return Ok(());
+    }
+    for (item, value) in items.iter_mut().zip(values) {
+        let Some(ttl) = redis_value_to_string(value).and_then(|value| value.parse::<i64>().ok()) else {
+            return Ok(());
+        };
+        item.field_ttl = (ttl != -2).then_some(ttl);
+    }
+    Ok(())
+}
+
+async fn read_hash_field_ttl<C>(con: &mut C, key: &[u8], field: &[u8]) -> Result<Option<i64>, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let raw: RedisRawValue = match redis::cmd("HTTL").arg(key).arg("FIELDS").arg(1).arg(field).query_async(con).await {
+        Ok(raw) => raw,
+        Err(error) if is_optional_hash_field_expiry_error(&error) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if matches!(raw, RedisRawValue::Nil) {
+        return Ok(None);
+    }
+    let RedisRawValue::Array(mut values) = raw else {
+        return Ok(None);
+    };
+    let Some(ttl) = values.pop().and_then(redis_value_to_string).and_then(|value| value.parse::<i64>().ok()) else {
+        return Ok(None);
+    };
+    Ok((ttl >= 0).then_some(ttl))
+}
+
+fn is_optional_hash_field_expiry_error(error: &redis::RedisError) -> bool {
+    let detail = error.detail().unwrap_or_default().to_ascii_lowercase();
+    detail.contains("unknown command")
+        || detail.contains("unsupported")
+        || detail.contains("syntax error")
+        || detail.contains("noperm")
+        || detail.contains("no permission")
+}
+
 fn hash_entry_matches_query(item: &RedisHashItem, query: &str) -> bool {
     let query = query.to_lowercase();
     if query.is_empty() {
@@ -2827,56 +3684,42 @@ where
     parse_scan_members(raw)
 }
 
-async fn zscan_page_raw<C>(
+async fn zrange_page_raw<C>(
     con: &mut C,
     key: &[u8],
-    cursor: u64,
-    count: usize,
-) -> Result<(u64, Vec<RedisZsetItem>), String>
+    start: i64,
+    end: i64,
+    descending: bool,
+) -> Result<Vec<RedisZsetItem>, String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let raw: RedisRawValue = redis::cmd("ZSCAN")
+    let command = if descending { "ZREVRANGE" } else { "ZRANGE" };
+    let raw: RedisRawValue = redis::cmd(command)
         .arg(key)
-        .arg(cursor)
-        .arg("COUNT")
-        .arg(count)
+        .arg(start)
+        .arg(end)
+        .arg("WITHSCORES")
         .query_async(con)
         .await
         .map_err(|e| e.to_string())?;
-    let (next_cursor, items) = parse_scan_pairs(raw)?;
-    Ok((next_cursor, items.into_iter().map(|(member, score)| RedisZsetItem { score, member }).collect()))
-}
 
-fn parse_scan_pairs(raw: RedisRawValue) -> Result<(u64, Vec<(RedisBlob, String)>), String> {
-    let RedisRawValue::Array(parts) = raw else {
-        return Err("Invalid SCAN response".to_string());
+    let RedisRawValue::Array(entries) = raw else {
+        return Err("Invalid ZRANGE response".to_string());
     };
-    if parts.len() != 2 {
-        return Err("Invalid SCAN response".to_string());
+    if entries.len() % 2 != 0 {
+        return Err("Invalid ZRANGE response".to_string());
     }
 
-    let cursor = redis_value_to_string(parts[0].clone())
-        .ok_or("Invalid cursor")?
-        .parse::<u64>()
-        .map_err(|_| "Invalid cursor".to_string())?;
-
-    let RedisRawValue::Array(entries) = &parts[1] else {
-        return Err("Invalid SCAN entries".to_string());
-    };
-
-    let mut items = Vec::new();
-    let mut iter = entries.iter();
-    while let Some(a) = iter.next() {
-        let Some(b) = iter.next() else { break };
-        let member = redis_value_to_bytes(a.clone())
+    let mut items = Vec::with_capacity(entries.len() / 2);
+    for pair in entries.chunks_exact(2) {
+        let member = redis_value_to_bytes(pair[0].clone())
             .map(|bytes| redis_blob_from_bytes(&bytes))
-            .ok_or_else(|| "Invalid SCAN member payload".to_string())?;
-        let value = redis_value_to_string(b.clone()).unwrap_or_default();
-        items.push((member, value));
+            .ok_or_else(|| "Invalid ZRANGE member payload".to_string())?;
+        let score = redis_value_to_string(pair[1].clone()).ok_or_else(|| "Invalid ZRANGE score".to_string())?;
+        items.push(RedisZsetItem { score, member });
     }
-
-    Ok((cursor, items))
+    Ok(items)
 }
 
 fn parse_scan_hash_entries(raw: RedisRawValue) -> Result<(u64, Vec<RedisHashItem>), String> {
@@ -2906,7 +3749,7 @@ fn parse_scan_hash_entries(raw: RedisRawValue) -> Result<(u64, Vec<RedisHashItem
         let value = redis_value_to_bytes(value.clone())
             .map(|bytes| redis_blob_from_bytes(&bytes))
             .ok_or_else(|| "Invalid hash value payload".to_string())?;
-        items.push(RedisHashItem { field, value });
+        items.push(RedisHashItem { field, value, field_ttl: None });
     }
 
     Ok((cursor, items))
@@ -2953,13 +3796,14 @@ mod tests {
     use super::{
         classify_command, connection_info, decode_cluster_cursor, encode_cluster_cursor, is_redis_json_type,
         parse_cluster_slots, parse_command_argv, parse_database_count, parse_redis_endpoint, parse_scan_keys,
-        parse_stream_entries, redis_auth_candidates, redis_blob_from_bytes, redis_cluster_slot,
-        redis_command_raw_to_json, redis_database_index, redis_key_bytes_to_display, redis_key_bytes_to_raw,
-        redis_key_matches_query, redis_key_raw_to_bytes, redis_key_value_preview, redis_sentinel_master_endpoint,
-        redis_value_matches_query, redis_value_to_bytes, standalone_connection_infos, RedisAuthCandidate, RedisBlob,
-        RedisBlobEncoding, RedisClusterSlotRange, RedisCollectionPage, RedisCommandSafety, RedisHashItem,
-        RedisNodeEndpoint, RedisNodeRoute, RedisRawValue, RedisSetItem, RedisStreamEntry, RedisStreamField, RedisValue,
-        RedisValueData,
+        parse_stream_consumers, parse_stream_entries, parse_stream_groups, parse_stream_pending_entries,
+        redis_auth_candidates, redis_blob_from_bytes, redis_cluster_slot, redis_command_raw_to_json,
+        redis_database_index, redis_key_bytes_to_display, redis_key_bytes_to_raw, redis_key_matches_query,
+        redis_key_raw_to_bytes, redis_key_value_preview, redis_sentinel_master_endpoint, redis_value_matches_query,
+        redis_value_to_bytes, standalone_connection_infos, RedisAuthCandidate, RedisBlob, RedisBlobEncoding,
+        RedisClusterSlotRange, RedisCollectionPage, RedisCommandSafety, RedisHashItem, RedisNodeEndpoint,
+        RedisNodeRoute, RedisRawValue, RedisSetItem, RedisStreamConsumer, RedisStreamEntry, RedisStreamField,
+        RedisStreamGroup, RedisStreamPendingEntry, RedisValue, RedisValueData, RedisZsetItem,
     };
     use crate::models::connection::ConnectionConfig;
     use redis::{aio::ConnectionLike, Cmd, ConnectionAddr, Pipeline, RedisFuture};
@@ -2993,11 +3837,15 @@ mod tests {
 
         fn req_packed_commands<'a>(
             &'a mut self,
-            _cmd: &'a Pipeline,
+            cmd: &'a Pipeline,
             _offset: usize,
-            _count: usize,
+            count: usize,
         ) -> RedisFuture<'a, Vec<RedisRawValue>> {
-            Box::pin(async move { Ok(Vec::new()) })
+            self.commands.push(String::from_utf8_lossy(&cmd.get_packed_pipeline()).into_owned());
+            let responses = (0..count)
+                .map(|_| self.responses.pop_front().unwrap_or(Ok(RedisRawValue::Nil)))
+                .collect::<redis::RedisResult<Vec<_>>>();
+            Box::pin(async move { responses })
         }
 
         fn get_db(&self) -> i64 {
@@ -3025,11 +3873,15 @@ mod tests {
 
         fn req_packed_commands<'a>(
             &'a mut self,
-            _cmd: &'a Pipeline,
+            cmd: &'a Pipeline,
             _offset: usize,
-            _count: usize,
+            count: usize,
         ) -> RedisFuture<'a, Vec<RedisRawValue>> {
-            Box::pin(async move { Ok(Vec::new()) })
+            self.commands.lock().unwrap().push(String::from_utf8_lossy(&cmd.get_packed_pipeline()).into_owned());
+            let responses = (0..count)
+                .map(|_| self.responses.pop_front().unwrap_or(Ok(RedisRawValue::Nil)))
+                .collect::<redis::RedisResult<Vec<_>>>();
+            Box::pin(async move { responses })
         }
 
         fn get_db(&self) -> i64 {
@@ -3060,6 +3912,17 @@ mod tests {
         RedisRawValue::Array(vec![bulk(cursor), RedisRawValue::Array(entries)])
     }
 
+    fn zrange_response(pairs: Vec<(&str, &str)>) -> RedisRawValue {
+        RedisRawValue::Array(pairs.into_iter().flat_map(|(member, score)| [bulk(member), bulk(score)]).collect())
+    }
+
+    fn noperm(command: &str) -> redis::RedisError {
+        redis::make_extension_error(
+            "NOPERM".to_string(),
+            Some(format!("this user has no permissions to run the '{command}' command")),
+        )
+    }
+
     fn text_blob(value: &str) -> RedisBlob {
         redis_blob_from_bytes(value.as_bytes())
     }
@@ -3084,7 +3947,11 @@ mod tests {
             RedisValueData::Hash {
                 items: entries
                     .iter()
-                    .map(|(field, value)| RedisHashItem { field: text_blob(field), value: text_blob(value) })
+                    .map(|(field, value)| RedisHashItem {
+                        field: text_blob(field),
+                        value: text_blob(value),
+                        field_ttl: None,
+                    })
                     .collect(),
                 total: entries.len() as u64,
                 scan_cursor: None,
@@ -3101,6 +3968,85 @@ mod tests {
                 scan_cursor: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn db0_console_command_continues_when_select_is_unavailable() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select', with args beginning with: '0'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("Ada"))]);
+
+        let result = super::execute_console_command(&mut con, 0, "GET name", false).await.unwrap();
+
+        assert_eq!(result.command, "GET");
+        assert_eq!(result.value, serde_json::json!("Ada"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 1);
+    }
+
+    #[tokio::test]
+    async fn console_command_keeps_supported_db_zero_selection() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Okay, bulk("Ada")]);
+
+        let result = super::execute_console_command(&mut con, 0, "GET name", false).await.unwrap();
+
+        assert_eq!(result.value, serde_json::json!("Ada"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 1);
+    }
+
+    #[tokio::test]
+    async fn console_command_does_not_ignore_unavailable_select_for_nonzero_db() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select', with args beginning with: '1'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("wrong db"))]);
+
+        let error = super::execute_console_command(&mut con, 1, "GET name", false).await.unwrap_err();
+
+        assert!(error.contains("unknown command"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 0);
+    }
+
+    #[tokio::test]
+    async fn console_command_propagates_non_compatibility_select_errors() {
+        let errors = vec![
+            redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "An error was signalled by the server",
+                "invalid DB index".to_string(),
+            )),
+            noperm("SELECT"),
+            redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "Authentication failed")),
+            redis::RedisError::from((redis::ErrorKind::ParseError, "Invalid response")),
+            redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")),
+        ];
+
+        for select_error in errors {
+            let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("must not run"))]);
+
+            assert!(super::execute_console_command(&mut con, 0, "GET name", false).await.is_err());
+            assert_eq!(con.command_count("SELECT"), 1);
+            assert_eq!(con.command_count("GET"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_database_selection_keeps_unavailable_select_error() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error)]);
+
+        assert!(super::select_db(&mut con, 0).await.is_err());
     }
 
     #[test]
@@ -3143,6 +4089,429 @@ mod tests {
                 fields: vec![RedisStreamField { field: "event".to_string(), value: "logout".to_string() }],
             }]
         );
+    }
+
+    #[test]
+    fn parses_stream_groups_with_binary_names_and_compatible_optional_fields() {
+        let raw = RedisRawValue::Array(vec![
+            RedisRawValue::Array(vec![
+                bulk("name"),
+                RedisRawValue::BulkString(vec![0xFF, b'g']),
+                bulk("consumers"),
+                RedisRawValue::Int(2),
+                bulk("pending"),
+                bulk("3"),
+                bulk("last-delivered-id"),
+                bulk("1714470000000-0"),
+                bulk("entries-read"),
+                RedisRawValue::Int(11),
+                bulk("lag"),
+                RedisRawValue::Nil,
+                bulk("future-field"),
+                bulk("ignored"),
+            ]),
+            RedisRawValue::Array(vec![
+                bulk("name"),
+                bulk("legacy-group"),
+                bulk("consumers"),
+                RedisRawValue::Int(0),
+                bulk("pending"),
+                RedisRawValue::Int(0),
+                bulk("last-delivered-id"),
+                bulk("0-0"),
+            ]),
+        ]);
+
+        let parsed = parse_stream_groups(raw);
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, redis_blob_from_bytes(&[0xFF, b'g']));
+        assert_eq!(
+            parsed[0],
+            RedisStreamGroup {
+                name: redis_blob_from_bytes(&[0xFF, b'g']),
+                consumers: 2,
+                pending: 3,
+                last_delivered_id: "1714470000000-0".to_string(),
+                entries_read: Some(11),
+                lag: None,
+            }
+        );
+        assert_eq!(
+            parsed[1],
+            RedisStreamGroup {
+                name: text_blob("legacy-group"),
+                consumers: 0,
+                pending: 0,
+                last_delivered_id: "0-0".to_string(),
+                entries_read: None,
+                lag: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_stream_consumers_and_pending_entries() {
+        let consumers = parse_stream_consumers(RedisRawValue::Array(vec![
+            RedisRawValue::Array(vec![
+                bulk("name"),
+                bulk("worker-a"),
+                bulk("pending"),
+                RedisRawValue::Int(4),
+                bulk("idle"),
+                bulk("1200"),
+                bulk("inactive"),
+                RedisRawValue::Int(800),
+            ]),
+            RedisRawValue::Array(vec![
+                bulk("name"),
+                bulk("legacy-worker"),
+                bulk("pending"),
+                RedisRawValue::Int(0),
+                bulk("idle"),
+                RedisRawValue::Int(0),
+            ]),
+        ]));
+        let pending = parse_stream_pending_entries(RedisRawValue::Array(vec![
+            RedisRawValue::Array(vec![
+                bulk("1714470000000-0"),
+                RedisRawValue::BulkString(vec![0xFE, b'c']),
+                RedisRawValue::Int(2_400),
+                bulk("3"),
+            ]),
+            RedisRawValue::Array(vec![bulk("malformed")]),
+        ]));
+
+        assert_eq!(
+            consumers,
+            vec![
+                RedisStreamConsumer { name: text_blob("worker-a"), pending: 4, idle_ms: 1_200, inactive_ms: Some(800) },
+                RedisStreamConsumer { name: text_blob("legacy-worker"), pending: 0, idle_ms: 0, inactive_ms: None },
+            ]
+        );
+        assert_eq!(
+            pending,
+            vec![RedisStreamPendingEntry {
+                id: "1714470000000-0".to_string(),
+                consumer: redis_blob_from_bytes(&[0xFE, b'c']),
+                idle_ms: 2_400,
+                deliveries: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn serializes_stream_metrics_without_losing_javascript_precision() {
+        let unsafe_value = super::JS_MAX_SAFE_INTEGER + 1;
+        let group = RedisStreamGroup {
+            name: text_blob("payments"),
+            consumers: unsafe_value,
+            pending: 2,
+            last_delivered_id: "1714470000000-0".to_string(),
+            entries_read: Some(unsafe_value),
+            lag: None,
+        };
+        let consumer = RedisStreamConsumer {
+            name: text_blob("worker-a"),
+            pending: 2,
+            idle_ms: unsafe_value,
+            inactive_ms: Some(unsafe_value),
+        };
+        let entry = RedisStreamPendingEntry {
+            id: "1714470000000-0".to_string(),
+            consumer: text_blob("worker-a"),
+            idle_ms: 2,
+            deliveries: unsafe_value,
+        };
+
+        let group_json = serde_json::to_value(group).unwrap();
+        let consumer_json = serde_json::to_value(consumer).unwrap();
+        let entry_json = serde_json::to_value(entry).unwrap();
+
+        assert_eq!(group_json["consumers"], unsafe_value.to_string());
+        assert_eq!(group_json["pending"].as_u64(), Some(2));
+        assert_eq!(group_json["entries_read"], unsafe_value.to_string());
+        assert!(group_json.get("lag").is_none());
+        assert_eq!(consumer_json["idle_ms"], unsafe_value.to_string());
+        assert_eq!(consumer_json["inactive_ms"], unsafe_value.to_string());
+        assert_eq!(entry_json["deliveries"], unsafe_value.to_string());
+    }
+
+    #[tokio::test]
+    async fn stream_value_uses_xlen_for_its_total_size() {
+        let entries = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
+            bulk("1714470000000-0"),
+            RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+        ])]);
+        let mut con =
+            FakeRedisConnection::new(vec![bulk("stream"), RedisRawValue::Int(-1), RedisRawValue::Int(177), entries]);
+
+        let value = super::get_value(&mut con, b"orders").await.unwrap();
+
+        let RedisValueData::Stream { entries, total, next_cursor } = &value.data else {
+            panic!("expected a Stream value");
+        };
+        assert_eq!(*total, Some(177));
+        assert_eq!(entries.len(), 1);
+        assert!(next_cursor.is_none());
+        assert_eq!(super::redis_search_value_size(&value), 177);
+        assert_eq!(con.command_count("TYPE"), 1);
+        assert_eq!(con.command_count("TTL"), 1);
+        assert_eq!(con.command_count("XLEN"), 1);
+        assert_eq!(con.command_count("XRANGE"), 1);
+        assert_eq!(con.commands.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_value_still_loads_when_xlen_is_not_permitted() {
+        let entries = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
+            bulk("1714470000000-0"),
+            RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+        ])]);
+        let xlen_denied = || {
+            redis::make_extension_error(
+                "NOPERM".to_string(),
+                Some("this user has no permissions to run the 'xlen' command".to_string()),
+            )
+        };
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("stream")),
+            Ok(RedisRawValue::Int(-1)),
+            Err(xlen_denied()),
+            Ok(RedisRawValue::Int(-1)),
+            Err(xlen_denied()),
+            Ok(entries),
+        ]);
+
+        let value = super::get_value(&mut con, b"orders").await.unwrap();
+
+        let RedisValueData::Stream { entries, total, .. } = &value.data else {
+            panic!("expected a Stream value");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(*total, None);
+        assert_eq!(super::redis_search_value_size(&value), 1);
+        assert!(serde_json::to_value(&value).unwrap()["data"].get("total").is_none());
+        assert_eq!(con.command_count("XLEN"), 2);
+        assert_eq!(con.command_count("XRANGE"), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_entry_first_page_exposes_a_cursor_when_more_entries_exist() {
+        let entries = RedisRawValue::Array(
+            (0..=50)
+                .map(|index| {
+                    RedisRawValue::Array(vec![
+                        bulk(&format!("1714470000000-{index}")),
+                        RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+                    ])
+                })
+                .collect(),
+        );
+        let mut con = FakeRedisConnection::new(vec![entries]);
+
+        let page = super::get_stream_entries_page(&mut con, b"orders", None).await.unwrap();
+
+        assert_eq!(page.entries.len(), 50);
+        assert_eq!(page.entries.first().map(|entry| entry.id.as_str()), Some("1714470000000-0"));
+        assert_eq!(page.entries.last().map(|entry| entry.id.as_str()), Some("1714470000000-49"));
+        assert_eq!(page.next_cursor.as_deref(), Some("1714470000000-49"));
+        assert_eq!(con.command_count("XRANGE"), 1);
+        assert!(con.commands[0].contains("\r\n-\r\n"));
+        assert!(con.commands[0].contains("\r\n51\r\n"));
+    }
+
+    #[tokio::test]
+    async fn stream_entry_pagination_reads_all_entries_across_sequential_pages() {
+        let stream_entries = |start: u64, end: u64| {
+            RedisRawValue::Array(
+                (start..=end)
+                    .map(|index| {
+                        RedisRawValue::Array(vec![
+                            bulk(&format!("1714470000000-{index}")),
+                            RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+                        ])
+                    })
+                    .collect(),
+            )
+        };
+        let mut con =
+            FakeRedisConnection::new(vec![stream_entries(0, 50), stream_entries(49, 100), stream_entries(99, 120)]);
+
+        let first = super::get_stream_entries_page(&mut con, b"orders", None).await.unwrap();
+        let second = super::get_stream_entries_page(&mut con, b"orders", first.next_cursor.as_deref()).await.unwrap();
+        let third = super::get_stream_entries_page(&mut con, b"orders", second.next_cursor.as_deref()).await.unwrap();
+
+        let ids = first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .chain(&third.entries)
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let expected = (0..=120).map(|index| format!("1714470000000-{index}")).collect::<Vec<_>>();
+
+        assert_eq!(first.next_cursor.as_deref(), Some("1714470000000-49"));
+        assert_eq!(second.next_cursor.as_deref(), Some("1714470000000-99"));
+        assert_eq!(third.next_cursor, None);
+        assert_eq!(ids, expected);
+        assert_eq!(con.command_count("XRANGE"), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_entry_pagination_uses_a_lookahead_and_skips_the_duplicate_cursor() {
+        let entries = RedisRawValue::Array(
+            (17..=68)
+                .map(|index| {
+                    RedisRawValue::Array(vec![
+                        bulk(&format!("1714470000000-{index}")),
+                        RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+                    ])
+                })
+                .collect(),
+        );
+        let mut con = FakeRedisConnection::new(vec![entries]);
+
+        let page = super::get_stream_entries_page(&mut con, b"orders", Some("1714470000000-17")).await.unwrap();
+
+        assert_eq!(page.entries.len(), 50);
+        assert_eq!(page.entries.first().map(|entry| entry.id.as_str()), Some("1714470000000-18"));
+        assert_eq!(page.entries.last().map(|entry| entry.id.as_str()), Some("1714470000000-67"));
+        assert_eq!(page.next_cursor.as_deref(), Some("1714470000000-67"));
+        assert_eq!(con.command_count("XRANGE"), 1);
+        assert!(con.commands[0].contains("\r\n1714470000000-17\r\n"));
+        assert!(!con.commands[0].contains("\r\n(1714470000000-17\r\n"));
+        assert!(con.commands[0].contains("\r\n52\r\n"));
+    }
+
+    #[tokio::test]
+    async fn stream_entry_pagination_keeps_the_first_entry_when_the_cursor_was_trimmed() {
+        let entries = RedisRawValue::Array(
+            (18..=68)
+                .map(|index| {
+                    RedisRawValue::Array(vec![
+                        bulk(&format!("1714470000000-{index}")),
+                        RedisRawValue::Array(vec![bulk("event"), bulk("login")]),
+                    ])
+                })
+                .collect(),
+        );
+        let mut con = FakeRedisConnection::new(vec![entries]);
+
+        let page = super::get_stream_entries_page(&mut con, b"orders", Some("1714470000000-17")).await.unwrap();
+
+        assert_eq!(page.entries.len(), 50);
+        assert_eq!(page.entries.first().map(|entry| entry.id.as_str()), Some("1714470000000-18"));
+        assert_eq!(page.entries.last().map(|entry| entry.id.as_str()), Some("1714470000000-67"));
+        assert_eq!(page.next_cursor.as_deref(), Some("1714470000000-67"));
+    }
+
+    #[tokio::test]
+    async fn stream_monitoring_commands_are_read_only_and_pending_pagination_supports_redis_5() {
+        let groups = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
+            bulk("name"),
+            bulk("payments"),
+            bulk("consumers"),
+            RedisRawValue::Int(1),
+            bulk("pending"),
+            RedisRawValue::Int(101),
+            bulk("last-delivered-id"),
+            bulk("1714470000000-0"),
+        ])]);
+        let consumers = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
+            bulk("name"),
+            bulk("worker-a"),
+            bulk("pending"),
+            RedisRawValue::Int(101),
+            bulk("idle"),
+            RedisRawValue::Int(10),
+        ])]);
+        let pending = RedisRawValue::Array(
+            (17..=118)
+                .map(|index| {
+                    RedisRawValue::Array(vec![
+                        bulk(&format!("1714470000000-{index}")),
+                        bulk("worker-a"),
+                        RedisRawValue::Int(index),
+                        RedisRawValue::Int(1),
+                    ])
+                })
+                .collect(),
+        );
+        let mut con = FakeRedisConnection::new(vec![groups, consumers, pending]);
+
+        let groups = super::get_stream_groups(&mut con, b"orders").await.unwrap();
+        let consumers = super::get_stream_consumers(&mut con, b"orders", b"payments").await.unwrap();
+        let page = super::get_stream_pending_page(&mut con, b"orders", b"payments", Some("1714470000000-17"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(page.entries.len(), 100);
+        assert_eq!(page.entries.first().map(|entry| entry.id.as_str()), Some("1714470000000-18"));
+        assert_eq!(page.entries.last().map(|entry| entry.id.as_str()), Some("1714470000000-117"));
+        assert_eq!(page.next_cursor.as_deref(), Some("1714470000000-117"));
+        assert_eq!(con.command_count("XINFO"), 2);
+        assert_eq!(con.command_count("XPENDING"), 1);
+        assert_eq!(con.command_count("XGROUP"), 0);
+        assert_eq!(con.command_count("XACK"), 0);
+        assert_eq!(con.command_count("XCLAIM"), 0);
+        assert!(con.commands[0].contains("\r\nGROUPS\r\n"));
+        assert!(con.commands[1].contains("\r\nCONSUMERS\r\n"));
+        assert!(con.commands[2].contains("\r\n1714470000000-17\r\n"));
+        assert!(!con.commands[2].contains("\r\n(1714470000000-17\r\n"));
+        assert!(con.commands[2].contains("\r\n102\r\n"));
+    }
+
+    #[tokio::test]
+    async fn stream_pending_pagination_keeps_the_first_entry_when_cursor_is_acknowledged() {
+        let pending = RedisRawValue::Array(
+            (18..=118)
+                .map(|index| {
+                    RedisRawValue::Array(vec![
+                        bulk(&format!("1714470000000-{index}")),
+                        bulk("worker-a"),
+                        RedisRawValue::Int(index),
+                        RedisRawValue::Int(1),
+                    ])
+                })
+                .collect(),
+        );
+        let mut con = FakeRedisConnection::new(vec![pending]);
+
+        let page = super::get_stream_pending_page(&mut con, b"orders", b"payments", Some("1714470000000-17"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(page.entries.len(), 100);
+        assert_eq!(page.entries.first().map(|entry| entry.id.as_str()), Some("1714470000000-18"));
+        assert_eq!(page.entries.last().map(|entry| entry.id.as_str()), Some("1714470000000-117"));
+        assert_eq!(page.next_cursor.as_deref(), Some("1714470000000-117"));
+        assert!(con.commands[0].contains("\r\n1714470000000-17\r\n"));
+        assert!(!con.commands[0].contains("\r\n(1714470000000-17\r\n"));
+        assert!(con.commands[0].contains("\r\n102\r\n"));
+    }
+
+    #[tokio::test]
+    async fn stream_pending_filters_by_consumer_server_side() {
+        let pending = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
+            bulk("1714470000000-0"),
+            bulk("worker-a"),
+            RedisRawValue::Int(2_400),
+            RedisRawValue::Int(1),
+        ])]);
+        let mut con = FakeRedisConnection::new(vec![pending]);
+
+        let page =
+            super::get_stream_pending_page(&mut con, b"orders", b"payments", None, Some(b"worker-a")).await.unwrap();
+
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(con.command_count("XPENDING"), 1);
+        assert!(con.commands[0].contains("\r\n-\r\n"));
+        assert!(con.commands[0].contains("\r\n+\r\n"));
+        assert!(con.commands[0].contains("\r\n101\r\n"));
+        assert!(con.commands[0].contains("\r\nworker-a\r\n"));
     }
 
     #[test]
@@ -3198,6 +4567,69 @@ mod tests {
         assert!(con.commands[0].contains("\r\nSET\r\n"));
         assert!(!con.commands[0].contains("\r\nKEEPTTL\r\n"));
         assert!(!con.commands[0].contains("\r\nEXPIRE\r\n"));
+    }
+
+    #[tokio::test]
+    async fn rename_key_uses_renamenx_without_overwriting_the_destination() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        super::rename_key(&mut con, b"session:old", b"session:new").await.unwrap();
+
+        assert_eq!(con.commands.len(), 1);
+        assert!(con.commands[0].contains("\r\nRENAMENX\r\n"));
+        assert!(con.commands[0].contains("\r\nsession:old\r\n"));
+        assert!(con.commands[0].contains("\r\nsession:new\r\n"));
+    }
+
+    #[tokio::test]
+    async fn rename_key_reports_a_destination_conflict() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        let error = super::rename_key(&mut con, b"session:old", b"session:new").await.unwrap_err();
+
+        assert_eq!(error, "Target key already exists");
+    }
+
+    #[tokio::test]
+    async fn set_expire_at_uses_expireat_with_the_unix_timestamp() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        super::set_expire_at(&mut con, b"session", 1_735_689_600).await.unwrap();
+
+        assert_eq!(con.commands.len(), 1);
+        assert!(con.commands[0].contains("\r\nEXPIREAT\r\n"));
+        assert!(con.commands[0].contains("\r\n1735689600\r\n"));
+        assert_eq!(con.command_count("EVAL"), 0);
+    }
+
+    #[tokio::test]
+    async fn set_expire_at_reports_when_the_key_disappears_before_expiration_is_applied() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        let error = super::set_expire_at(&mut con, b"session", 1_735_689_600).await.unwrap_err();
+
+        assert!(error.contains("EXPIREAT was not applied"));
+    }
+
+    #[tokio::test]
+    async fn set_ttl_reports_when_positive_expiration_is_not_applied() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        let error = super::set_ttl(&mut con, b"session", 60).await.unwrap_err();
+
+        assert!(error.contains("EXPIRE was not applied"));
+    }
+
+    #[tokio::test]
+    async fn persist_is_idempotent_for_an_already_persistent_key() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        super::set_ttl(&mut con, b"session", 0).await.unwrap();
+
+        assert_eq!(con.commands.len(), 1);
+        assert_eq!(con.command_count("PERSIST"), 1);
+        assert_eq!(con.command_count("EXISTS"), 0);
+        assert_eq!(con.command_count("EVAL"), 0);
     }
 
     #[tokio::test]
@@ -3307,6 +4739,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_keys_batch_batches_type_and_ttl_metadata() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(2),
+            scan_response("0", vec!["session:a", "cache:b"]),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::SimpleString("hash".to_string()),
+            RedisRawValue::Int(-1),
+            RedisRawValue::Int(3600),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 2);
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -1);
+        assert_eq!(result.keys[1].key_type, "hash");
+        assert_eq!(result.keys[1].ttl, 3600);
+        let type_pipeline = con.commands.iter().find(|packed| packed.contains("\r\nTYPE\r\n")).unwrap();
+        let ttl_pipeline = con.commands.iter().find(|packed| packed.contains("\r\nTTL\r\n")).unwrap();
+        assert_eq!(type_pipeline.matches("\r\nTYPE\r\n").count(), 2);
+        assert_eq!(type_pipeline.matches("\r\nTTL\r\n").count(), 0);
+        assert_eq!(ttl_pipeline.matches("\r\nTYPE\r\n").count(), 0);
+        assert_eq!(ttl_pipeline.matches("\r\nTTL\r\n").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_preserves_types_when_one_ttl_command_fails() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(2),
+            scan_response("0", vec!["session:a", "cache:b"]),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::SimpleString("hash".to_string()),
+            redis::parse_redis_value(b"-NOPERM this user has no permissions to run the 'ttl' command\r\n").unwrap(),
+            RedisRawValue::Int(3600),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 2);
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -2);
+        assert_eq!(result.keys[1].key_type, "hash");
+        assert_eq!(result.keys[1].ttl, 3600);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_skips_type_and_ttl_when_metadata_disabled() {
+        // include_types=false 是“加载全部”的百万 key 链路，不能多发出任何 TYPE/TTL 命令
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1), scan_response("0", vec!["cache:b"])]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, false).await.unwrap();
+
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_type, "");
+        assert_eq!(result.keys[0].ttl, -2);
+        assert_eq!(con.command_count("TYPE"), 0);
+        assert_eq!(con.command_count("TTL"), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_exact_match_returns_ttl() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(1),
+            RedisRawValue::Int(1),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::Int(-1),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "session:a", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_display, "session:a");
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -1);
+        assert_eq!(con.command_count("EXISTS"), 1);
+        assert_eq!(con.command_count("TTL"), 1);
+    }
+
+    #[tokio::test]
     async fn cluster_key_batch_reuses_node_connections_across_scan_iterations() {
         let sessions = tokio::sync::Mutex::new(super::RedisClusterScanSessions::default());
         let masters = vec![
@@ -3325,16 +4836,15 @@ mod tests {
             ),
             (
                 masters[1].clone(),
+                TrackedRedisConnection::new(vec![RedisRawValue::Int(200), scan_response("9", vec![])], logs[1].clone()),
+            ),
+            (
+                masters[2].clone(),
                 TrackedRedisConnection::new(
-                    vec![
-                        RedisRawValue::Int(200),
-                        scan_response("9", vec![]),
-                        scan_response("0", vec!["membership:saas:base:token:match"]),
-                    ],
-                    logs[1].clone(),
+                    vec![RedisRawValue::Int(300), scan_response("0", vec!["membership:saas:base:token:match"])],
+                    logs[2].clone(),
                 ),
             ),
-            (masters[2].clone(), TrackedRedisConnection::new(vec![RedisRawValue::Int(300)], logs[2].clone())),
         ]);
         let connect_count = Arc::new(AtomicUsize::new(0));
         let connector_count = connect_count.clone();
@@ -3373,6 +4883,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_key_batch_scans_later_masters_before_exhausting_the_first_master() {
+        let sessions = tokio::sync::Mutex::new(super::RedisClusterScanSessions::default());
+        let masters = vec![
+            RedisNodeEndpoint { host: "node-a".to_string(), port: 7000 },
+            RedisNodeEndpoint { host: "node-b".to_string(), port: 7001 },
+            RedisNodeEndpoint { host: "node-c".to_string(), port: 7002 },
+        ];
+        let logs: Vec<_> = (0..masters.len()).map(|_| Arc::new(StdMutex::new(Vec::new()))).collect();
+        let mut connections = HashMap::from([
+            (
+                masters[0].clone(),
+                TrackedRedisConnection::new(
+                    vec![RedisRawValue::Int(200_000), scan_response("7", vec!["migration:visible:first"])],
+                    logs[0].clone(),
+                ),
+            ),
+            (
+                masters[1].clone(),
+                TrackedRedisConnection::new(vec![RedisRawValue::Int(0), scan_response("0", vec![])], logs[1].clone()),
+            ),
+            (
+                masters[2].clone(),
+                TrackedRedisConnection::new(
+                    vec![RedisRawValue::Int(1), scan_response("0", vec!["migration:user:1:status"])],
+                    logs[2].clone(),
+                ),
+            ),
+        ]);
+        let discovered_masters = masters.clone();
+
+        let result = super::scan_cluster_keys_batch_with(
+            &sessions,
+            move || ready(Ok(discovered_masters.clone())),
+            move |endpoint| {
+                ready(connections.remove(&endpoint).ok_or_else(|| format!("unexpected reconnect to {}", endpoint.host)))
+            },
+            0,
+            "*migration*",
+            100,
+            3,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.total_keys, 200_001);
+        assert_eq!(
+            result.keys.iter().map(|key| key.key_display.as_str()).collect::<Vec<_>>(),
+            ["migration:visible:first", "migration:user:1:status",]
+        );
+        assert!(result.cursor > 0);
+        assert_eq!(logs.iter().map(|log| tracked_command_count(log, "SCAN")).collect::<Vec<_>>(), [1, 1, 1]);
+        let continued = sessions.lock().await.take(result.cursor).unwrap();
+        assert_eq!(continued.node_cursors, [7, 0, 0]);
+        assert_eq!(continued.node_complete, [false, true, true]);
+        assert_eq!(continued.next_node_index, 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_key_batch_exact_match_reaches_the_owning_master() {
+        let sessions = tokio::sync::Mutex::new(super::RedisClusterScanSessions::default());
+        let masters = vec![
+            RedisNodeEndpoint { host: "node-a".to_string(), port: 7000 },
+            RedisNodeEndpoint { host: "node-b".to_string(), port: 7001 },
+            RedisNodeEndpoint { host: "node-c".to_string(), port: 7002 },
+        ];
+        let mut connections = HashMap::from([
+            (
+                masters[0].clone(),
+                TrackedRedisConnection::new(
+                    vec![RedisRawValue::Int(100), RedisRawValue::Int(0)],
+                    Arc::new(StdMutex::new(Vec::new())),
+                ),
+            ),
+            (
+                masters[1].clone(),
+                TrackedRedisConnection::new(
+                    vec![RedisRawValue::Int(200), RedisRawValue::Int(0)],
+                    Arc::new(StdMutex::new(Vec::new())),
+                ),
+            ),
+            (
+                masters[2].clone(),
+                TrackedRedisConnection::new(
+                    vec![
+                        RedisRawValue::Int(1),
+                        RedisRawValue::Int(1),
+                        RedisRawValue::SimpleString("string".to_string()),
+                        RedisRawValue::Int(-1),
+                    ],
+                    Arc::new(StdMutex::new(Vec::new())),
+                ),
+            ),
+        ]);
+        let discovered_masters = masters.clone();
+
+        let result = super::scan_cluster_keys_batch_with(
+            &sessions,
+            move || ready(Ok(discovered_masters.clone())),
+            move |endpoint| {
+                ready(connections.remove(&endpoint).ok_or_else(|| format!("unexpected reconnect to {}", endpoint.host)))
+            },
+            0,
+            "migration:user:1:status",
+            100,
+            3,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.cursor, 0);
+        assert_eq!(result.total_keys, 301);
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_display, "migration:user:1:status");
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -1);
+        assert!(sessions.lock().await.entries.is_empty());
+    }
+
+    #[tokio::test]
     async fn cluster_key_batch_continuation_skips_dbsize_and_advances_masters() {
         let pattern = "membership:saas:base:token:*";
         let masters = vec![
@@ -3381,8 +5012,9 @@ mod tests {
             RedisNodeEndpoint { host: "node-c".to_string(), port: 7002 },
         ];
         let mut saved_session = super::RedisClusterKeyScanSession::new(masters.clone(), pattern);
-        saved_session.node_index = 1;
-        saved_session.node_cursor = 7;
+        saved_session.node_complete[0] = true;
+        saved_session.node_cursors[1] = 7;
+        saved_session.next_node_index = 1;
         let mut saved_sessions = super::RedisClusterScanSessions::default();
         let cursor = saved_sessions.insert(None, saved_session);
         let sessions = tokio::sync::Mutex::new(saved_sessions);
@@ -3530,8 +5162,9 @@ mod tests {
             RedisNodeEndpoint { host: "node-c".to_string(), port: 7002 },
         ];
         let mut saved_session = super::RedisClusterKeyScanSession::new(masters.clone(), pattern);
-        saved_session.node_index = 1;
-        saved_session.node_cursor = 7;
+        saved_session.node_complete[0] = true;
+        saved_session.node_cursors[1] = 7;
+        saved_session.next_node_index = 1;
         let mut saved_sessions = super::RedisClusterScanSessions::default();
         let cursor = saved_sessions.insert(None, saved_session);
         let sessions = tokio::sync::Mutex::new(saved_sessions);
@@ -3564,8 +5197,8 @@ mod tests {
         assert_eq!(tracked_command_count(&commands, "DBSIZE"), 0);
         assert_eq!(tracked_command_count(&commands, "SCAN"), 1);
         let continued = sessions.lock().await.take(cursor).unwrap();
-        assert_eq!(continued.master_nodes[continued.node_index], masters[1]);
-        assert_eq!(continued.node_cursor, 9);
+        assert_eq!(continued.node_cursors[1], 9);
+        assert_eq!(continued.next_node_index, 2);
     }
 
     #[tokio::test]
@@ -3577,8 +5210,9 @@ mod tests {
             RedisNodeEndpoint { host: "node-c".to_string(), port: 7002 },
         ];
         let mut saved_session = super::RedisClusterKeyScanSession::new(masters.clone(), pattern);
-        saved_session.node_index = 1;
-        saved_session.node_cursor = 7;
+        saved_session.node_complete[0] = true;
+        saved_session.node_cursors[1] = 7;
+        saved_session.next_node_index = 1;
         let mut saved_sessions = super::RedisClusterScanSessions::default();
         let cursor = saved_sessions.insert(None, saved_session);
         let sessions = tokio::sync::Mutex::new(saved_sessions);
@@ -3617,8 +5251,8 @@ mod tests {
 
         assert_eq!(error, "temporary node failure");
         let restored = sessions.lock().await.entries.get(&cursor).unwrap().clone();
-        assert_eq!(restored.master_nodes[restored.node_index], masters[1]);
-        assert_eq!(restored.node_cursor, 7);
+        assert_eq!(restored.node_cursors[1], 7);
+        assert_eq!(restored.next_node_index, 1);
 
         let retry_connected_nodes = connected_nodes.clone();
         let retry_commands = commands.clone();
@@ -3653,8 +5287,8 @@ mod tests {
         assert!(commands.lock().unwrap()[1].contains("\r\n7\r\n"));
         assert_eq!(*connected_nodes.lock().unwrap(), vec![masters[1].clone(), masters[2].clone(), masters[1].clone()]);
         let continued = sessions.lock().await.take(cursor).unwrap();
-        assert_eq!(continued.master_nodes[continued.node_index], masters[1]);
-        assert_eq!(continued.node_cursor, 9);
+        assert_eq!(continued.node_cursors[1], 9);
+        assert_eq!(continued.next_node_index, 2);
     }
 
     #[tokio::test]
@@ -3761,13 +5395,14 @@ mod tests {
             hscan_response("0", vec![("user:2", "Bob")]),
         ]);
 
-        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 1, Some("user")).await.unwrap();
+        let result =
+            super::load_more_collection(&mut con, b"hash-key", "hash", 0, 1, Some("user"), None).await.unwrap();
 
         let RedisCollectionPage::Hash { items, scan_cursor } = result else {
             panic!("expected hash collection page");
         };
         assert_eq!(scan_cursor, Some(512));
-        assert_eq!(items, vec![RedisHashItem { field: text_blob("user:1"), value: text_blob("Ada") }]);
+        assert_eq!(items, vec![RedisHashItem { field: text_blob("user:1"), value: text_blob("Ada"), field_ttl: None }]);
         assert_eq!(con.command_count("HSCAN"), 1);
         assert!(!con.commands[0].contains("\r\nMATCH\r\n"));
     }
@@ -3777,15 +5412,203 @@ mod tests {
         let mut con =
             FakeRedisConnection::new(vec![hscan_response("0", vec![("status", "Ada Lovelace"), ("name", "Bob")])]);
 
-        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("lovelace")).await.unwrap();
+        let result =
+            super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("lovelace"), None).await.unwrap();
 
         let RedisCollectionPage::Hash { items, scan_cursor } = result else {
             panic!("expected hash collection page");
         };
         assert_eq!(scan_cursor, None);
-        assert_eq!(items, vec![RedisHashItem { field: text_blob("status"), value: text_blob("Ada Lovelace") }]);
+        assert_eq!(
+            items,
+            vec![RedisHashItem { field: text_blob("status"), value: text_blob("Ada Lovelace"), field_ttl: None }]
+        );
         assert_eq!(con.command_count("HSCAN"), 1);
         assert!(!con.commands[0].contains("\r\nMATCH\r\n"));
+    }
+
+    #[tokio::test]
+    async fn hash_load_more_attaches_field_ttl_when_supported() {
+        let mut con = FakeRedisConnection::new(vec![
+            hscan_response("0", vec![("session", "Ada")]),
+            RedisRawValue::Array(vec![RedisRawValue::Int(42)]),
+        ]);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, None, None).await.unwrap();
+
+        let RedisCollectionPage::Hash { items, scan_cursor } = result else {
+            panic!("expected hash collection page");
+        };
+        assert_eq!(scan_cursor, None);
+        assert_eq!(items[0].field_ttl, Some(42));
+        assert_eq!(con.command_count("HTTL"), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_load_more_keeps_persistent_field_ttl() {
+        let mut con = FakeRedisConnection::new(vec![
+            hscan_response("0", vec![("session", "Ada")]),
+            RedisRawValue::Array(vec![RedisRawValue::Int(-1)]),
+        ]);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, None, None).await.unwrap();
+
+        let RedisCollectionPage::Hash { items, .. } = result else {
+            panic!("expected hash collection page");
+        };
+        assert_eq!(items[0].field_ttl, Some(-1));
+    }
+
+    #[tokio::test]
+    async fn hash_load_more_degrades_when_field_ttl_is_unsupported() {
+        let unsupported = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'HTTL'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(hscan_response("0", vec![("session", "Ada")])),
+            Err(unsupported),
+        ]);
+
+        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, None, None).await.unwrap();
+
+        let RedisCollectionPage::Hash { items, .. } = result else {
+            panic!("expected hash collection page");
+        };
+        assert_eq!(items[0].field_ttl, None);
+    }
+
+    #[tokio::test]
+    async fn hash_set_preserves_existing_field_ttl() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Array(vec![RedisRawValue::Int(42)]),
+            RedisRawValue::Okay,
+            RedisRawValue::Array(vec![RedisRawValue::Int(1)]),
+        ]);
+
+        super::hash_set(&mut con, b"hash-key", "session", "Grace", None).await.unwrap();
+
+        assert_eq!(con.command_count("HTTL"), 1);
+        assert_eq!(con.command_count("HSET"), 1);
+        assert_eq!(con.command_count("HEXPIRE"), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_uses_one_atomic_script_and_carries_field_ttl() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(2)]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap();
+
+        assert_eq!(con.command_count("EVAL"), 1);
+        // HSET/HDEL/HTTL/HEXPIRE are script body text, not independent
+        // requests.  This guards the atomic path and its TTL handling.
+        assert_eq!(con.command_count("HSET"), 0);
+        assert_eq!(con.command_count("HDEL"), 0);
+        assert!(con.commands[0].contains("redis.call('HEXISTS'"));
+        assert!(con.commands[0].contains("redis.pcall('HTTL'"));
+        assert!(con.commands[0].contains("redis.pcall('HEXPIRE'"));
+        assert!(con.commands[0].contains("redis.pcall('HDEL'"));
+        assert!(con.commands[0].contains("local delete_probe"));
+        assert!(con.commands[0].contains("if source_ttl == 0 then"));
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_rejects_destination_collisions_without_follow_up_commands() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(-1)]);
+
+        let error = super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap_err();
+
+        assert!(error.contains("new name already exists"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_reports_a_missing_source_field() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        let error = super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap_err();
+
+        assert!(error.contains("no longer exists"));
+        assert_eq!(con.command_count("EVAL"), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_supports_value_only_edits_without_renaming() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "session", "Grace").await.unwrap();
+
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert!(con.commands[0].contains("if old_field == new_field then"));
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_keeps_failures_inside_the_atomic_operation() {
+        let failure = redis::make_extension_error("ERR".to_string(), Some("script command failed".to_string()));
+        let mut con = FakeRedisConnection::with_results(vec![Err(failure)]);
+
+        let error = super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap_err();
+
+        assert!(error.contains("script command failed"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.command_count("HSET"), 0);
+        assert_eq!(con.command_count("HDEL"), 0);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_reports_restricted_eval_access_without_fallback() {
+        let mut con = FakeRedisConnection::with_results(vec![Err(noperm("eval"))]);
+
+        let error = super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap_err();
+
+        assert!(error.contains("EVAL and hash command permissions"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_does_not_restore_a_source_that_disappeared_before_hdel() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(2)]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap();
+
+        let script = &con.commands[0];
+        let delete_branch = script.find("if tonumber(deleted) ~= 1 then").expect("HDEL result branch");
+        let branch = &script[delete_branch..];
+        assert!(branch.contains("redis.pcall('HDEL', key, new_field)"));
+        assert!(branch.contains("return 0"));
+        assert!(!branch.contains("restore_source()"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_hash_field_updates_use_serialized_evals_and_reject_the_loser() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(2), RedisRawValue::Int(0)]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap();
+        let error = super::hash_field_update(&mut con, b"hash-key", "session", "profile", "Grace").await.unwrap_err();
+
+        assert!(error.contains("no longer exists"));
+        assert_eq!(con.command_count("EVAL"), 2);
+        assert_eq!(con.commands.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hash_field_expiry_commands_accept_expected_results() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Array(vec![RedisRawValue::Int(1)]),
+            RedisRawValue::Array(vec![RedisRawValue::Int(-1)]),
+            RedisRawValue::Array(vec![RedisRawValue::Int(1)]),
+        ]);
+
+        super::set_hash_field_ttl(&mut con, b"hash-key", "session", 60).await.unwrap();
+        super::set_hash_field_ttl(&mut con, b"hash-key", "session", -1).await.unwrap();
+        super::set_hash_field_expire_at(&mut con, b"hash-key", "session", 1_735_689_600).await.unwrap();
+
+        assert_eq!(con.command_count("HEXPIRE"), 1);
+        assert_eq!(con.command_count("HPERSIST"), 1);
+        assert_eq!(con.command_count("HEXPIREAT"), 1);
     }
 
     #[tokio::test]
@@ -3795,7 +5618,8 @@ mod tests {
             .collect();
         let mut con = FakeRedisConnection::new(responses);
 
-        let result = super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("missing")).await.unwrap();
+        let result =
+            super::load_more_collection(&mut con, b"hash-key", "hash", 0, 20, Some("missing"), None).await.unwrap();
 
         let RedisCollectionPage::Hash { items, scan_cursor } = result else {
             panic!("expected hash collection page");
@@ -3803,6 +5627,127 @@ mod tests {
         assert_eq!(scan_cursor, Some(super::HASH_FILTER_SCAN_MAX_ITERATIONS as u64));
         assert!(items.is_empty());
         assert_eq!(con.command_count("HSCAN"), super::HASH_FILTER_SCAN_MAX_ITERATIONS);
+    }
+
+    #[tokio::test]
+    async fn zset_update_passes_expected_score_to_the_atomic_script() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        let used_acl_compatibility =
+            super::zset_update(&mut con, b"scores", "alice", "10", "alice", "20").await.unwrap();
+
+        assert!(!used_acl_compatibility);
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.command_count("ZADD"), 0);
+        assert!(con.commands[0].contains("\r\n$2\r\n10\r\n"));
+        assert!(con.commands[0].contains("\r\n$2\r\n20\r\n"));
+    }
+
+    #[tokio::test]
+    async fn zset_update_rejects_a_second_writer_with_a_stale_score() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(-2)]);
+
+        let error = super::zset_update(&mut con, b"scores", "alice", "10", "alice", "30").await.unwrap_err();
+
+        assert!(error.contains("score changed"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zset_update_rejects_a_second_writer_renaming_a_member_with_a_stale_score() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(-2)]);
+
+        let error = super::zset_update(&mut con, b"scores", "alice", "10", "alicia", "20").await.unwrap_err();
+
+        assert!(error.contains("score changed"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.command_count("ZADD"), 0);
+        assert_eq!(con.command_count("ZREM"), 0);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zset_update_rejects_restricted_acl_score_edits_without_writing() {
+        let mut con = FakeRedisConnection::with_results(vec![Err(noperm("eval"))]);
+
+        let error = super::zset_update(&mut con, b"scores", "alice", "10", "alice", "20").await.unwrap_err();
+
+        assert!(error.contains("EVAL and ZSCORE permissions"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.command_count("ZADD"), 0);
+        assert_eq!(con.command_count("ZREM"), 0);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zset_update_rejects_restricted_acl_renames_without_writing() {
+        let mut con = FakeRedisConnection::with_results(vec![Err(noperm("zscore"))]);
+
+        let error = super::zset_update(&mut con, b"scores", "alice", "10", "alicia", "20").await.unwrap_err();
+
+        assert!(error.contains("EVAL and ZSCORE permissions"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.command_count("ZADD"), 0);
+        assert_eq!(con.command_count("ZREM"), 0);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zset_update_does_not_fallback_for_unrelated_acl_errors() {
+        let mut con = FakeRedisConnection::with_results(vec![Err(noperm("zrem"))]);
+
+        let error = super::zset_update(&mut con, b"scores", "alice", "10", "alicia", "20").await.unwrap_err();
+
+        assert!(error.contains("NOPERM"));
+        assert_eq!(con.command_count("EVAL"), 1);
+        assert_eq!(con.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn zset_load_more_uses_ranked_ascending_pages() {
+        let mut con =
+            FakeRedisConnection::new(vec![zrange_response(vec![("alice", "1"), ("bob", "2"), ("carol", "3")])]);
+
+        let result = super::load_more_collection(&mut con, b"scores", "zset", 0, 2, None, Some("asc")).await.unwrap();
+
+        let RedisCollectionPage::Zset { items, scan_cursor } = result else {
+            panic!("expected zset collection page");
+        };
+        assert_eq!(
+            items,
+            vec![
+                RedisZsetItem { score: "1".to_string(), member: text_blob("alice") },
+                RedisZsetItem { score: "2".to_string(), member: text_blob("bob") },
+            ]
+        );
+        assert_eq!(scan_cursor, Some(2));
+        assert_eq!(con.command_count("ZRANGE"), 1);
+        assert_eq!(con.command_count("ZREVRANGE"), 0);
+        assert_eq!(con.command_count("ZSCAN"), 0);
+    }
+
+    #[tokio::test]
+    async fn zset_load_more_uses_ranked_descending_pages() {
+        let mut con =
+            FakeRedisConnection::new(vec![zrange_response(vec![("carol", "3"), ("bob", "2"), ("alice", "1")])]);
+
+        let result = super::load_more_collection(&mut con, b"scores", "zset", 0, 2, None, Some("desc")).await.unwrap();
+
+        let RedisCollectionPage::Zset { items, scan_cursor } = result else {
+            panic!("expected zset collection page");
+        };
+        assert_eq!(
+            items,
+            vec![
+                RedisZsetItem { score: "3".to_string(), member: text_blob("carol") },
+                RedisZsetItem { score: "2".to_string(), member: text_blob("bob") },
+            ]
+        );
+        assert_eq!(scan_cursor, Some(2));
+        assert_eq!(con.command_count("ZRANGE"), 0);
+        assert_eq!(con.command_count("ZREVRANGE"), 1);
+        assert_eq!(con.command_count("ZSCAN"), 0);
     }
 
     #[test]
@@ -3829,6 +5774,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_empty_quoted_arguments() {
+        let argv = parse_command_argv(r#"SET "" """#).unwrap();
+
+        assert_eq!(argv, vec!["SET", "", ""]);
+    }
+
+    #[test]
     fn parses_quoted_and_escaped_command_names_before_classification() {
         for command_text in [r#""JSON.SET" user:1 $ {}"#, r#"JSON\.SET user:1 $ {}"#] {
             let argv = parse_command_argv(command_text).unwrap();
@@ -3838,7 +5790,9 @@ mod tests {
 
     #[test]
     fn rejects_empty_command_text() {
-        assert_eq!(parse_command_argv("   ").unwrap_err(), "Redis command is empty");
+        for command_text in ["   ", "\"\""] {
+            assert_eq!(parse_command_argv(command_text).unwrap_err(), "Redis command is empty");
+        }
     }
 
     #[tokio::test]
@@ -3924,13 +5878,47 @@ mod tests {
         assert_eq!(classify_command("GETEX"), RedisCommandSafety::Write);
         assert_eq!(classify_command("XREADGROUP"), RedisCommandSafety::Write);
         assert_eq!(classify_command("del"), RedisCommandSafety::Confirm);
-        assert_eq!(classify_command("flushdb"), RedisCommandSafety::Blocked);
+        assert_eq!(classify_command("flushdb"), RedisCommandSafety::Confirm);
+        assert_eq!(classify_command("JSON.DEL"), RedisCommandSafety::Confirm);
+        assert_eq!(classify_command("JSON.FORGET"), RedisCommandSafety::Confirm);
+        assert_eq!(classify_command("JSON.CLEAR"), RedisCommandSafety::Confirm);
         assert_eq!(classify_command("KEYS"), RedisCommandSafety::Blocked);
         assert_eq!(classify_command("flushall"), RedisCommandSafety::Blocked);
         assert_eq!(classify_command("eval"), RedisCommandSafety::Blocked);
         assert_eq!(classify_command("FCALL"), RedisCommandSafety::Blocked);
         assert_eq!(classify_command("XGROUP"), RedisCommandSafety::Blocked);
         assert_eq!(classify_command("VENDOR.WRITE"), RedisCommandSafety::Blocked);
+    }
+
+    // Regression for review feedback: an unknown command (e.g. FCALL) inside a
+    // multi-statement batch must still raise the batch to Blocked regardless
+    // of its position, so "DEL victim\nFCALL wipe 0" cannot execute the
+    // destructive command after the frontend scan would otherwise have
+    // stopped the run.
+    #[test]
+    fn classify_command_batch_blocks_on_any_unknown_member() {
+        for batch in [
+            // destructive first, unknown second
+            ["DEL victim", "FCALL wipe 0"],
+            // unknown first, destructive second
+            ["FCALL wipe 0", "DEL victim"],
+        ] {
+            let mut highest = RedisCommandSafety::Allowed;
+            for cmd in batch.iter() {
+                let safety = classify_command(cmd);
+                if matches!(safety, RedisCommandSafety::Blocked) {
+                    highest = safety;
+                    break;
+                }
+                if matches!(safety, RedisCommandSafety::Confirm) && !matches!(highest, RedisCommandSafety::Blocked) {
+                    highest = safety;
+                }
+            }
+            assert!(
+                matches!(highest, RedisCommandSafety::Blocked),
+                "batch {batch:?} must be Blocked because it contains FCALL, got {highest:?}"
+            );
+        }
     }
 
     #[test]
@@ -4075,8 +6063,10 @@ mod tests {
 
     fn redis_test_connection_config() -> ConnectionConfig {
         ConnectionConfig {
+            docs_notes_path: None,
             id: "redis".to_string(),
             name: "Redis".to_string(),
+            note: String::new(),
             db_type: crate::models::connection::DatabaseType::Redis,
             driver_profile: None,
             driver_label: None,
@@ -4087,8 +6077,11 @@ mod tests {
             username: String::new(),
             password: String::new(),
             database: None,
+            default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -4113,6 +6106,8 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -4120,6 +6115,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],

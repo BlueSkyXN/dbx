@@ -4,11 +4,29 @@ import { supportsDriverManagement } from "@/lib/database/databaseCapabilities";
 export interface AgentDriverInstallState {
   db_type: string;
   installed: boolean;
+  installed_version?: string | null;
   update_available?: boolean;
 }
 
+/** Returns whether a locally installed native Agent meets a required release. */
+export function hasInstalledAgentVersion(drivers: readonly AgentDriverInstallState[], driverKey: string, minimumVersion: string): boolean {
+  const installedVersion = drivers.find((driver) => driver.db_type === driverKey && driver.installed)?.installed_version;
+  if (!installedVersion) return false;
+
+  const parse = (version: string): number[] | null => {
+    const match = version.trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+    return match ? match.slice(1).map(Number) : null;
+  };
+  const installed = parse(installedVersion);
+  const minimum = parse(minimumVersion);
+  if (!installed || !minimum) return false;
+  return installed[0] > minimum[0] || (installed[0] === minimum[0] && (installed[1] > minimum[1] || (installed[1] === minimum[1] && installed[2] >= minimum[2])));
+}
+
 export function agentDriverInstallKey(dbType: DatabaseType | undefined, driverProfile?: string): string | undefined {
+  if (dbType === "kyuubi" || dbType === "impala") return "hive";
   if (dbType === "oracle") return "oracle";
+  if (dbType === "h2") return "h2";
   if (dbType === "mongodb") return "mongodb";
   if (dbType === "dameng") return "dameng";
   if (dbType === "gbase") return driverProfile === "gbase8s" ? "gbase8s" : "gbase8a";
@@ -21,15 +39,22 @@ export function agentDriverInstallKey(dbType: DatabaseType | undefined, driverPr
   return driverProfile && driverProfile !== dbType ? driverProfile : dbType;
 }
 
+function usesManagedAgentDriver(dbType: DatabaseType | undefined, driverProfile?: string): boolean {
+  if (supportsDriverManagement(dbType)) return true;
+  if (dbType !== "mongodb") return false;
+  const profile = driverProfile?.trim().toLowerCase();
+  return profile === "mongodb-legacy" || profile === "mongodb_legacy" || profile === "legacy";
+}
+
 export function showAgentDriverInstallHint(dbType: DatabaseType | undefined, drivers: readonly AgentDriverInstallState[], driverProfile?: string): boolean {
-  if (!supportsDriverManagement(dbType)) return false;
+  if (!usesManagedAgentDriver(dbType, driverProfile)) return false;
   const driverKey = agentDriverInstallKey(dbType, driverProfile);
   if (!driverKey) return false;
   return drivers.find((driver) => driver.db_type === driverKey)?.installed !== true;
 }
 
 export function hasAgentDriverUpdate(dbType: DatabaseType | undefined, drivers: readonly AgentDriverInstallState[], driverProfile?: string): boolean {
-  if (!supportsDriverManagement(dbType)) return false;
+  if (!usesManagedAgentDriver(dbType, driverProfile)) return false;
   const driverKey = agentDriverInstallKey(dbType, driverProfile);
   return drivers.find((driver) => driver.db_type === driverKey)?.update_available === true;
 }

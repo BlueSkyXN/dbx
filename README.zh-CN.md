@@ -1,13 +1,12 @@
 <div align="center">
-  <p style="font-size: 18px; white-space: nowrap;"><strong>20 MB 驾驭 70+ 种数据库。桌面端、Docker、CLI、内置 AI 助手与 MCP Server。</strong></p>
+  <p style="font-size: 18px; white-space: nowrap;"><strong>20 MB 驾驭 90+ 种数据库。桌面端、Docker、CLI、内置 AI 助手与 MCP Server。</strong></p>
 
   <p>
-    <img src="https://dl.dbxio.com/assets/readme-hero-20260707.png" alt="DBX 截图" width="820" />
+    <img src="https://dl.dbxio.com/assets/readme-hero-20260820.png" alt="DBX 截图" width="820" />
   </p>
 
   <p>
-    <a href="https://github.com/t8y2/dbx/releases"><img src="https://img.shields.io/github/downloads/t8y2/dbx/total?style=for-the-badge&color=blue" /></a>
-    <a href="https://github.com/t8y2/dbx/graphs/contributors"><img src="https://img.shields.io/github/contributors/t8y2/dbx?style=for-the-badge" /></a>
+    <a href="https://github.com/t8y2/dbx/releases"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fshieldcn.dev%2Fgithub%2Fdownloads%2Ft8y2%2Fdbx%2Fshields.json&amp;style=for-the-badge" /></a>
     <a href="https://qm.qq.com/cgi-bin/qm/qr?k=&group_code=1087880322"><img src="https://img.shields.io/badge/QQ_群-1087880322-EB1923?style=for-the-badge&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGhlaWdodD0iODYiIHdpZHRoPSI4NiIgdmlld0JveD0iMCAwIDEyMCAxNDUiPjxwYXRoIGZpbGw9IiNmYWFiMDciIGQ9Ik02MC41MDMgMTQyLjIzN2MtMTIuNTMzIDAtMjQuMDM4LTQuMTk1LTMxLjQ0NS0xMC40Ni0zLjc2MiAxLjEyNC04LjU3NCAyLjkzMi0xMS42MSA1LjE3NS0yLjYgMS45MTgtMi4yNzUgMy44NzQtMS44MDcgNC42NjMgMi4wNTYgMy40NyAzNS4yNzMgMi4yMTYgNDQuODYyIDEuMTM2em0wIDBjMTIuNTM1IDAgMjQuMDM5LTQuMTk1IDMxLjQ0Ny0xMC40NiAzLjc2IDEuMTI0IDguNTczIDIuOTMyIDExLjYxIDUuMTc1IDIuNTk4IDEuOTE4IDIuMjc0IDMuODc0IDEuODA1IDQuNjYzLTIuMDU2IDMuNDctMzUuMjcyIDIuMjE2LTQ0Ljg2MiAxLjEzNnptMCAwIi8+PHBhdGggZD0iTTYwLjU3NiA2Ny4xMTljMjAuNjk4LS4xNCAzNy4yODYtNC4xNDcgNDIuOTA3LTUuNjgzIDEuMzQtLjM2NyAyLjA1Ni0xLjAyNCAyLjA1Ni0xLjAyNC4wMDUtLjE4OS4wODUtMy4zNy4wODUtNS4wMUMxMDUuNjI0IDI3Ljc2OCA5Mi41OC4wMDEgNjAuNSAwIDI4LjQyLjAwMSAxNS4zNzUgMjcuNzY5IDE1LjM3NSA1NS40MDFjMCAxLjY0Mi4wOCA0LjgyMi4wODYgNS4wMSAwIDAgLjU4My42MTUgMS42NS45MTMgNS4xOSAxLjQ0NCAyMi4wOSA1LjY1IDQzLjMxMiA1Ljc5NXptNTYuMjQ1IDIzLjAyYy0xLjI4My00LjEyOS0zLjAzNC04Ljk0NC00LjgwOC0xMy41NjggMCAwLTEuMDItLjEyNi0xLjUzNy4wMjMtMTUuOTEzIDQuNjIzLTM1LjIwMiA3LjU3LTQ5LjkgNy4zOTJoLS4xNTNjLTE0LjYxNi4xNzUtMzMuNzc0LTIuNzM3LTQ5LjYzNC03LjMxNS0uNjA2LS4xNzUtMS44MDItLjEtMS44MDItLjEtMS43NzQgNC42MjQtMy41MjUgOS40NC00LjgwOCAxMy41NjgtNi4xMTkgMTkuNjktNC4xMzYgMjcuODM4LTIuNjI3IDI4LjAyIDMuMjM5LjM5MiAxMi42MDYtMTQuODIxIDEyLjYwNi0xNC44MjEgMCAxNS40NTkgMTMuOTU3IDM5LjE5NSA0NS45MTggMzkuNDEzaC44NDhjMzEuOTYtLjIxOCA0NS45MTctMjMuOTU0IDQ0LjkxNy0zOS40MTMgMCAwIDkuMzY4IDE1LjIxMyAxMi42MDcgMTQuODIyIDEuNTA4LS4xODMgMy40OTEtOC4zMzItMi42MjctMjguMDIxIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTQ5LjA4NSA0MC44MjRjLTQuMzUyLjE5Ny04LjA3LTQuNzYtOC4zMDQtMTEuMDYzLS4yMzYtNi4zMDUgMy4wOTgtMTEuNTc2IDcuNDUtMTEuNzczIDQuMzQ3LS4xOTUgOC4wNjQgNC43NiA4LjMgMTEuMDY1LjIzOCA2LjMwNi0zLjA5NyAxMS41NzctNy40NDYgMTEuNzcxbTMxLjEzMy0xMS4wNjNjLS4yMzMgNi4zMDItMy45NTEgMTEuMjYtOC4zMDMgMTEuMDYzLTQuMzUtLjE5NS03LjY4NC01LjQ2NS03LjQ0Ni0xMS43Ny4yMzYtNi4zMDUgMy45NTItMTEuMjYgOC4zLTExLjA2NiA0LjM1Mi4xOTcgNy42ODYgNS40NjggNy40NDkgMTEuNzczIi8+PHBhdGggZmlsbD0iI2ZhYWIwNyIgZD0iTTg3Ljk1MiA0OS43MjVDODYuNzkgNDcuMTUgNzUuMDc3IDQ0LjI4IDYwLjU3OCA0NC4yOGgtLjE1NmMtMTQuNSAwLTI2LjIxMiAyLjg3LTI3LjM3NSA1LjQ0NmEuODYzLjg2MyAwIDAwLS4wODUuMzY3Ljg4Ljg4IDAgMDAuMTYuNDk2Yy45OCAxLjQyNyAxMy45ODUgOC40ODcgMjcuMyA4LjQ4N2guMTU2YzEzLjMxNCAwIDI2LjMxOS03LjA1OCAyNy4yOTktOC40ODdhLjg3My44NzMgMCAwMC4xNi0uNDk4Ljg1Ni44NTYgMCAwMC0uMDg1LS4zNjUiLz48cGF0aCBkPSJNNTQuNDM0IDI5Ljg1NGMuMTk5IDIuNDktMS4xNjcgNC43MDItMy4wNDYgNC45NDMtMS44ODMuMjQyLTMuNTY4LTEuNTgtMy43NjgtNC4wNy0uMTk3LTIuNDkyIDEuMTY3LTQuNzA0IDMuMDQzLTQuOTQ0IDEuODg2LS4yNDQgMy41NzQgMS41OCAzLjc3MSA0LjA3bTExLjk1Ni44MzNjLjM4NS0uNjg5IDMuMDA0LTQuMzEyIDguNDI3LTIuOTkzIDEuNDI1LjM0NyAyLjA4NC44NTcgMi4yMjMgMS4wNTcuMjA1LjI5Ni4yNjIuNzE4LjA1MyAxLjI4Ni0uNDEyIDEuMTI2LTEuMjYzIDEuMDk1LTEuNzM0Ljg3NS0uMzA1LS4xNDItNC4wODItMi42Ni03LjU2MiAxLjA5Ny0uMjQuMjU3LS42NjguMzQ2LTEuMDczLjA0LS40MDctLjMwOC0uNTc0LS45My0uMzM0LTEuMzYyIi8+PHBhdGggZmlsbD0iI2ZmZiIgZD0iTTYwLjU3NiA4My4wOGgtLjE1M2MtOS45OTYuMTItMjIuMTE2LTEuMjA0LTMzLjg1NC0zLjUxOC0xLjAwNCA1LjgxOC0xLjYxIDEzLjEzMi0xLjA5IDIxLjg1MyAxLjMxNiAyMi4wNDMgMTQuNDA3IDM1LjkgMzQuNjE0IDM2LjFoLjgyYzIwLjIwOC0uMiAzMy4yOTgtMTQuMDU3IDM0LjYxNi0zNi4xLjUyLTguNzIzLS4wODctMTYuMDM1LTEuMDkyLTIxLjg1NC0xMS43MzkgMi4zMTUtMjMuODYyIDMuNjQtMzMuODYgMy41MTgiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMzIuMTAyIDgxLjIzNXYyMS42OTNzOS45MzcgMi4wMDQgMTkuODkzLjYxNlY4My41MzVjLTYuMzA3LS4zNTctMTMuMTA5LTEuMTUyLTE5Ljg5My0yLjMiLz48cGF0aCBmaWxsPSIjZWIxOTIzIiBkPSJNMTA1LjUzOSA2MC40MTJzLTE5LjMzIDYuMTAyLTQ0Ljk2MyA2LjI3NWgtLjE1M2MtMjUuNTkxLS4xNzItNDQuODk2LTYuMjU1LTQ0Ljk2Mi02LjI3NUw4Ljk4NyA3Ni41N2MxNi4xOTMgNC44ODIgMzYuMjYxIDguMDI4IDUxLjQzNiA3Ljg0NWguMTUzYzE1LjE3NS4xODMgMzUuMjQyLTIuOTYzIDUxLjQzNy03Ljg0NXptMCAwIi8+PC9zdmc+" alt="加入 QQ 群" /></a>
     <a href="https://docs.qq.com/doc/DVVhMY0h1ekJqc0tz" target="_blank"><img src="https://img.shields.io/badge/微信交流群-点击加入-07C160?style=for-the-badge&logo=wechat&logoColor=white" alt="加入微信交流群" /></a>
     <a href="https://discord.gg/W7NyVDRt6a"><img src="https://dcbadge.limes.pink/api/server/W7NyVDRt6a" alt="加入 Discord" /></a>
@@ -28,28 +27,27 @@
     <img src="https://img.shields.io/badge/SQL%20Server-CC2927?logo=microsoftsqlserver&logoColor=white" />
     <img src="https://img.shields.io/badge/Oracle-F80000?logo=oracle&logoColor=white" />
     <img src="https://img.shields.io/badge/Elasticsearch-005571?logo=elasticsearch&logoColor=white" />
+    <img src="https://img.shields.io/badge/Meilisearch-FF5CAA?logo=meilisearch&logoColor=white" />
     <img src="https://img.shields.io/badge/MariaDB-003545?logo=mariadb&logoColor=white" />
     <img src="https://img.shields.io/badge/TiDB-DC150B?logo=tidb&logoColor=white" />
     <img src="https://img.shields.io/badge/Doris-0052CC?logoColor=white" />
     <img src="https://img.shields.io/badge/SelectDB-22C1C3?logoColor=white" />
     <img src="https://img.shields.io/badge/StarRocks-5C2D91?logoColor=white" />
     <img src="https://img.shields.io/badge/Redshift-8C4FFF?logo=amazonredshift&logoColor=white" />
+    <img src="https://img.shields.io/badge/Cloud%20Spanner-4285F4?logo=googlecloudspanner&logoColor=white" />
     <img src="https://img.shields.io/badge/DM-3857FF?logoColor=white" />
     <img src="https://img.shields.io/badge/OceanBase-006AFF?logoColor=white" />
     <img src="https://img.shields.io/badge/openGauss-2B7BD9?logoColor=white" />
     <img src="https://img.shields.io/badge/GaussDB-E60012?logoColor=white" />
     <img src="https://img.shields.io/badge/KWDB-1c60e0?logoColor=white" />
-    <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
+    <img src="https://img.shields.io/badge/KingbaseES-003B8E?logoColor=white" />
     <img src="https://img.shields.io/badge/TDengine-2F6FFF?logoColor=white" />
     <img src="https://img.shields.io/badge/CockroachDB-6933FF?logoColor=white" />
     <img src="https://img.shields.io/badge/InfluxDB-d30971?logo=influxdb&logoColor=white" />
     <img src="https://img.shields.io/badge/JDBC-4B5563?logoColor=white" />
-    <img src="https://img.shields.io/badge/CSV-217346?logoColor=white" />
-    <img src="https://img.shields.io/badge/XLSX-217346?logo=microsoftexcel&logoColor=white" />
-    <img src="https://img.shields.io/badge/Feishu%20Sheets-2B6DE5?logoColor=white" />
-    <img src="https://img.shields.io/badge/Feishu%20Bitable-00A870?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
     <a href="https://cnb.cool/dbxio.com/dbx"><img src="https://img.shields.io/badge/CNB-dbx-F76945?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAppJREFUOE9tk01rE1EUhs+5H5lJ0iQT3FRX2Yi4avoLkv4CWxBcNt11oZiuFKGmXQhFN6kuRESSgitXKf6A5g+I6cqFLiKCiptOkraZ5H4cuZOkH9oLw+UO8z7nvGfei3DFohoEQLAKCGWyGJCSbQZsD3ei7r+f45WATV6xmjdISyAlYLaDliveux+ti5ozwLAaFPhIlk6G6f18sxuO7l9bBiWbVoncDGCMWMl++PI/gJ7IohkmD0zkBxT5oRn5LTpN7ULqBByEtFywWvRyHz8Fx3dvN0UwuMPyR0uJFycddH7tKPHZRn7BjnwwkQcUud0HO/K7oOENcTYPRCEAFERmsCpyfZDZfpdnBosOUKGx13BC60QTIdjpmSzrEWDR+UagjsgMciLXAwfhc4MNpKfQtOPE6mVh0gEOaeTXtWXXEdADpJAR/GaZ/rrM9Us82wORPd5zHbRp7JVcyxR5PRP5LTPy6uo0HXIlG9awMgLuEUABkBYI7VLyxs+yyPW3+Nyg4zqoG+UV7TDRlMBbWA/D43u3qlbLGmgRWM2BjFxjQjWQGQBuu4bYYvrm14JMnQSXcjBcny9A5DXIiDJp9/8FWCXAAOaFUEfILTgIcttOvf+2NJnLdI0fBFUyskZKBGTEJEAmBuzr9LCSUDwGQAwwgMzu+m9/VWOAeZSsk+YP48C4li/sRok1nlBd5PogBjgxNw70PfHyqBADyEVXicasZXCVpxYiLfO+HxVZDHCVYwvu2ebPT7fOLNAm65AWLnEAzvsEcOi9/lPU1aACXDfOLdhD9kxNszGdweQGYstqXgItJwDFNxKvwrp57G8h0zVwldHuA0IFt8El83yIs2FSDcpgxDJpUUTwK7gTduN3AK5iG7ehc/E2/gUPD3q3eY4awwAAAABJRU5ErkJggg==" alt="CNB" /></a>
+    <a href="https://mcptoplist.com/server/io.github.t8y2%2Fdbx"><img src="https://mcptoplist.com/badge/io.github.t8y2%2Fdbx.svg" alt="MCP Toplist" /></a>
   </p>
 	  <p>
     <a href="README.md">English</a> | 简体中文
@@ -64,6 +62,78 @@
     <a href="https://dl.dbxio.com/assets/screenshot-grid.png"><img src="https://dl.dbxio.com/assets/screenshot-grid.png" width="395" /></a>
   </p>
 </div>
+
+## 赞助商与合作伙伴
+
+<table>
+  <tr>
+    <td align="center" valign="middle" width="220">
+      <a href="https://www.rainyun.com/MTE5Mjc4Ng==_" target="_blank">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/public/sponsors/rainyun-dark.png" />
+          <img src="https://www.rainyun.com/img/logo.d193755d.png" alt="雨云" height="48" />
+        </picture>
+      </a>
+    </td>
+    <td>
+      雨云是面向开发者和站长的云服务提供商，提供云服务器、物理服务器、游戏云和配套基础设施服务。
+      <a href="https://www.rainyun.com/MTE5Mjc4Ng==_" target="_blank">访问雨云</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="220">
+      <a href="https://www.qiniu.com/" target="_blank">
+        <img src="https://www-static.qbox.me/_next/static/media/logo.0fc18feaa621d2068a7180631f742256.jpg" alt="七牛云" height="64" />
+      </a>
+    </td>
+    <td>
+      七牛云为 DBX 提供对象存储、CDN 等云基础设施资源支持。
+      <a href="https://www.qiniu.com/" target="_blank">访问七牛云</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="220">
+      <a href="https://easysearch.cn" target="_blank">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/public/sponsors/easysearch-dark.png" />
+          <img src="docs/public/sponsors/easysearch.png" alt="Easysearch" width="150" />
+        </picture>
+      </a>
+    </td>
+    <td>
+      Easysearch 是一款企业级分布式搜索引擎，兼容 ES API、融合全文检索、向量检索、地理空间位置检索、实时分析与 AI 能力，为企业提供统一的数据检索与智能分析基础设施。
+      <a href="https://easysearch.cn" target="_blank">访问 Easysearch</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="220">
+      <a href="https://www.atlascloud.ai/?ref=6YYXWA" target="_blank">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/public/sponsors/atlas-dark.svg" />
+          <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="150" />
+        </picture>
+      </a>
+    </td>
+    <td>
+      Atlas Cloud 为开发者提供统一的多模态 AI API，可通过一个接口访问聊天、图像、视频和音频等 400+ 模型。
+      <a href="https://www.atlascloud.ai/?ref=6YYXWA" target="_blank">访问 Atlas Cloud</a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="middle" width="220">
+      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="docs/public/sponsors/trustasia-dark.svg" />
+          <img src="docs/public/sponsors/trustasia.png" alt="TrustAsia" height="44" />
+        </picture>
+      </a>
+    </td>
+    <td>
+      由 TrustAsia 提供代码签名云签服务，实现 CICD 自动化构建可信软件。
+      <a href="https://www.trustasia.com/ssl/trustasia/code-signing" target="_blank">访问 TrustAsia</a>
+    </td>
+  </tr>
+</table>
 
 ## 为什么选择 DBX？
 
@@ -92,9 +162,9 @@
 
 ## 功能特性
 
-### 70+ 种数据库，一个工具搞定
+### 90+ 种数据库，一个工具搞定
 
-MySQL、PostgreSQL、SQLite、Cloudflare D1、Redis、MongoDB、DuckDB、ClickHouse、SQL Server、Oracle、Elasticsearch、MariaDB、TiDB、OceanBase、openGauss、GaussDB、KWDB、KingBase、Vastbase、GoldenDB、Doris、SelectDB、StarRocks、Manticore Search、Redshift、DM、TDengine、虚谷 XuguDB、CockroachDB、Access、HighGo 等数据库都能直接连接。Agent/JDBC 方向的配置还可扩展到 H2、Snowflake、Trino、Hive、DB2、Informix、Neo4j、Cassandra、BigQuery、Kylin、SunDB、JDBCX 和自定义 JDBC。新增的原生与 Agent 驱动还覆盖了 Databricks、SAP HANA、Teradata、Vertica、Firebird、Exasol、崖山 YashanDB、GBase、Databend、RQLite、Turso、InfluxDB、QuestDB、IoTDB、etcd、IRIS 等。全部装进约 20 MB 的应用里，不内嵌 Chromium。
+MySQL、PostgreSQL、SQLite、Cloudflare D1、Redis、MongoDB、DuckDB、ClickHouse、SQL Server、Oracle、Elasticsearch、Easysearch、Meilisearch、MariaDB、TiDB、OceanBase、openGauss、GaussDB、KWDB、KingbaseES、Vastbase、GoldenDB、Doris、SelectDB、StarRocks、Manticore Search、Redshift、DM、TDengine、虚谷 XuguDB、CockroachDB、Access、HighGo、UXDB、Dolt 等数据库都能直接连接。Agent 配置还可扩展到 H2、Snowflake、Trino、Hive、DB2、Informix、Neo4j、Cassandra、BigQuery、Cloud Spanner、Kylin、SunDB、JDBCX 和自定义 JDBC。新增的原生与 Agent 驱动还覆盖了 Databricks、SAP HANA、Teradata、Vertica、Firebird、Exasol、崖山 YashanDB、GBase、Databend、RQLite、Turso、InfluxDB、QuestDB、IoTDB、etcd、ZooKeeper、Nacos、Consul KV、IRIS 等。全部装进约 20 MB 的应用里，不内嵌 Chromium。
 
 ### 查询编辑器
 
@@ -126,7 +196,6 @@ CodeMirror 6 语法高亮、元数据感知自动补全、`Cmd+Enter` 执行、�
 - **数据库导出** — 完整数据库导出
 - **数据对比** — 对比表数据并审查同步结果
 - **SQL 文件执行** — 直接执行 `.sql` 文件
-- **外部表格连接** — 将 CSV/XLSX 和飞书电子表格/多维表格加载为 DuckDB 快照查询；飞书多维表格支持追加、更新和删除写入
 - **文件预览** — 拖入 Parquet、CSV、JSON 即时预览（基于 DuckDB）
 - **连接导入** — 从 DBeaver 或 Navicat 导入连接配置
 
@@ -191,7 +260,7 @@ DBX 也提供独立 CLI 包，适合终端、脚本和 Codex 工作流：
 ```bash
 npm install -g @dbx-app/cli
 # 或通过 Homebrew
-brew tap t8y2/dbx && brew install dbx-cli
+brew tap t8y2/tap && brew install dbx-cli
 dbx connections list --json
 dbx query local "select 1" --json
 ```
@@ -230,11 +299,15 @@ flatpak install flatpark com.dbxio.dbx
 
 之后通过常规的 `flatpak update` 即可获取更新。详见 [FlatPark 上的 DBX 页面](https://flatpark.org/apps/com.dbxio.dbx/)。
 
-**星火应用商店 / AmberPM (Linux)：**
+**Spark Store 星火应用商店(Linux)：**
 
 通过[星火应用商店](https://spk-resolv.spark-app.store/?spk=spk://store/development/dbx)一键安装，后续可直接在商店客户端中获取更新。
 
-银河麒麟 V10、统信 UOS 等系统推荐选择 **APM 版本**，以减少发行版依赖差异导致的安装或启动问题。APM 在兼容环境中运行 DBX；如果为 Agent/JDBC 驱动选择宿主机 Java，需要在路径前添加 `/host`，例如将 `/usr/bin/java` 填写为 `/host/usr/bin/java`。
+  <a href="https://spk-resolv.spark-app.store/?spk=spk://store/development/dbx" target="_blank"  rel="noopener noreferrer">
+  <img src="https://spk-json.spark-app.store/install-from-spark-store.png" width="200"/>
+  </a>
+
+银河麒麟 V10、统信 UOS 等系统推荐选择 **APM（AmberPM）版本**，以减少发行版依赖差异导致的安装或启动问题。APM 在兼容环境中运行 DBX；如果为 Agent/JDBC 驱动选择宿主机 Java，需要在路径前添加 `/host`，例如将 `/usr/bin/java` 填写为 `/host/usr/bin/java`。
 
 ## 自托管 (Docker)
 
@@ -405,8 +478,6 @@ DBX 是免费开源项目，但持续维护、数据库兼容性测试、基础�
 - [支持 DBX](https://my.feishu.cn/wiki/WMTkwdATDiiu4rk14JMcoyhTnoh) —— 通过微信或支付宝自愿捐助
 - [赞助商与合作伙伴](https://my.feishu.cn/wiki/CgOWwwTzzify79k9Oq8cXpUNn6e) —— 支持基础设施、开发工具、服务或社区合作
 
-捐助和赞助不会影响任何人使用 DBX，也不代表购买功能排期。经双方确认后，赞助商和合作伙伴可在赞助页面展示。
-
 ## 常见问题
 
 <details>
@@ -421,17 +492,18 @@ DBX 是免费开源项目，但持续维护、数据库兼容性测试、基础�
 
 <details>
 <summary><strong>可以离线使用吗？</strong></summary>
+
 可以。桌面端完全支持离线使用。内网环境安装驱动时，可在有网机器打开[离线驱动下载页](https://dbxio.com/cn/drivers)下载离线驱动包，传输到内网机器后，在 DBX 的「设置 > 驱动管理」中导入。AI 功能需要网络访问模型端点（或通过 Ollama 使用本地模型）。
 </details>
 
 <details>
 <summary><strong>DBX 和 DBeaver / TablePlus / Beekeeper Studio 有什么区别？</strong></summary>
-DBX 仅 20 MB，无需运行时依赖（无需 Java、无需 Python）。AI 和 MCP 是原生内置功能，不是插件。单一代码库同时支持 70+ 数据库、桌面端、Docker 和 Web。
+DBX 仅 20 MB，无需运行时依赖（无需 Java、无需 Python）。AI 和 MCP 是原生内置功能，不是插件。单一代码库同时支持 90+ 数据库、桌面端、Docker 和 Web。
 </details>
 
 <details>
 <summary><strong>支持哪些数据库？</strong></summary>
-MySQL、PostgreSQL、SQLite、Cloudflare D1、Redis、MongoDB、DuckDB、ClickHouse、SQL Server、Oracle、Elasticsearch、Qdrant、Milvus、Weaviate、MariaDB、TiDB、OceanBase、openGauss、GaussDB、KWDB、KingBase、Vastbase、GoldenDB、Doris、SelectDB、StarRocks、Manticore Search、Redshift、DM、TDengine、虚谷 XuguDB、CockroachDB、Access、HighGo 等。JDBC 方向配置可扩展到 H2、Snowflake、Trino、PrestoSQL、Hive、DB2、Informix、Neo4j、Cassandra、BigQuery、Kylin、SunDB、JDBCX、Databricks、SAP HANA、Teradata、Vertica、Firebird、Exasol、崖山 YashanDB、GBase 8a/8s、Databend、RQLite、Turso、InfluxDB、QuestDB、IoTDB、etcd、ZooKeeper、Nacos、IRIS 及自定义 JDBC 连接，并支持消息队列管理（Pulsar、Kafka、RocketMQ）。
+MySQL、PostgreSQL、SQLite、Cloudflare D1、Redis、MongoDB、DuckDB、ClickHouse、SQL Server、Oracle、Elasticsearch、Easysearch、Meilisearch、Qdrant、Milvus、Weaviate、MariaDB、TiDB、OceanBase、openGauss、GaussDB、KWDB、KingbaseES、Vastbase、GoldenDB、Doris、SelectDB、StarRocks、Manticore Search、Redshift、DM、TDengine、虚谷 XuguDB、CockroachDB、Access、HighGo、UXDB 等。Agent 配置可扩展到 H2、Snowflake、Trino、PrestoSQL、Hive、DB2、Informix、Neo4j、Cassandra、BigQuery、Cloud Spanner、Kylin、SunDB、JDBCX、Databricks、SAP HANA、Teradata、Vertica、Firebird、Exasol、崖山 YashanDB、GBase 8a/8s、Databend、RQLite、Turso、InfluxDB、QuestDB、IoTDB、etcd、ZooKeeper、Nacos、Consul KV、IRIS 及自定义 JDBC 连接，并支持消息队列管理（Pulsar、Kafka、RocketMQ）。
 </details>
 
 <details>
@@ -447,11 +519,11 @@ MySQL、PostgreSQL、SQLite、Cloudflare D1、Redis、MongoDB、DuckDB、ClickHo
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=t8y2%2Fdbx&type=date&legend=top-left">
+<a href="https://star-history.dera.page/#t8y2/dbx&type=date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=t8y2/dbx&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=t8y2/dbx&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=t8y2/dbx&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=t8y2/dbx&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=t8y2/dbx&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=t8y2/dbx&type=date&legend=top-left" />
  </picture>
 </a>
 
