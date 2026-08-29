@@ -84,6 +84,7 @@ function preloadDataGridComponent() {
 }
 
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
+const ExternalTableBrowser = defineAsyncComponent(() => import("@/components/external/ExternalTableBrowser.vue"));
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
 const RedisDashboard = defineAsyncComponent(() => import("@/components/redis/RedisDashboard.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
@@ -277,7 +278,7 @@ onMounted(() => {
 watch(
   () => [props.activeTab.mode, !!props.activeTab.result] as const,
   ([mode, hasResult]) => {
-    if (mode === "data" || hasResult) preloadDataGridComponent();
+    if (mode === "data" || mode === "external-table" || hasResult) preloadDataGridComponent();
   },
   { immediate: true },
 );
@@ -316,6 +317,7 @@ const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
+const externalTableBrowserRef = ref<{ refresh: () => Promise<boolean> }>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeResultExecutionTarget = computed(() => queryStore.activeResultExecutionTarget(props.activeTab.id));
@@ -917,6 +919,11 @@ function refreshData(): boolean {
   if (props.activeTab.mode === "consul-overview") return consulOverviewRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "consul") return consulWorkspaceRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "databases") return databaseBrowserRef.value?.refresh?.() ?? false;
+  if (props.activeTab.mode === "external-table") {
+    if (!externalTableBrowserRef.value) return false;
+    void externalTableBrowserRef.value.refresh();
+    return true;
+  }
   // Restored data tabs intentionally omit row data, so refresh must work before DataGrid mounts.
   if (canReloadUnavailableDataTab(props.activeTab)) {
     emit("reload");
@@ -2189,6 +2196,10 @@ defineExpose({
           </Button>
         </div>
       </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'external-table'">
+      <ExternalTableBrowser ref="externalTableBrowserRef" :connection-id="activeTab.connectionId" :pending-state-key="activeTab.id" />
     </template>
 
     <!-- Redis mode: key browser -->

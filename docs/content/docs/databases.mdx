@@ -28,6 +28,19 @@ Protocol compatibility covers only connection and selected dialect behavior. Ver
 
 Desktop file paths belong to the local computer. Docker/Web paths belong to the server container or mounted host storage; a path on the browser computer is not mapped automatically.
 
+### External Tables (Desktop)
+
+DBX Desktop can open four external tabular sources through a direct table browser rather than SQL or a DuckDB cache:
+
+- CSV files, with an explicit delimiter, text encoding, and optional header row
+- Ordinary `.xlsx` workbooks, with worksheet selection, an optional A1 data range, and formula cells kept read-only
+- Feishu Sheets, authenticated with an app ID and app secret
+- Feishu Base, authenticated with an app ID and app secret
+
+All four support paged browsing, controlled value updates, row creation or append according to the source capability, row deletion, manual refresh, and save readback. DBX checks file snapshots or remote revisions before writing. Conflicts remain pending; partial results clear only confirmed operations; an uncertain network outcome blocks another save until the source is reloaded.
+
+This channel is Desktop-only. It does not add SQL queries, automatic synchronization, polling, webhooks, CLI/MCP tools, or `dbx-web` routes. XLSX editing is limited to normal `.xlsx` data regions; macros, encrypted workbooks, legacy Excel formats, formula editing, and workbook-structure editing are outside this path.
+
 ### Specialized Data Models and Services
 
 - Redis and MongoDB

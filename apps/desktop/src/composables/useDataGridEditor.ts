@@ -48,6 +48,17 @@ interface ConditionalUpdateExecution {
 
 export type DataGridAppendPastedRowsResult = { ok: true; rowCount: number } | { ok: false; reason: "not-editable" | "invalid-target" | "target-not-empty" | "empty-paste" | "readonly-column" };
 
+export interface CustomSaveResult {
+  appliedDirtyCells: Array<{ sourceRowIndex: number; columnIndex: number }>;
+  appliedNewRowTokens: number[];
+  appliedDeletedRows: number[];
+  conflicts: string[];
+  rejected: string[];
+  unknown: string[];
+  reloadRequired: boolean;
+  saveBlocked: boolean;
+}
+
 type CommitEditResult =
   | {
       changed: false;
@@ -73,7 +84,7 @@ type GridScrollerRef =
     };
 
 export interface CustomSaveHandler {
-  save: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: GridNewRowMeta[]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void>;
+  save: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: GridNewRowMeta[]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void | CustomSaveResult>;
   applySavedChanges?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; columns: string[] }) => void;
   preview?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: GridNewRowMeta[]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<string[]>;
   canInsert?: boolean;
@@ -286,6 +297,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     nextNewRowToken = maxToken + 1;
   }
   const deletedRows = ref<Set<number>>(new Set());
+  const customSaveBlocked = ref(false);
+  let preserveCustomPendingOnNextResultChange = false;
   const quickEntryDraftRow = ref<CellValue[]>([]);
   const undoStack = ref<PendingChangesHistorySnapshot[]>([]);
   const redoStack = ref<PendingChangesHistorySnapshot[]>([]);
@@ -1382,8 +1395,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     return snapshot.newRows.length > 0 || snapshot.dirtyRows.size > 0 || snapshot.deletedRows.size > 0;
   }
 
-  function applyDirtyRowsToResult(snapshot: PendingSaveSnapshot) {
-    for (const [sourceIndex, changes] of snapshot.dirtyRows) {
+  function applyDirtyRowsToResult(snapshot: PendingSaveSnapshot, dirtyRowsToApply = snapshot.dirtyRows) {
+    for (const [sourceIndex, changes] of dirtyRowsToApply) {
       const row = result.value.rows[sourceIndex];
       if (row) {
         for (const [colIdx, value] of changes) {
@@ -1391,6 +1404,55 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         }
       }
     }
+  }
+
+  function appliedCustomDirtyRows(snapshot: PendingSaveSnapshot, result: CustomSaveResult) {
+    const applied = new Set(result.appliedDirtyCells.map(({ sourceRowIndex, columnIndex }) => `${sourceRowIndex}:${columnIndex}`));
+    const rows = new Map<number, Map<number, CellValue>>();
+    for (const [sourceIndex, changes] of snapshot.dirtyRows) {
+      for (const [columnIndex, value] of changes) {
+        if (!applied.has(`${sourceIndex}:${columnIndex}`)) continue;
+        const row = rows.get(sourceIndex) ?? new Map<number, CellValue>();
+        row.set(columnIndex, value);
+        rows.set(sourceIndex, row);
+      }
+    }
+    return rows;
+  }
+
+  function clearAppliedCustomSaveChanges(snapshot: PendingSaveSnapshot, result: CustomSaveResult) {
+    const dirtyRowsToClear = appliedCustomDirtyRows(snapshot, result);
+    for (const [sourceIndex, changes] of dirtyRowsToClear) {
+      const liveChanges = dirtyRows.value.get(sourceIndex);
+      if (!liveChanges) continue;
+      for (const [columnIndex, savedValue] of changes) {
+        if (liveChanges.get(columnIndex) === savedValue) liveChanges.delete(columnIndex);
+      }
+      if (liveChanges.size === 0) dirtyRows.value.delete(sourceIndex);
+    }
+    dirtyRows.value = new Map(dirtyRows.value);
+
+    const appliedNewRowTokens = new Set(result.appliedNewRowTokens);
+    if (appliedNewRowTokens.size > 0) {
+      const keptRows: CellValue[][] = [];
+      const keptMeta: GridNewRowMeta[] = [];
+      newRows.value.forEach((row, rowIndex) => {
+        const meta = newRowMeta.value[rowIndex];
+        if (meta && appliedNewRowTokens.has(meta.token)) return;
+        keptRows.push(row);
+        keptMeta.push(meta ?? allocateNewRowMeta(null));
+      });
+      newRows.value = keptRows;
+      newRowMeta.value = keptMeta;
+    }
+
+    for (const sourceIndex of result.appliedDeletedRows) deletedRows.value.delete(sourceIndex);
+    deletedRows.value = new Set(deletedRows.value);
+    touchPendingChanges();
+  }
+
+  function customSaveResultMessage(result: CustomSaveResult) {
+    return [...result.conflicts, ...result.rejected, ...result.unknown].filter(Boolean).join("; ");
   }
 
   function clearSavedPendingChanges(snapshot: PendingSaveSnapshot) {
@@ -1702,6 +1764,10 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       return;
     }
     const customHandler = customSaveHandler?.value;
+    if (customHandler && customSaveBlocked.value) {
+      saveError.value = i18n.global.t("grid.customSaveBlockedReloadRequired");
+      return;
+    }
     const connection = connectionStore.getConfig(connectionId.value ?? "");
     if (connection?.read_only) {
       if (saveOptions.autoSave && !isWriteUnlockActive(connection.id)) return;
@@ -1738,8 +1804,9 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const shouldReloadAfterSqlSave = shouldReloadAfterSave || snapshot.dirtyRows.size > 0;
 
     if (customHandler) {
+      let customResult: void | CustomSaveResult;
       try {
-        await customHandler.save({
+        customResult = await customHandler.save({
           dirtyRows: snapshot.dirtyRows,
           newRows: snapshot.newRows,
           newRowMeta: snapshot.newRowMeta,
@@ -1753,13 +1820,28 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         return;
       }
       snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
-      customHandler.applySavedChanges?.({ dirtyRows: snapshot.dirtyRows, columns: result.value.columns });
-      applyDirtyRowsToResult(snapshot);
+      const appliedDirtyRows = customResult ? appliedCustomDirtyRows(snapshot, customResult) : snapshot.dirtyRows;
+      customHandler.applySavedChanges?.({ dirtyRows: appliedDirtyRows, columns: result.value.columns });
+      applyDirtyRowsToResult(snapshot, appliedDirtyRows);
       options.onResultPayloadMutated?.();
-      clearSavedPendingChanges(snapshot);
+      if (customResult) {
+        clearAppliedCustomSaveChanges(snapshot, customResult);
+        customSaveBlocked.value = customResult.saveBlocked;
+        saveError.value = customSaveResultMessage(customResult);
+        preserveCustomPendingOnNextResultChange = hasPendingChanges.value;
+        if (preserveCustomPendingOnNextResultChange) {
+          void nextTick(() => {
+            preserveCustomPendingOnNextResultChange = false;
+          });
+        }
+      } else {
+        clearSavedPendingChanges(snapshot);
+        customSaveBlocked.value = false;
+      }
       if (!hasPendingChanges.value) exitTransaction();
       clearPendingChangeHistory();
-      if (shouldReloadAfterSave) {
+      const shouldReloadCustomResult = customResult?.reloadRequired === true && !hasPendingChanges.value && !customResult.saveBlocked;
+      if ((customResult ? shouldReloadCustomResult : shouldReloadAfterSave) && !hasPendingChanges.value) {
         reloadCurrentData();
       }
       await finishSaveChanges(snapshot);
@@ -1879,6 +1961,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     newRows.value = [];
     newRowMeta.value = [];
     deletedRows.value = new Set();
+    customSaveBlocked.value = false;
     quickEntryDraftRow.value = emptyDraftRow();
     queuedAutoSaveChanges.clear();
     editingCell.value = null;
@@ -1899,6 +1982,10 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       }
       previousResultRows = rows;
       pendingScrollRestore = undefined;
+      if (customSaveBlocked.value || preserveCustomPendingOnNextResultChange) {
+        preserveCustomPendingOnNextResultChange = false;
+        return;
+      }
       discardChanges();
     },
   );
@@ -2013,6 +2100,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     newRows,
     newRowMeta,
     deletedRows,
+    customSaveBlocked,
     quickEntryDraftRow,
     quickEntryDraftRowId: DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID,
     dirtyRowCount,

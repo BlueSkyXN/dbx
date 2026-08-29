@@ -440,6 +440,7 @@ interface DataGridProps {
   autoTransposeSingleRow?: boolean;
   sourceColumns?: Array<string | undefined>;
   readonlyColumnIndexes?: number[];
+  isCellReadonly?: (sourceRowIndex: number, columnIndex: number) => boolean;
   /**
    * Column comments for a multi-source query result (e.g. JOIN), indexed by
    * result-column ordinal (projection order). Populated even when the result is
@@ -4085,6 +4086,7 @@ const {
   newRows,
   newRowMeta: editorNewRowMeta,
   deletedRows,
+  customSaveBlocked,
   quickEntryDraftRow,
   quickEntryDraftRowId,
   pendingChangesVersion,
@@ -4253,6 +4255,7 @@ function canEditRowItem(item: RowItem | undefined): boolean {
 function canEditCellItem(item: RowItem | undefined, columnIndex: number): boolean {
   if (!canEditRowItem(item) || !canEditColumn(columnIndex)) return false;
   if (isSavingNewRow(item)) return false;
+  if (item?.sourceIndex !== undefined && props.isCellReadonly?.(item.sourceIndex, columnIndex)) return false;
   const column = props.result.columns[columnIndex] ?? "";
   if (customReadonlyColumns.value.has(column.toLowerCase())) return false;
   if (!item?.isNew && !item?.isDraft) {
@@ -11688,6 +11691,9 @@ defineExpose({
   useTransaction,
   transactionActive,
   isSaving,
+  hasPendingChanges: () => hasPendingChanges.value,
+  isCustomSaveBlocked: () => customSaveBlocked.value,
+  discardPendingChanges: discardChanges,
   onToolbarRefresh,
   onToolbarCommit,
   onToolbarRollback,

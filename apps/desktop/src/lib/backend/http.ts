@@ -149,6 +149,7 @@ import type {
   MeilisearchIndexOverview,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import { isExternalTableDatabaseType, type ApplyChangesRequest, type ApplyChangesResult, type ExternalTableRef, type ExternalTableSchema, type PageSnapshot, type ReadPageRequest } from "@/types/externalTable";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
@@ -367,10 +368,12 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 // ---------------------------------------------------------------------------
 
 export async function testConnection(config: ConnectionConfig): Promise<string> {
+  if (isExternalTableDatabaseType(config.db_type)) return externalTablesDesktopOnly();
   return post("/api/connection/test", { config });
 }
 
 export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
+  if (isExternalTableDatabaseType(config.db_type)) return externalTablesDesktopOnly();
   const response = await fetch(apiUrl("/api/connection/test-info"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -384,6 +387,7 @@ export async function testConnectionWithInfo(config: ConnectionConfig): Promise<
 }
 
 export async function connectDb(config: ConnectionConfig, clientAttempt?: number): Promise<string> {
+  if (isExternalTableDatabaseType(config.db_type)) return externalTablesDesktopOnly();
   return post("/api/connection/connect", { config, clientAttempt });
 }
 
@@ -435,6 +439,26 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return post("/api/connection/check-health", { connectionId });
+}
+
+function externalTablesDesktopOnly(): never {
+  throw new Error("External table connections are available only in the DBX desktop app.");
+}
+
+export async function externalTableList(_connectionId: string): Promise<ExternalTableRef[]> {
+  return externalTablesDesktopOnly();
+}
+
+export async function externalTableDescribe(_connectionId: string, _table: ExternalTableRef): Promise<ExternalTableSchema> {
+  return externalTablesDesktopOnly();
+}
+
+export async function externalTableReadPage(_connectionId: string, _request: ReadPageRequest): Promise<PageSnapshot> {
+  return externalTablesDesktopOnly();
+}
+
+export async function externalTableApplyChanges(_connectionId: string, _request: ApplyChangesRequest): Promise<ApplyChangesResult> {
+  return externalTablesDesktopOnly();
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
