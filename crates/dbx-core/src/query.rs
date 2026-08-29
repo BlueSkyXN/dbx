@@ -1795,7 +1795,9 @@ async fn do_execute_typed(
         }
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::ExternalTabular(pool) => {
-            if !crate::sql::starts_with_duckdb_result_sql_keyword(sql) {
+            if !crate::sql::starts_with_duckdb_result_sql_keyword(sql)
+                || crate::query_execution_sql::is_write_sql_for_database(sql, DatabaseType::DuckDb)
+            {
                 return Err("External data sources are read-only. Only result-returning queries are supported.".into());
             }
             let pool = pool.clone();

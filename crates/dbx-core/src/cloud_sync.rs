@@ -1048,6 +1048,7 @@ async fn build_sensitive_payload(
         push_mq_external_config_secrets(&mut connection_secrets, config);
         if config.save_password {
             push_nacos_external_config_secrets(&mut connection_secrets, config);
+            push_feishu_external_config_secrets(&mut connection_secrets, config);
         }
     }
 
@@ -1215,8 +1216,10 @@ async fn apply_sensitive_payload(
         }
         // Metadata is applied before secrets. Never let an older encrypted snapshot
         // restore a password after the user chose not to retain it locally.
-        if matches!(secret.key.as_str(), "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY)
-            && connections.iter().any(|config| config.id == secret.connection_id && !config.save_password)
+        if matches!(
+            secret.key.as_str(),
+            "password" | NACOS_AUTH_PASSWORD_KEY | NACOS_RNACOS_CONSOLE_PASSWORD_KEY | FEISHU_ACCESS_TOKEN_KEY
+        ) && connections.iter().any(|config| config.id == secret.connection_id && !config.save_password)
         {
             continue;
         }
@@ -1637,7 +1640,9 @@ mod tests {
         SnippetProvider, SnippetSyncClient, SnippetSyncConfig, WebDavClient, WebDavConfig, DEFAULT_SNIPPET_FILE_NAME,
     };
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiConfigItem};
-    use crate::connection_secrets::{NACOS_AUTH_PASSWORD_KEY, NACOS_RNACOS_CONSOLE_PASSWORD_KEY};
+    use crate::connection_secrets::{
+        FEISHU_ACCESS_TOKEN_KEY, NACOS_AUTH_PASSWORD_KEY, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
+    };
     use crate::models::connection::{
         default_redis_key_separator, ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
@@ -2686,6 +2691,59 @@ mod tests {
         apply_sensitive_payload(&source, &legacy_payload, &[config]).await.unwrap();
         assert_eq!(source.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
         assert_eq!(source.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn encrypted_sync_snapshot_round_trips_feishu_access_token_without_exposing_it() {
+        let storage = Storage::open(&temp_db_path("sync-feishu-access-token-src")).await.unwrap();
+        storage.save_connections(&[feishu_connection("feishu", "tenant-token")]).await.unwrap();
+
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+
+        assert_eq!(feishu_access_token(&snapshot.connections[0]), Some(""));
+        let public_json = serde_json::to_string(&snapshot.connections).unwrap();
+        assert!(!public_json.contains("tenant-token"));
+        let encrypted = snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        assert!(decrypted.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "feishu" && secret.key == FEISHU_ACCESS_TOKEN_KEY && secret.secret == "tenant-token"
+        }));
+
+        let target = Storage::open(&temp_db_path("sync-feishu-access-token-dst")).await.unwrap();
+        apply_sync_snapshot(
+            &target,
+            &snapshot,
+            ApplySnapshotOptions { secrets_passphrase: Some("sync-pass"), restore_secrets: true },
+        )
+        .await
+        .unwrap();
+        let restored = target.load_connections().await.unwrap();
+        assert_eq!(feishu_access_token(&restored[0]), Some("tenant-token"));
+    }
+
+    #[tokio::test]
+    async fn sync_never_snapshots_or_restores_feishu_token_when_saving_is_disabled() {
+        let source = Storage::open(&temp_db_path("sync-no-save-feishu-source")).await.unwrap();
+        let mut config = feishu_connection("feishu", "transient-token");
+        config.save_password = false;
+        let payload = build_sensitive_payload(&source, std::slice::from_ref(&config), &[]).await.unwrap();
+        assert!(!payload
+            .connection_secrets
+            .iter()
+            .any(|secret| { secret.connection_id == "feishu" && secret.key == FEISHU_ACCESS_TOKEN_KEY }));
+
+        let legacy_payload = SensitiveSyncPayload {
+            connection_secrets: vec![ConnectionSecretSnapshot {
+                connection_id: "feishu".to_string(),
+                key: FEISHU_ACCESS_TOKEN_KEY.to_string(),
+                secret: "legacy-token".to_string(),
+            }],
+            ai_configs: None,
+            ai_config: None,
+            tunnel_profiles: None,
+        };
+        apply_sensitive_payload(&source, &legacy_payload, &[config]).await.unwrap();
+        assert_eq!(source.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap(), None);
     }
 
     #[tokio::test]

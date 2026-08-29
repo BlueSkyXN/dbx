@@ -74,6 +74,36 @@ profiles:
     port: 0
     user: ""
     category: lightweight
+  - id: csvfile
+    dbType: csvfile
+    label: CSV
+    icon: csvfile
+    port: 0
+    user: ""
+    category: lightweight
+  - id: xlsxfile
+    dbType: xlsxfile
+    label: XLSX
+    icon: xlsxfile
+    port: 0
+    user: ""
+    category: lightweight
+  - id: feishu_sheets
+    dbType: feishu_sheets
+    label: Feishu Sheets
+    icon: feishu_sheets
+    port: 0
+    user: ""
+    host: https://open.feishu.cn
+    category: lightweight
+  - id: feishu_bitable
+    dbType: feishu_bitable
+    label: Feishu Bitable
+    icon: feishu_bitable
+    port: 0
+    user: ""
+    host: https://open.feishu.cn
+    category: lightweight
   - id: access
     dbType: access
     label: Microsoft Access

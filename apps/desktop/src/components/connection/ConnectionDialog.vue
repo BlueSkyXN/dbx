@@ -2296,9 +2296,15 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   form.value.driver_profile = val;
   form.value.driver_label = isCustomCompatibleProfile() ? customDriverName.value.trim() || profile.label : profile.label;
   const preserveMeilisearchConfig = preserveConnectionFields && previousDatabaseType === "meilisearch" && profile.type === "meilisearch";
-  const preservesExternalTabularConfig = profile.type === "csvfile" || profile.type === "xlsxfile" || profile.type === "feishu_sheets" || profile.type === "feishu_bitable";
-  if (profile.type !== "sqlserver" && !preserveMeilisearchConfig && !preservesExternalTabularConfig) {
+  const previousWasExternalTabular = previousDatabaseType === "csvfile" || previousDatabaseType === "xlsxfile" || previousDatabaseType === "feishu_sheets" || previousDatabaseType === "feishu_bitable";
+  const nextIsExternalTabular = profile.type === "csvfile" || profile.type === "xlsxfile" || profile.type === "feishu_sheets" || profile.type === "feishu_bitable";
+  const preservesExternalTabularConfig = preserveConnectionFields && previousDatabaseType === profile.type && nextIsExternalTabular;
+  if ((previousWasExternalTabular && previousDatabaseType !== profile.type) || (profile.type !== "sqlserver" && !preserveMeilisearchConfig && !preservesExternalTabularConfig)) {
     form.value.external_config = undefined;
+  }
+  if (previousDatabaseType !== profile.type && (previousWasExternalTabular || nextIsExternalTabular)) {
+    form.value.username = "";
+    form.value.password = "";
   }
   if (profile.type !== "elasticsearch" || previousDatabaseType !== "elasticsearch") {
     resetElasticsearchProxyFields();
@@ -3047,10 +3053,6 @@ const feishuMaxColumns = externalConfigNumber("max_columns", 100);
 const feishuSyncMode = externalConfigString("sync_mode", "snapshot");
 const feishuBitablePageSize = externalConfigNumber("page_size", 500);
 const feishuBitableMaxRecords = externalConfigNumber("max_records", 5000);
-const feishuBitableAutomaticFields = computed({
-  get: () => externalConfigRecord(form.value.external_config).automatic_fields === true,
-  set: (value: boolean) => setExternalConfigValue("automatic_fields", value),
-});
 const sqliteExtensionPaths = computed({
   get: () => sqliteExtensionPathsFromParams(form.value.url_params),
   set: (value: string) => {
@@ -3965,8 +3967,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
     };
     config.port = 0;
-    config.username = "";
-    config.password = "";
+    config.username = config.username?.trim() || "";
     config.database = undefined;
     config.connection_string = undefined;
     config.transport_layers = [];
@@ -3986,8 +3987,7 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
       sync_mode: typeof existing.sync_mode === "string" ? existing.sync_mode : "snapshot",
     };
     config.port = 0;
-    config.username = "";
-    config.password = "";
+    config.username = config.username?.trim() || "";
     config.database = undefined;
     config.connection_string = undefined;
     config.transport_layers = [];
@@ -6436,25 +6436,49 @@ function openExternalUrl(url: string) {
                 <!-- Feishu Sheets / Bitable: remote tabular source settings -->
                 <template v-else-if="isFeishuConnection">
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Host</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.host") }}</Label>
                     <Input v-model="form.host" class="col-span-3" placeholder="https://open.feishu.cn" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Access Token</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.feishuAccessToken") }}</Label>
                     <PasswordInput v-model="feishuAccessToken" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.feishuAppId") }}</Label>
+                    <Input v-model="form.username" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.feishuAppSecret") }}</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">{{ t("connection.feishuAuthHint") }}</p>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <div class="col-span-3 flex items-center gap-1.5 text-sm">
+                      <label class="flex items-center gap-2">
+                        <input v-model="form.save_password" type="checkbox" class="h-4 w-4 rounded border-border accent-primary" :aria-label="t('connection.feishuSaveCredentials')" />
+                        <span class="whitespace-nowrap">{{ t("connection.feishuSaveCredentials") }}</span>
+                      </label>
+                      <HelpTooltip :label="t('connection.feishuSaveCredentials')">
+                        {{ form.save_password ? t("connection.feishuSaveCredentialsHint") : t("connection.feishuSessionCredentialsHint") }}
+                      </HelpTooltip>
+                    </div>
                   </div>
                   <template v-if="form.db_type === 'feishu_sheets'">
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Spreadsheet Token</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuSpreadsheetToken") }}</Label>
                       <Input v-model="feishuSpreadsheetToken" class="col-span-3" placeholder="shtcn..." />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Sheet ID</Label>
-                      <Input v-model="feishuSheetId" class="col-span-3" placeholder="Optional" />
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuSheetId") }}</Label>
+                      <Input v-model="feishuSheetId" class="col-span-3" :placeholder="t('connection.feishuOptionalPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Range</Label>
-                      <Input v-model="feishuRange" class="col-span-3" placeholder="A1:Z1000 or sheetId!A1:Z1000" />
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuRange") }}</Label>
+                      <Input v-model="feishuRange" class="col-span-3" :placeholder="t('connection.feishuRangePlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />
@@ -6464,52 +6488,45 @@ function openExternalUrl(url: string) {
                       </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Limit</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuLimit") }}</Label>
                       <div class="col-span-3 grid grid-cols-2 gap-2">
-                        <Input v-model.number="feishuMaxRows" type="number" min="1" placeholder="Rows" />
-                        <Input v-model.number="feishuMaxColumns" type="number" min="1" max="100" placeholder="Columns" />
+                        <Input v-model.number="feishuMaxRows" type="number" min="1" :placeholder="t('connection.feishuRows')" />
+                        <Input v-model.number="feishuMaxColumns" type="number" min="1" max="100" :placeholder="t('connection.feishuColumns')" />
                       </div>
                     </div>
                   </template>
                   <template v-else>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">App Token</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuBitableAppToken") }}</Label>
                       <Input v-model="feishuBitableAppToken" class="col-span-3" placeholder="app..." />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Table ID</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuBitableTableId") }}</Label>
                       <Input v-model="feishuBitableTableId" class="col-span-3" placeholder="tbl..." />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">View ID</Label>
-                      <Input v-model="feishuBitableViewId" class="col-span-3" placeholder="Optional" />
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuBitableViewId") }}</Label>
+                      <Input v-model="feishuBitableViewId" class="col-span-3" :placeholder="t('connection.feishuOptionalPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Fields</Label>
-                      <Input v-model="feishuBitableFieldNames" class="col-span-3" placeholder="Name, Amount" />
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuBitableFields") }}</Label>
+                      <Input v-model="feishuBitableFieldNames" class="col-span-3" :placeholder="t('connection.feishuBitableFieldsPlaceholder')" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">Limit</Label>
+                      <Label :class="connectionLabelClass">{{ t("connection.feishuLimit") }}</Label>
                       <div class="col-span-3 grid grid-cols-2 gap-2">
-                        <Input v-model.number="feishuBitablePageSize" type="number" min="1" max="500" placeholder="Page" />
-                        <Input v-model.number="feishuBitableMaxRecords" type="number" min="1" placeholder="Records" />
+                        <Input v-model.number="feishuBitablePageSize" type="number" min="1" max="500" :placeholder="t('connection.feishuPageSize')" />
+                        <Input v-model.number="feishuBitableMaxRecords" type="number" min="1" :placeholder="t('connection.feishuMaxRecords')" />
                       </div>
-                    </div>
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <span />
-                      <label class="col-span-3 flex cursor-pointer items-center gap-2">
-                        <Switch v-model="feishuBitableAutomaticFields" />
-                        <span class="text-xs text-muted-foreground">Return automatic fields</span>
-                      </label>
                     </div>
                   </template>
                   <div class="grid grid-cols-4 items-center gap-4">
-                    <Label :class="connectionLabelClass">Sync</Label>
+                    <Label :class="connectionLabelClass">{{ t("connection.feishuSyncMode") }}</Label>
                     <Select v-model="feishuSyncMode">
                       <SelectTrigger class="col-span-3 h-9"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="snapshot">Snapshot / manual refresh</SelectItem>
-                        <SelectItem value="realtime">Refresh before SELECT</SelectItem>
+                        <SelectItem value="snapshot">{{ t("connection.feishuSyncSnapshot") }}</SelectItem>
+                        <SelectItem value="realtime">{{ t("connection.feishuSyncRealtime") }}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>

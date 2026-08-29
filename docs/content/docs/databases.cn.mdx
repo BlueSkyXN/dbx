@@ -22,11 +22,22 @@ DBX 的新建连接窗口提供 90+ 数据库和服务 profile。Profile 决定�
 
 ### 文件、边缘和托管数据库
 
-- SQLite、DuckDB、Microsoft Access
+- SQLite、DuckDB、Microsoft Access、CSV/TSV 文件和 Excel 工作簿
 - Cloudflare D1、Turso、RQLite
 - H2 和通过 JDBC URL 访问的本地数据库
 
 Desktop 的文件路径属于本机。Docker/Web 的文件路径属于服务器容器或宿主机挂载目录；浏览器电脑上的路径不会自动映射到服务器。
+
+### 外部表格数据源
+
+CSV/TSV 文件、Excel 工作簿、Feishu Sheets 和 Feishu Bitable 会加载到隔离的内存 DuckDB 缓存中。这样可以使用 SQL 查询和元数据浏览，同时不允许 SQL 直接修改源数据。
+
+- CSV/TSV 和 Excel 连接是只读快照。文件变化后，在连接菜单中使用 **刷新外部数据快照**。
+- Feishu 连接可以填写 Access Token，也可以使用 App ID 和 App Secret。**保存 Feishu 凭据**同时控制 Access Token 和 App Secret 是否持久化；关闭后，凭据只保留在当前 Desktop 进程或已认证的 Web 登录会话内。
+- Feishu `snapshot` 模式只在连接和手动刷新时更新；`realtime` 模式会在读取前自动刷新，最短间隔为 5 秒。
+- Feishu Bitable 的表数据标签页可以使用 Feishu 返回的 record ID 新增、更新和删除记录；查询结果网格和 Feishu Sheets 快照保持只读。
+
+外部写入同样由共享后端执行连接只读保护。标记为生产环境的连接仍需经过数据网格已有的前端确认流程。
 
 ### 专用数据模型和服务
 

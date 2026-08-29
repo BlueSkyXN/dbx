@@ -147,6 +147,7 @@ impl PoolKind {
             Self::DuckDbWorker(client) => Some(Self::DuckDbWorker(client.clone())),
             #[cfg(not(feature = "duckdb-sidecar"))]
             Self::DuckDbWorker(_) => Some(Self::DuckDbWorker(())),
+            Self::ExternalTabular(client) => Some(Self::ExternalTabular(client.clone())),
             Self::MongoDb(client) => Some(Self::MongoDb(client.clone())),
             Self::ClickHouse(client) => Some(Self::ClickHouse(client.clone())),
             Self::SqlServer(client) => Some(Self::SqlServer(client.clone())),
@@ -1148,10 +1149,23 @@ impl AppState {
         db_config: &mut ConnectionConfig,
         connection_id: &str,
     ) {
-        if !config.save_password && db_config.password.is_empty() {
+        if !config.save_password {
             let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
-            if let Some(session_password) = self.session_credentials.get(&owner, connection_id) {
-                db_config.password = session_password;
+            if db_config.password.is_empty() {
+                if let Some(session_password) = self.session_credentials.get(&owner, connection_id) {
+                    db_config.password = session_password;
+                }
+            }
+            if matches!(config.db_type, DatabaseType::FeishuSheets | DatabaseType::FeishuBitable)
+                && crate::connection_secrets::feishu_access_token(db_config).is_none()
+            {
+                if let Some(token) = self.session_credentials.get_for_purpose(
+                    &owner,
+                    connection_id,
+                    crate::connection_secrets::FEISHU_ACCESS_TOKEN_KEY,
+                ) {
+                    crate::connection_secrets::restore_transient_feishu_access_token(db_config, token);
+                }
             }
         }
     }
@@ -2881,8 +2895,11 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        let transport_layers = config.effective_transport_layers();
-        if transport_layers.is_empty() || config.db_type.is_external_tabular() {
+        if config.db_type.is_external_tabular() {
+            return Ok((config.host.clone(), config.port));
+        }
+        let transport_layers = self.resolved_transport_layers(config).await?;
+        if transport_layers.is_empty() {
             return Ok((config.host.clone(), config.port));
         }
         if config.uses_oracle_tns() {
@@ -4981,6 +4998,11 @@ impl AppState {
 
     #[cfg(feature = "duckdb-sidecar")]
     pub async fn refresh_external_pool(&self, connection_id: &str) -> Result<(), String> {
+        self.external_pool_for_connection(connection_id).await?.refresh_cache().await
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    async fn external_pool_for_connection(&self, connection_id: &str) -> Result<ExternalTabularHandle, String> {
         let pool = {
             let connections = self.connections.read().await;
             match connections.get(connection_id) {
@@ -4989,18 +5011,23 @@ impl AppState {
                 None => return Err("Connection is not connected".to_string()),
             }
         };
-
-        pool.refresh_cache().await
+        let config = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).cloned().ok_or_else(|| "Connection config not found".to_string())?
+        };
+        if self.pool_credential_owner_mismatch(&config, connection_id).await {
+            return Err("Connection is not connected for the current session".to_string());
+        }
+        Ok(pool)
     }
 
-    #[cfg(feature = "duckdb-sidecar")]
-    async fn external_pool_for_connection(&self, connection_id: &str) -> Result<ExternalTabularHandle, String> {
-        let connections = self.connections.read().await;
-        match connections.get(connection_id) {
-            Some(PoolKind::ExternalTabular(pool)) => Ok(pool.clone()),
-            Some(_) => Err("Connection is not an external tabular source".to_string()),
-            None => Err("Connection is not connected".to_string()),
+    async fn ensure_external_connection_writable(&self, connection_id: &str, action: &str) -> Result<(), String> {
+        if let Some(name) = crate::query::connection_readonly_name(self, connection_id).await {
+            return Err(format!(
+                "Read-only mode: connection '{name}' has read-only protection enabled. {action} blocked."
+            ));
         }
+        Ok(())
     }
 
     #[cfg(feature = "duckdb-sidecar")]
@@ -5010,6 +5037,7 @@ impl AppState {
         table_name: &str,
         rows: Vec<Vec<serde_json::Value>>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Append external rows").await?;
         self.external_pool_for_connection(connection_id).await?.append_rows(table_name, rows).await
     }
 
@@ -5020,6 +5048,7 @@ impl AppState {
         table_name: &str,
         updates: Vec<external::ExternalRowUpdate>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Update external rows").await?;
         self.external_pool_for_connection(connection_id).await?.update_rows(table_name, updates).await
     }
 
@@ -5030,6 +5059,7 @@ impl AppState {
         table_name: &str,
         row_ids: Vec<String>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Delete external rows").await?;
         self.external_pool_for_connection(connection_id).await?.delete_rows(table_name, row_ids).await
     }
 
@@ -5041,6 +5071,7 @@ impl AppState {
         range: &str,
         rows: Vec<Vec<serde_json::Value>>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Write external range").await?;
         self.external_pool_for_connection(connection_id).await?.write_range(table_name, range, rows).await
     }
 
@@ -5052,41 +5083,45 @@ impl AppState {
     #[cfg(not(feature = "duckdb-sidecar"))]
     pub async fn append_external_rows(
         &self,
-        _connection_id: &str,
+        connection_id: &str,
         _table_name: &str,
         _rows: Vec<Vec<serde_json::Value>>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Append external rows").await?;
         Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 
     #[cfg(not(feature = "duckdb-sidecar"))]
     pub async fn update_external_rows(
         &self,
-        _connection_id: &str,
+        connection_id: &str,
         _table_name: &str,
         _updates: Vec<external::ExternalRowUpdate>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Update external rows").await?;
         Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 
     #[cfg(not(feature = "duckdb-sidecar"))]
     pub async fn delete_external_rows(
         &self,
-        _connection_id: &str,
+        connection_id: &str,
         _table_name: &str,
         _row_ids: Vec<String>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Delete external rows").await?;
         Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 
     #[cfg(not(feature = "duckdb-sidecar"))]
     pub async fn write_external_range(
         &self,
-        _connection_id: &str,
+        connection_id: &str,
         _table_name: &str,
         _range: &str,
         _rows: Vec<Vec<serde_json::Value>>,
     ) -> Result<external::ExternalWriteResult, String> {
+        self.ensure_external_connection_writable(connection_id, "Write external range").await?;
         Err("External tabular source support is not compiled in this build. Rebuild with default features.".to_string())
     }
 }
@@ -9681,6 +9716,53 @@ for line in sys.stdin:
 
     #[cfg(feature = "duckdb-sidecar")]
     #[tokio::test]
+    async fn external_write_methods_enforce_read_only_before_pool_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("state.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = mysql_config(None);
+        config.id = "readonly-external".to_string();
+        config.name = "Read-only external source".to_string();
+        config.db_type = DatabaseType::FeishuBitable;
+        config.read_only = true;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let errors = [
+            state
+                .append_external_rows("readonly-external", "records", vec![vec![serde_json::json!("Ada")]])
+                .await
+                .unwrap_err(),
+            state
+                .update_external_rows(
+                    "readonly-external",
+                    "records",
+                    vec![crate::external::ExternalRowUpdate {
+                        row_id: "rec-1".to_string(),
+                        fields: serde_json::Map::new(),
+                    }],
+                )
+                .await
+                .unwrap_err(),
+            state.delete_external_rows("readonly-external", "records", vec!["rec-1".to_string()]).await.unwrap_err(),
+            state
+                .write_external_range("readonly-external", "records", "A1", vec![vec![serde_json::json!("Ada")]])
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(error.contains("read-only protection enabled"), "unexpected error: {error}");
+        }
+
+        state.write_unlock_windows.unlock("readonly-external", 60).await.unwrap();
+        let unlocked_error = state
+            .append_external_rows("readonly-external", "records", vec![vec![serde_json::json!("Ada")]])
+            .await
+            .unwrap_err();
+        assert_eq!(unlocked_error, "Connection is not connected");
+    }
+
+    #[cfg(feature = "duckdb-sidecar")]
+    #[tokio::test]
     async fn external_csv_pool_is_reused_and_refresh_reloads_snapshot() {
         let dir = std::env::temp_dir().join(format!(
             "dbx_external_csv_pool_{}_{}",
@@ -9717,6 +9799,14 @@ for line in sys.stdin:
             assert_eq!(connections.len(), 1);
             assert!(matches!(connections.get("csv"), Some(PoolKind::ExternalTabular(_))));
         }
+
+        state.configs.write().await.get_mut("csv").unwrap().save_password = false;
+        state.session_credentials.record_pool_owner("csv", "token-a");
+        crate::session_credentials::with_credential_owner(Some("token-b".to_string()), async {
+            let error = state.refresh_external_pool("csv").await.unwrap_err();
+            assert_eq!(error, "Connection is not connected for the current session");
+        })
+        .await;
 
         let result =
             query::execute_sql_statement(&state, "csv", "main", "SELECT name FROM people", None, None).await.unwrap();

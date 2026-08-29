@@ -12,6 +12,7 @@ pub use dbx_core::connection::{
     gaussdb_uses_m_jdbc_driver, metadata_connection_config, prestosql_jdbc_config_for_endpoint,
     probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
 };
+use dbx_core::connection_secrets::{feishu_access_token, take_transient_feishu_access_token, FEISHU_ACCESS_TOKEN_KEY};
 use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::db::agent_driver::{AgentDriverClient, AgentMethod};
@@ -567,6 +568,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn save_connection_configs_keeps_no_save_feishu_token_in_memory_only() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-feishu-token-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let mut config = mongodb_config();
+        config.id = "feishu-a".to_string();
+        config.name = "Feishu Bitable".to_string();
+        config.db_type = DatabaseType::FeishuBitable;
+        config.host = "https://open.feishu.cn".to_string();
+        config.port = 0;
+        config.username.clear();
+        config.password.clear();
+        config.database = None;
+        config.connection_string = None;
+        config.save_password = false;
+        config.external_config = Some(serde_json::json!({
+            "access_token": "tenant-token",
+            "app_token": "app_test"
+        }));
+
+        super::save_connection_configs(&state, std::slice::from_ref(&config)).await.unwrap();
+
+        let runtime = state.configs.read().await.get("feishu-a").cloned().unwrap();
+        assert_eq!(dbx_core::connection_secrets::feishu_access_token(&runtime), None);
+        assert_eq!(
+            state
+                .session_credentials
+                .get_for_purpose(
+                    dbx_core::session_credentials::DESKTOP_OWNER,
+                    "feishu-a",
+                    dbx_core::connection_secrets::FEISHU_ACCESS_TOKEN_KEY,
+                )
+                .as_deref(),
+            Some("tenant-token")
+        );
+        assert_eq!(
+            dbx_core::connection_secrets::feishu_access_token(&state.storage.load_connections().await.unwrap()[0]),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(any(feature = "sqlite-sqlcipher", feature = "sqlite-multiple-ciphers"))]
     #[tokio::test]
     async fn sqlite_connect_from_config_uses_sqlcipher_key() {
@@ -878,7 +924,25 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
         }
     }
     state.storage.save_connections(configs).await?;
-    let sync = sync_connection_configs(state, configs).await;
+    let mut runtime_configs = configs.to_vec();
+    let mut transient_tokens = Vec::new();
+    for config in &mut runtime_configs {
+        if !config.save_password {
+            if let Some(token) = take_transient_feishu_access_token(config) {
+                transient_tokens.push((config.id.clone(), token));
+            }
+            config.password.clear();
+        }
+    }
+    let sync = sync_connection_configs(state, &runtime_configs).await;
+    for (connection_id, token) in transient_tokens {
+        state.session_credentials.set_for_purpose(
+            dbx_core::session_credentials::DESKTOP_OWNER,
+            &connection_id,
+            FEISHU_ACCESS_TOKEN_KEY,
+            &token,
+        );
+    }
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
@@ -1594,9 +1658,27 @@ async fn test_connection_with_info_inner(
 /// 连接成功且 `save_password=false` 时，把本次输入的密码记入内存会话凭据仓库，
 /// 供本次运行内 AI / 元数据 / 池重建复用（进程退出即丢，绝不落盘）。
 fn record_session_credential(state: &AppState, config: &ConnectionConfig, connection_id: &str) {
-    if !config.save_password && !config.password.is_empty() {
-        let _ = state.session_credentials.set("", connection_id, &config.password);
+    if !config.save_password {
+        if !config.password.is_empty() {
+            let _ = state.session_credentials.set("", connection_id, &config.password);
+        }
+        if let Some(token) = feishu_access_token(config) {
+            state.session_credentials.set_for_purpose(
+                dbx_core::session_credentials::DESKTOP_OWNER,
+                connection_id,
+                FEISHU_ACCESS_TOKEN_KEY,
+                &token,
+            );
+        }
     }
+}
+
+fn sanitized_runtime_config(mut config: ConnectionConfig) -> ConnectionConfig {
+    if !config.save_password {
+        config.password.clear();
+        take_transient_feishu_access_token(&mut config);
+    }
+    config
 }
 
 #[tauri::command]
@@ -1992,10 +2074,7 @@ pub async fn connect_db(
     }
     record_session_credential(state.inner(), &connected_config, &id);
     // 存入全局运行态 configs 的配置脱敏（no-save 密码恒为空），明文只存在于会话凭据仓库。
-    let mut stored = connected_config;
-    if !stored.save_password {
-        stored.password.clear();
-    }
+    let stored = sanitized_runtime_config(connected_config);
     state.configs.write().await.insert(id.clone(), stored);
 
     Ok(id)
@@ -2022,10 +2101,7 @@ pub async fn connection_final_proxy_port(
     let db_config = metadata_connection_config(&runtime_config);
     // This pre-connect path caches the configuration for tunnel resolution. Keep
     // no-save passwords out of that shared runtime cache just like connect_db.
-    let mut stored_config = runtime_config.clone();
-    if !stored_config.save_password {
-        stored_config.password.clear();
-    }
+    let stored_config = sanitized_runtime_config(runtime_config.clone());
     state.configs.write().await.insert(connection_id.clone(), stored_config);
 
     let (_, port) = state.connection_host_port(&connection_id, &db_config).await?;
@@ -2072,14 +2148,17 @@ pub async fn close_database_connection(
 /// 供前端决定是否需要弹密码框；仅返回布尔状态，不泄露密码本身。
 #[tauri::command]
 pub async fn session_credential_status(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<bool, String> {
-    Ok(state.session_credentials.has("", &connection_id))
+    Ok(state.session_credentials.has("", &connection_id)
+        || state.session_credentials.get_for_purpose("", &connection_id, FEISHU_ACCESS_TOKEN_KEY).is_some())
 }
 
 /// "断开并忘记本次密码"：清除连接本次运行期的临时密码，下次连接需重新输入。
 /// 只清内存会话凭据，不影响持久化配置与已保存密码。
 #[tauri::command]
 pub async fn forget_session_credential(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
-    if !state.session_credentials.has("", &connection_id) {
+    if !state.session_credentials.has("", &connection_id)
+        && state.session_credentials.get_for_purpose("", &connection_id, FEISHU_ACCESS_TOKEN_KEY).is_none()
+    {
         return Err(format!("Connection has no transient session credential to forget: {connection_id}"));
     }
     state.session_credentials.remove("", &connection_id);

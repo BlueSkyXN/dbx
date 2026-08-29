@@ -71,6 +71,9 @@ impl ExternalPool {
     }
 
     fn realtime_refresh_is_fresh(&self) -> Result<bool, String> {
+        if !matches!(&*self.cache_state.lock().map_err(|error| error.to_string())?, CacheState::Fresh) {
+            return Ok(false);
+        }
         Ok(self
             .last_refresh_at
             .lock()
@@ -86,15 +89,94 @@ impl ExternalPool {
         cancel_token: Option<CancellationToken>,
         query_timeout: Option<Duration>,
     ) -> Result<db::QueryResult, DuckDbWorkerError> {
-        if self.source.refresh_before_query() {
-            self.refresh_cache_if_stale().await.map_err(DuckDbWorkerError::from)?;
-        }
+        self.prepare_read().await.map_err(DuckDbWorkerError::from)?;
         let _operation_guard = self.operation_lock.lock().await;
         self.worker.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await
     }
 
     pub fn worker(&self) -> Arc<DuckDbWorkerClient> {
         self.worker.clone()
+    }
+
+    async fn prepare_read(&self) -> Result<(), String> {
+        if self.cache_refresh_required()? {
+            self.refresh_cache_if_stale().await
+        } else if self.source.refresh_before_query() {
+            self.refresh_cache_if_stale().await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn list_databases(&self) -> Result<Vec<db::DatabaseInfo>, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.list_databases().await
+    }
+
+    pub async fn list_schemas(&self, database: String) -> Result<Vec<String>, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.list_schemas(database).await
+    }
+
+    pub async fn list_tables(&self, database: String, schema: String) -> Result<Vec<db::TableInfo>, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.list_tables(database, schema).await
+    }
+
+    pub async fn list_columns(
+        &self,
+        database: String,
+        schema: String,
+        table: String,
+    ) -> Result<Vec<db::ColumnInfo>, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.list_columns(database, schema, table).await
+    }
+
+    pub async fn get_table_ddl(&self, database: String, schema: String, table: String) -> Result<String, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.get_table_ddl(database, schema, table).await
+    }
+
+    pub async fn completion_assistant(
+        &self,
+        request: db::CompletionAssistantRequest,
+    ) -> Result<db::CompletionAssistantResponse, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.completion_assistant(request).await
+    }
+
+    pub async fn get_object_source(
+        &self,
+        database: String,
+        schema: String,
+        name: String,
+        object_type: db::ObjectSourceKind,
+    ) -> Result<String, String> {
+        self.prepare_read().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        self.worker.get_object_source(database, schema, name, object_type).await
+    }
+
+    fn cache_refresh_required(&self) -> Result<bool, String> {
+        Ok(matches!(
+            &*self.cache_state.lock().map_err(|error| error.to_string())?,
+            CacheState::Loading | CacheState::Error(_)
+        ))
+    }
+
+    async fn refresh_after_write(&self) {
+        // The remote mutation has already committed. Preserve its successful
+        // result even if cache reload fails so callers do not retry an append
+        // and create duplicates. The Error state forces the next query to
+        // retry the refresh before reading from the cache.
+        let _ = self.refresh_cache().await;
     }
 
     pub async fn append_rows(
@@ -104,7 +186,7 @@ impl ExternalPool {
     ) -> Result<ExternalWriteResult, String> {
         let table_ref = self.resolve_table_ref(table_name)?;
         let result = self.source.append_rows(&table_ref, rows).await?;
-        self.refresh_cache().await?;
+        self.refresh_after_write().await;
         Ok(result)
     }
 
@@ -115,14 +197,14 @@ impl ExternalPool {
     ) -> Result<ExternalWriteResult, String> {
         let table_ref = self.resolve_table_ref(table_name)?;
         let result = self.source.update_rows(&table_ref, updates).await?;
-        self.refresh_cache().await?;
+        self.refresh_after_write().await;
         Ok(result)
     }
 
     pub async fn delete_rows(&self, table_name: &str, row_ids: Vec<String>) -> Result<ExternalWriteResult, String> {
         let table_ref = self.resolve_table_ref(table_name)?;
         let result = self.source.delete_rows(&table_ref, row_ids).await?;
-        self.refresh_cache().await?;
+        self.refresh_after_write().await;
         Ok(result)
     }
 
@@ -134,7 +216,7 @@ impl ExternalPool {
     ) -> Result<ExternalWriteResult, String> {
         let table_ref = self.resolve_table_ref(table_name)?;
         let result = self.source.write_range(&table_ref, range, rows).await?;
-        self.refresh_cache().await?;
+        self.refresh_after_write().await;
         Ok(result)
     }
 
