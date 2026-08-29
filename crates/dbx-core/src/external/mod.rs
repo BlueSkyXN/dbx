@@ -1,5 +1,9 @@
 pub mod config;
 pub mod csv;
+mod factory;
+mod feishu;
+pub mod feishu_base;
+pub mod feishu_sheets;
 mod file_support;
 pub mod registry;
 pub mod traits;
@@ -8,6 +12,9 @@ pub mod xlsx;
 
 pub use config::*;
 pub use csv::CsvAdapter;
+pub use factory::adapter_from_connection;
+pub use feishu_base::FeishuBaseAdapter;
+pub use feishu_sheets::FeishuSheetsAdapter;
 pub use registry::ExternalTableRegistry;
 pub use traits::ExternalTableAdapter;
 pub use types::*;

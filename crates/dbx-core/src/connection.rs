@@ -1889,6 +1889,7 @@ impl AppState {
         self.running_queries.cancel_all();
         let removed_pools = self.drain_all_connection_pools().await;
         self.transaction_sessions.write().await.clear();
+        self.external_tables.clear().await;
 
         let shutdown = async {
             let routing = self.pool_routing_control();

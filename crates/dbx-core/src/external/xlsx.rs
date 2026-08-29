@@ -625,7 +625,7 @@ fn apply_xlsx_changes(
         }
     }
 
-    let operation_results = results
+    let mut operation_results = results
         .into_iter()
         .enumerate()
         .map(|(index, result)| {
@@ -674,14 +674,31 @@ fn apply_xlsx_changes(
         });
     }
     replace_staged_file(&staged_path, path)?;
-    let new_snapshot = file_sha256(path)?;
-    let _readback = read_sheet_document(path, sheet_name, config)?;
+    let new_snapshot = match file_sha256(path) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            annotate_xlsx_applied(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
+            None
+        }
+    };
+    if let Err(error) = read_sheet_document(path, sheet_name, config) {
+        annotate_xlsx_applied(&mut operation_results, &format!("saved, but worksheet readback failed: {error}"));
+    }
     Ok(ApplyChangesResult {
         operation_results,
-        new_snapshot_token: Some(new_snapshot),
+        new_snapshot_token: new_snapshot,
         reload_required: true,
         save_blocked: false,
     })
+}
+
+fn annotate_xlsx_applied(results: &mut [OperationResult], message: &str) {
+    for result in results.iter_mut().filter(|result| result.outcome == OperationOutcome::Applied) {
+        result.message = Some(match result.message.take() {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message.to_string(),
+        });
+    }
 }
 
 fn validate_xlsx_value(value: &Value) -> Result<(), ExternalTableError> {

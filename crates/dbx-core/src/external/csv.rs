@@ -445,13 +445,35 @@ fn apply_csv_changes(
 
     let staged_path = staged.into_temp_path();
     replace_staged_file(&staged_path, path)?;
-    let new_snapshot = file_sha256(path)?;
+    let new_snapshot = match file_sha256(path) {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            annotate_csv_applied(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
+            None
+        }
+    };
+    match read_document(path, config) {
+        Ok(readback) if readback.raw_headers == document.raw_headers && readback.rows == document.rows => {}
+        Ok(_) => annotate_csv_applied(&mut operation_results, "saved, but content readback differs; reload required"),
+        Err(error) => {
+            annotate_csv_applied(&mut operation_results, &format!("saved, but content readback failed: {error}"));
+        }
+    }
     Ok(ApplyChangesResult {
         operation_results,
-        new_snapshot_token: Some(new_snapshot),
+        new_snapshot_token: new_snapshot,
         reload_required: true,
         save_blocked: false,
     })
+}
+
+fn annotate_csv_applied(results: &mut [OperationResult], message: &str) {
+    for result in results.iter_mut().filter(|result| result.outcome == OperationOutcome::Applied) {
+        result.message = Some(match result.message.take() {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message.to_string(),
+        });
+    }
 }
 
 fn write_document(document: &CsvDocument, config: &CsvExternalConfig) -> Result<Vec<u8>, ExternalTableError> {
