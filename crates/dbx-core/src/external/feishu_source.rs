@@ -96,11 +96,11 @@ impl FeishuClient {
         let status = response.status();
         let text = response.text().await.map_err(|e| format!("Feishu token response read failed: {e}"))?;
         if !status.is_success() {
-            return Err(format!("Feishu token request failed with HTTP {status}: {text}"));
+            return Err(format!("Feishu token request failed with HTTP {status}"));
         }
 
         let parsed: TenantTokenResponse =
-            serde_json::from_str(&text).map_err(|e| format!("Invalid Feishu token response: {e}; body={text}"))?;
+            serde_json::from_str(&text).map_err(|e| format!("Invalid Feishu token response: {e}"))?;
         if parsed.code != 0 {
             return Err(format!(
                 "Feishu token request failed: code={} msg={}",
@@ -170,11 +170,10 @@ impl FeishuClient {
         let status = response.status();
         let text = response.text().await.map_err(|e| format!("Feishu response read failed: {e}"))?;
         if !status.is_success() {
-            return Err(format!("Feishu request failed with HTTP {status}: {text}"));
+            return Err(format!("Feishu request failed with HTTP {status}"));
         }
 
-        let envelope: Envelope<T> =
-            serde_json::from_str(&text).map_err(|e| format!("Invalid Feishu response: {e}; body={text}"))?;
+        let envelope: Envelope<T> = serde_json::from_str(&text).map_err(|e| format!("Invalid Feishu response: {e}"))?;
         if envelope.code != 0 {
             return Err(format!("Feishu API error: code={} msg={}", envelope.code, envelope.msg.unwrap_or_default()));
         }
@@ -926,6 +925,9 @@ fn bitable_record_id_column_name(fields: &[BitableField]) -> String {
 }
 
 fn remove_bitable_internal_update_fields(fields: &[BitableField], update_fields: &mut Map<String, Value>) {
+    let allowed_fields = fields.iter().map(|field| field.field_name.as_str()).collect::<std::collections::HashSet<_>>();
+    update_fields.retain(|field_name, _| allowed_fields.contains(field_name.as_str()));
+
     let record_id_column = bitable_record_id_column_name(fields);
     update_fields.remove(&record_id_column);
 
@@ -1131,6 +1133,81 @@ fn collapse_raw_responses(mut responses: Vec<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_http_response(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn token_http_errors_do_not_expose_response_body() {
+        let sensitive_body = r#"{"tenant_access_token":"sensitive-token"}"#;
+        let (base_url, server) = serve_http_response("401 Unauthorized", sensitive_body).await;
+        let client = FeishuClient::new(&base_url, "app-id", "app-secret", None);
+
+        let error = client.bearer_token().await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("HTTP 401 Unauthorized"));
+        assert!(!error.contains("sensitive-token"));
+        assert!(!error.contains(sensitive_body));
+    }
+
+    #[tokio::test]
+    async fn invalid_token_json_does_not_expose_response_body() {
+        let sensitive_body = r#"{"tenant_access_token":"sensitive-token""#;
+        let (base_url, server) = serve_http_response("200 OK", sensitive_body).await;
+        let client = FeishuClient::new(&base_url, "app-id", "app-secret", None);
+
+        let error = client.bearer_token().await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("Invalid Feishu token response"));
+        assert!(!error.contains("sensitive-token"));
+        assert!(!error.contains(sensitive_body));
+    }
+
+    #[tokio::test]
+    async fn api_http_errors_do_not_expose_response_body() {
+        let sensitive_body = r#"{"customer_data":"sensitive-cell-value"}"#;
+        let (base_url, server) = serve_http_response("500 Internal Server Error", sensitive_body).await;
+        let client = FeishuClient::new(&base_url, "", "", Some("test-access-token".to_string()));
+
+        let error = client.get_data::<Value>("/probe", &[]).await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("HTTP 500 Internal Server Error"));
+        assert!(!error.contains("sensitive-cell-value"));
+        assert!(!error.contains(sensitive_body));
+    }
+
+    #[tokio::test]
+    async fn invalid_api_json_does_not_expose_response_body() {
+        let sensitive_body = r#"{"customer_data":"sensitive-cell-value""#;
+        let (base_url, server) = serve_http_response("200 OK", sensitive_body).await;
+        let client = FeishuClient::new(&base_url, "", "", Some("test-access-token".to_string()));
+
+        let error = client.get_data::<Value>("/probe", &[]).await.unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("Invalid Feishu response"));
+        assert!(!error.contains("sensitive-cell-value"));
+        assert!(!error.contains(sensitive_body));
+    }
 
     #[test]
     fn builds_spreadsheet_column_labels() {
@@ -1246,12 +1323,14 @@ mod tests {
             ("__dbx_record_id__".to_string(), Value::String("rec_internal".to_string())),
             ("_record_id".to_string(), Value::String("legacy_internal".to_string())),
             ("Name".to_string(), Value::String("Ada".to_string())),
+            ("Hidden".to_string(), Value::String("not-selected".to_string())),
         ]);
 
         remove_bitable_internal_update_fields(&fields, &mut update_fields);
 
         assert!(!update_fields.contains_key("__dbx_record_id__"));
         assert!(!update_fields.contains_key("_record_id"));
+        assert!(!update_fields.contains_key("Hidden"));
         assert_eq!(update_fields.get("Name"), Some(&Value::String("Ada".to_string())));
     }
 }

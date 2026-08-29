@@ -2765,12 +2765,8 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
     persist_mq_auth_secrets_in_tx(tx, &config)?;
     persist_mq_token_signing_secret_in_tx(tx, &config)?;
     persist_nacos_auth_secrets_in_tx(tx, &config)?;
-    persist_secret_in_tx(
-        tx,
-        &config.id,
-        FEISHU_ACCESS_TOKEN_KEY,
-        feishu_access_token(&config).as_deref().unwrap_or_default(),
-    )
+    let feishu_token = if config.save_password { feishu_access_token(&config) } else { None };
+    persist_secret_in_tx(tx, &config.id, FEISHU_ACCESS_TOKEN_KEY, feishu_token.as_deref().unwrap_or_default())
 }
 
 fn insert_connection_copy_next_to_source(entries: &mut Vec<serde_json::Value>, source_id: &str, copy_id: &str) -> bool {
@@ -2895,6 +2891,7 @@ impl Storage {
                     // make a no-save connection silently authenticate without prompting.
                     persist_secret_in_tx(&tx, &config.id, "password", "")?;
                     delete_secret_prefix_in_tx(&tx, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
+                    persist_secret_in_tx(&tx, &config.id, FEISHU_ACCESS_TOKEN_KEY, "")?;
                 }
                 let mut sanitized = config;
                 sanitized.password = String::new();
@@ -3227,14 +3224,19 @@ impl Storage {
             config.init_script = self.get_secret(&id, "init_script").await?;
             let stored_feishu_token = self.get_secret(&id, FEISHU_ACCESS_TOKEN_KEY).await?;
             let mut needs_feishu_secret_rewrite = legacy_feishu_token.is_some();
-            match (stored_feishu_token, legacy_feishu_token) {
-                (Some(token), _) => set_feishu_access_token(&mut config, token),
-                (None, Some(token)) => {
-                    self.set_secret(&id, FEISHU_ACCESS_TOKEN_KEY, &token).await?;
-                    set_feishu_access_token(&mut config, token);
-                    needs_feishu_secret_rewrite = true;
+            if !config.save_password {
+                self.delete_secret(&id, FEISHU_ACCESS_TOKEN_KEY).await?;
+                scrub_feishu_access_token(&mut config);
+            } else {
+                match (stored_feishu_token, legacy_feishu_token) {
+                    (Some(token), _) => set_feishu_access_token(&mut config, token),
+                    (None, Some(token)) => {
+                        self.set_secret(&id, FEISHU_ACCESS_TOKEN_KEY, &token).await?;
+                        set_feishu_access_token(&mut config, token);
+                        needs_feishu_secret_rewrite = true;
+                    }
+                    (None, None) => {}
                 }
-                (None, None) => {}
             }
             let needs_mq_auth_rewrite = self.hydrate_mq_auth_secrets(&id, &mut config).await?;
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
@@ -4736,8 +4738,8 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
-        McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,
+        feishu_access_token, maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings,
+        McpGlobalPolicy, McpGlobalPolicyState, Storage, KEEP_TERMINAL_AI_RUNS_PER_CONVERSATION, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::ai::{
         AiActiveModelSelection, AiAssistantMode, AiChatMessage, AiChatSelectionState, AiConversation,
@@ -5791,6 +5793,42 @@ mod tests {
         let loaded = storage.load_connections().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(feishu_access_token(&loaded[0]).as_deref(), Some("tenant-token"));
+    }
+
+    #[tokio::test]
+    async fn disabling_password_saving_removes_feishu_access_token_from_secret_table() {
+        let path = temp_db_path("feishu-token-no-save");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = feishu_connection("feishu", "tenant-token");
+
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+        assert!(storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap().is_some());
+
+        config.save_password = false;
+        storage.save_connections(&[config]).await.unwrap();
+
+        assert_eq!(storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap(), None);
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(feishu_access_token(&loaded[0]), None);
+        assert!(!raw_connection_json(&storage, "feishu").await.contains("tenant-token"));
+    }
+
+    #[tokio::test]
+    async fn load_connections_cleans_no_save_feishu_tokens_from_legacy_json_and_secret_table() {
+        let path = temp_db_path("feishu-token-no-save-legacy-cleanup");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = feishu_connection("feishu", "legacy-token");
+        config.save_password = false;
+        insert_raw_connection(&storage, &config).await;
+        storage.set_secret("feishu", FEISHU_ACCESS_TOKEN_KEY, "stored-token").await.unwrap();
+
+        let loaded = storage.load_connections().await.unwrap();
+
+        assert_eq!(feishu_access_token(&loaded[0]), None);
+        assert_eq!(storage.get_secret("feishu", FEISHU_ACCESS_TOKEN_KEY).await.unwrap(), None);
+        let raw_json = raw_connection_json(&storage, "feishu").await;
+        assert!(!raw_json.contains("legacy-token"));
+        assert!(!raw_json.contains("stored-token"));
     }
 
     #[tokio::test]

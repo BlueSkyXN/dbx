@@ -22,11 +22,22 @@ Protocol compatibility covers only connection and selected dialect behavior. Ver
 
 ### File, Edge, and Hosted Databases
 
-- SQLite, DuckDB, and Microsoft Access
+- SQLite, DuckDB, Microsoft Access, CSV/TSV files, and Excel workbooks
 - Cloudflare D1, Turso, and RQLite
 - H2 and local databases reached through JDBC URLs
 
 Desktop file paths belong to the local computer. Docker/Web paths belong to the server container or mounted host storage; a path on the browser computer is not mapped automatically.
+
+### External Tabular Sources
+
+CSV/TSV files, Excel workbooks, Feishu Sheets, and Feishu Bitable are loaded into an isolated in-memory DuckDB cache. This provides SQL query and metadata browsing without allowing SQL to modify the source directly.
+
+- CSV/TSV and Excel connections are read-only snapshots. Use **Refresh External Snapshot** from the connection menu after the file changes.
+- Feishu connections accept either an access token or an App ID and App Secret. **Save Feishu credentials** controls both access-token and App Secret persistence; disabled credentials remain only in the current Desktop process or authenticated Web session.
+- Feishu `snapshot` mode refreshes on connect and on explicit refresh. `realtime` mode refreshes before reads with a five-second minimum interval.
+- Feishu Bitable table-data tabs can append, update, and delete records using the record ID returned by Feishu. Query-result grids and Feishu Sheets snapshots remain read-only.
+
+Read-only connection protection is enforced by the shared backend for external writes. Production-marked connections still require the same UI confirmation used by other data-grid edits.
 
 ### Specialized Data Models and Services
 

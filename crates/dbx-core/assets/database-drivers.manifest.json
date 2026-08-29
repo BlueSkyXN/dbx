@@ -282,6 +282,7 @@
       "singleConnectionPool": true,
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
+      "localFile": true,
       "supportLevel": "operate",
       "capabilities": {
         "queryExecution": true,
@@ -310,6 +311,7 @@
       "singleConnectionPool": true,
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
+      "localFile": true,
       "supportLevel": "operate",
       "capabilities": {
         "queryExecution": true,

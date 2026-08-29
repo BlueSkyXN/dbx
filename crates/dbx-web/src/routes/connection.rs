@@ -7,6 +7,7 @@ use axum::Json;
 use dbx_core::connection::{
     connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, AppState, PoolKind,
 };
+use dbx_core::connection_secrets::{take_transient_feishu_access_token, FEISHU_ACCESS_TOKEN_KEY};
 use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType};
 use dbx_core::nacos::config::{
     take_transient_passwords, NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD,
@@ -28,6 +29,7 @@ const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
 struct NoSaveRuntimeSecrets {
     primary: Option<String>,
     console: Option<String>,
+    feishu_access_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -40,12 +42,19 @@ fn prepare_runtime_config(mut config: ConnectionConfig) -> (ConnectionConfig, No
     if config.save_password {
         return (config, NoSaveRuntimeSecrets::default());
     }
+    let feishu_access_token = take_transient_feishu_access_token(&mut config);
     if config.db_type == DatabaseType::Nacos {
         let passwords = take_transient_passwords(&mut config);
-        return (config, NoSaveRuntimeSecrets { primary: passwords.primary, console: passwords.console });
+        return (
+            config,
+            NoSaveRuntimeSecrets { primary: passwords.primary, console: passwords.console, feishu_access_token },
+        );
     }
     let primary = std::mem::take(&mut config.password);
-    (config, NoSaveRuntimeSecrets { primary: (!primary.is_empty()).then_some(primary), console: None })
+    (
+        config,
+        NoSaveRuntimeSecrets { primary: (!primary.is_empty()).then_some(primary), console: None, feishu_access_token },
+    )
 }
 
 fn record_session_credentials(
@@ -80,7 +89,17 @@ fn record_session_credentials(
             purposes.push(token);
         }
     }
+    if let Some(token) = secrets.feishu_access_token.as_deref().and_then(|token| {
+        app.session_credentials.set_for_purpose_with_token(owner, connection_id, FEISHU_ACCESS_TOKEN_KEY, token)
+    }) {
+        purposes.push(token);
+    }
     SessionCredentialWrites { primary, purposes }
+}
+
+fn has_session_credential(app: &AppState, owner: &str, connection_id: &str) -> bool {
+    app.session_credentials.has(owner, connection_id)
+        || app.session_credentials.get_for_purpose(owner, connection_id, FEISHU_ACCESS_TOKEN_KEY).is_some()
 }
 
 fn rollback_session_credential_writes(app: &AppState, writes: &SessionCredentialWrites) {
@@ -152,6 +171,45 @@ pub struct UnlockConnectionWritesRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WriteUnlockStateResponse {
     pub remaining_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshExternalRequest {
+    pub connection_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub updates: Vec<dbx_core::external::ExternalRowUpdate>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteExternalRowsRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub row_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteExternalRangeRequest {
+    pub connection_id: String,
+    pub table_name: String,
+    pub range: String,
+    pub rows: Vec<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -564,7 +622,7 @@ pub async fn session_credential_status(
     Json(body): Json<SessionCredentialStatusRequest>,
 ) -> Result<Json<bool>, AppError> {
     let owner = session_token_from_headers(&headers).unwrap_or_default();
-    Ok(Json(state.app.session_credentials.has(&owner, &body.connection_id)))
+    Ok(Json(has_session_credential(&state.app, &owner, &body.connection_id)))
 }
 
 /// "断开并忘记本次密码"：清除连接本次运行期的临时密码，下次连接需重新输入。
@@ -575,7 +633,7 @@ pub async fn forget_session_credential(
     Json(body): Json<SessionCredentialStatusRequest>,
 ) -> Result<Json<()>, AppError> {
     let owner = session_token_from_headers(&headers).unwrap_or_default();
-    if !state.app.session_credentials.has(&owner, &body.connection_id) {
+    if !has_session_credential(&state.app, &owner, &body.connection_id) {
         return Err(AppError::from(format!(
             "Connection has no transient session credential to forget: {}",
             body.connection_id
@@ -1545,6 +1603,66 @@ mod tests {
             let mut db_config = dbx_core::connection::metadata_connection_config(&stored);
             state.app.apply_session_credential(&stored, &mut db_config, "conn-a");
             assert_eq!(db_config.password, "");
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn save_connections_scopes_no_save_feishu_token_by_session() {
+        let (state, dir) = test_web_state().await;
+        let mut config = sqlite_config("feishu-a", "");
+        config.name = "Feishu Sheets".to_string();
+        config.db_type = DatabaseType::FeishuSheets;
+        config.host = "https://open.feishu.cn".to_string();
+        config.save_password = false;
+        config.external_config = Some(serde_json::json!({
+            "access_token": "tenant-token",
+            "spreadsheet_token": "shtcn_test"
+        }));
+
+        save_connections(
+            State(state.clone()),
+            cookie_headers("token-a"),
+            Json(SaveConnectionsRequest { configs: vec![config] }),
+        )
+        .await
+        .unwrap();
+
+        let stored = state.app.configs.read().await.get("feishu-a").cloned().unwrap();
+        assert_eq!(dbx_core::connection_secrets::feishu_access_token(&stored), None);
+        assert_eq!(
+            state
+                .app
+                .session_credentials
+                .get_for_purpose("token-a", "feishu-a", dbx_core::connection_secrets::FEISHU_ACCESS_TOKEN_KEY)
+                .as_deref(),
+            Some("tenant-token")
+        );
+        assert_eq!(
+            state.app.session_credentials.get_for_purpose(
+                "token-b",
+                "feishu-a",
+                dbx_core::connection_secrets::FEISHU_ACCESS_TOKEN_KEY,
+            ),
+            None
+        );
+        assert_eq!(
+            dbx_core::connection_secrets::feishu_access_token(&state.app.storage.load_connections().await.unwrap()[0]),
+            None
+        );
+
+        dbx_core::session_credentials::with_credential_owner(Some("token-a".to_string()), async {
+            let mut db_config = dbx_core::connection::metadata_connection_config(&stored);
+            state.app.apply_session_credential(&stored, &mut db_config, "feishu-a");
+            assert_eq!(dbx_core::connection_secrets::feishu_access_token(&db_config).as_deref(), Some("tenant-token"));
+        })
+        .await;
+        dbx_core::session_credentials::with_credential_owner(Some("token-b".to_string()), async {
+            let mut db_config = dbx_core::connection::metadata_connection_config(&stored);
+            state.app.apply_session_credential(&stored, &mut db_config, "feishu-a");
+            assert_eq!(dbx_core::connection_secrets::feishu_access_token(&db_config), None);
         })
         .await;
 

@@ -369,6 +369,8 @@ const externalTableSaveHandler = computed<CustomSaveHandler | undefined>(() => {
   }
 
   return {
+    supportsInsert: true,
+    canDelete: true,
     async save(changes) {
       if (!connectionId || !tableMeta) throw new Error("Missing Feishu Bitable table context");
       const recordIdIndex = changes.columns.indexOf(recordIdColumn);

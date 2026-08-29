@@ -111,7 +111,7 @@ function validateDescriptor(descriptor, file, knownDialects) {
   validateKnownKeys(descriptor, descriptorKeys, location);
   if (descriptor.schemaVersion !== 1) throw new Error(`${location}: schemaVersion must be 1`);
   if (!Number.isInteger(descriptor.order) || descriptor.order <= 0) throw new Error(`${location}: order must be a positive integer`);
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(descriptor.dbType ?? "")) throw new Error(`${location}: invalid dbType`);
+  if (!/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/.test(descriptor.dbType ?? "")) throw new Error(`${location}: invalid dbType`);
   if (!/^[A-Z][A-Za-z0-9]*$/.test(descriptor.rustVariant ?? "")) throw new Error(`${location}: invalid rustVariant`);
   if (typeof descriptor.label !== "string" || descriptor.label.trim() === "") throw new Error(`${location}: label is required`);
   if (!runtimeModes.has(descriptor.runtimeMode)) throw new Error(`${location}: invalid runtimeMode`);

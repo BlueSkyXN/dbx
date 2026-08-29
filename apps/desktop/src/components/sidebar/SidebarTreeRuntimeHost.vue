@@ -612,6 +612,10 @@ function currentDatabaseType(): DatabaseType | undefined {
   return activeNode.value.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(activeNode.value.connectionId)) : undefined;
 }
 
+function isExternalTabularDatabaseType(dbType: DatabaseType | undefined): boolean {
+  return dbType === "csvfile" || dbType === "xlsxfile" || dbType === "feishu_sheets" || dbType === "feishu_bitable";
+}
+
 function currentTableStructureDatabaseType(): DatabaseType | undefined {
   return activeNode.value.connectionId ? tableStructureDatabaseTypeForConnection(connectionStore.getConfig(activeNode.value.connectionId)) : undefined;
 }
@@ -1905,10 +1909,19 @@ async function openDdl() {
 
 async function refresh() {
   const node = activeNode.value;
+  const refreshesExternalSnapshot = node.type === "connection" && !!node.connectionId && isExternalTabularDatabaseType(currentDatabaseType());
   try {
+    if (refreshesExternalSnapshot) {
+      await connectionStore.ensureConnected(node.connectionId!);
+      await api.refreshExternalConnection(node.connectionId!);
+    }
     await connectionStore.refreshTreeNode(node);
+    if (refreshesExternalSnapshot) {
+      toast(t("contextMenu.refreshExternalSnapshotSuccess"), 3000);
+    }
   } catch (e: any) {
-    toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+    const message = translateBackendError(t, e);
+    toast(refreshesExternalSnapshot ? t("contextMenu.refreshExternalSnapshotFailed", { message }) : t("connection.connectFailed", { message }), 5000);
     openDriverStoreForInstallError(e?.message || String(e), node);
   }
 }
@@ -4929,7 +4942,7 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
       items.push({ label: t("connectionGroup.moveToNewGroup"), action: moveToNewGroup, icon: FolderPlus });
     }
     items.push({
-      label: t("contextMenu.refreshChildren"),
+      label: t(isExternalTabularDatabaseType(currentDatabaseType()) ? "contextMenu.refreshExternalSnapshot" : "contextMenu.refreshChildren"),
       action: refresh,
       icon: RefreshCw,
       shortcut: shortcutRefresh,
