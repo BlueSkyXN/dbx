@@ -2226,9 +2226,10 @@ mod tests {
     ) -> Result<Vec<TableExportProgress>, String> {
         let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = progress.clone();
-        let result = export_table_data_core(&fixture.state, &fixture.request, move |event| {
+        // Keep the large export future off libtest's default thread stack.
+        let result = Box::pin(export_table_data_core(&fixture.state, &fixture.request, move |event| {
             captured.lock().unwrap().push(event);
-        })
+        }))
         .await;
         let events = progress.lock().unwrap().clone();
         result.map(|_| events)
