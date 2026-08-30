@@ -63,12 +63,12 @@ const gridResult = computed<QueryResult>(() => ({
   has_more: !!page.value?.nextCursor,
 }));
 
-const editable = computed(() => !!schema.value?.writable && page.value?.readState === "complete" && schema.value.capabilities.canUpdate && !saveBlocked.value);
+const editable = computed(() => !!schema.value?.writable && page.value?.readState === "complete" && page.value.columns.some((column) => column.writable) && schema.value.capabilities.canUpdate && !saveBlocked.value);
 const canInsert = computed(() => schema.value?.capabilities.insertMode === "append");
 const canDelete = computed(() => schema.value?.capabilities.deleteMode !== "unsupported");
 
 function isCellReadonly(sourceRowIndex: number, columnIndex: number) {
-  const column = schema.value?.columns[columnIndex];
+  const column = page.value?.columns[columnIndex] ?? schema.value?.columns[columnIndex];
   const row = page.value?.rows[sourceRowIndex];
   if (!column || !row || !column.writable) return true;
   return (row.readonlyColumnKeys ?? []).includes(column.columnKey);
@@ -98,7 +98,7 @@ const customSaveHandler = computed<CustomSaveHandler | undefined>(() => {
     canDelete: canDelete.value,
     targetLabel: page.value.table.displayName,
     confirmDiscardPending: () => window.confirm(t("externalTable.discardPendingConfirm")),
-    readonlyColumns: schema.value.columns.filter((column) => !column.writable).map((column) => column.displayName),
+    readonlyColumns: page.value.columns.filter((column) => !column.writable).map((column) => column.displayName),
     preview: async (changes) => externalSavePreview(buildExternalSavePlan(changes, page.value!, schema.value!), schema.value!.capabilities.deleteMode),
     save: async (changes) => {
       const currentPage = page.value;
@@ -127,7 +127,7 @@ const customSaveHandler = computed<CustomSaveHandler | undefined>(() => {
         const row = currentPage.rows[sourceRowIndex];
         if (!row) continue;
         for (const [columnIndex, value] of changes) {
-          const column = currentSchema.columns[columnIndex];
+          const column = currentPage.columns[columnIndex] ?? currentSchema.columns[columnIndex];
           if (column) row.values[columnIndex] = gridValueForExternal(value, column);
         }
       }

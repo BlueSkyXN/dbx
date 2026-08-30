@@ -241,6 +241,7 @@ fn stable_xlsx_copy(path: &Path) -> Result<(tempfile::TempPath, String), Externa
             .prefix(".dbx-read-")
             .suffix(".xlsx")
             .tempfile_in(parent)
+            .or_else(|_| tempfile::Builder::new().prefix("dbx-read-").suffix(".xlsx").tempfile())
             .map_err(|error| ExternalTableError::io(format!("Failed to stage XLSX snapshot: {error}")))?;
         let staged_path = staged.into_temp_path();
         std::fs::copy(path, &staged_path)
@@ -1155,5 +1156,29 @@ mod tests {
 
         assert!(page.rows.is_empty());
         assert!(page.next_cursor.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xlsx_read_snapshot_falls_back_when_the_source_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-source.xlsx");
+        create_round_trip_fixture(&path);
+        let original_mode = std::fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let direct_temp = tempfile::Builder::new().suffix(".xlsx").tempfile_in(directory.path());
+        if direct_temp.is_ok() {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(original_mode)).unwrap();
+            return;
+        }
+        let snapshot = stable_xlsx_copy(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(original_mode)).unwrap();
+
+        let (snapshot_path, hash) = snapshot.unwrap();
+        assert_eq!(hash, file_sha256(&path).unwrap());
+        assert_eq!(hash, file_sha256(&snapshot_path).unwrap());
     }
 }

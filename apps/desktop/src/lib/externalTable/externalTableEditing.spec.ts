@@ -69,6 +69,34 @@ describe("externalTableEditing", () => {
     ]);
   });
 
+  it("uses page-owned column metadata when describe metadata is stale", () => {
+    const staleSchema: ExternalTableSchema = {
+      ...schema,
+      columns: schema.columns.map((column, index) => (index === 1 ? { ...column, valueType: "string", writable: true } : column)),
+    };
+    const currentPage: PageSnapshot = {
+      ...page,
+      columns: page.columns.map((column, index) => (index === 0 ? { ...column, writable: false } : { ...column, valueType: "json" })),
+    };
+
+    const plan = buildExternalSavePlan(
+      {
+        dirtyRows: new Map([[0, new Map([[1, '["Open","Blocked"]']])]]),
+        newRows: [["Ignored", '["Open"]']],
+        newRowMeta: [{ token: 99, placement: null }],
+        deletedRows: new Set(),
+      },
+      currentPage,
+      staleSchema,
+    );
+
+    expect(plan.operations[0]).toMatchObject({ newValue: ["Open", "Blocked"] });
+    expect(plan.operations[1]).toMatchObject({
+      kind: "insert",
+      values: [{ columnKey: "field:tags", value: ["Open"] }],
+    });
+  });
+
   it("maps only applied operations back to DataGrid pending identities", () => {
     const plan = buildExternalSavePlan(
       {
