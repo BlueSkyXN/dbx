@@ -798,6 +798,29 @@ fn copy_u64(
     target.insert(to.to_string(), Value::Number(value.into()));
 }
 
+fn canonical_external_table_config(db_type: DatabaseType, value: Option<&Value>) -> Option<Value> {
+    if value.is_none() {
+        return None;
+    }
+    let keys: &[&str] = match db_type {
+        DatabaseType::Csv => &["delimiter", "hasHeader", "encoding"],
+        DatabaseType::Xlsx => &["hasHeader", "dataRange"],
+        DatabaseType::FeishuSheets => &["spreadsheetToken", "sheetId", "dataRange", "hasHeader"],
+        DatabaseType::FeishuBase => &["baseToken", "tableId", "viewId"],
+        _ => return value.cloned(),
+    };
+    let source = value.and_then(Value::as_object);
+    let mut canonical = serde_json::Map::new();
+    if let Some(source) = source {
+        for key in keys {
+            if let Some(value) = source.get(*key) {
+                canonical.insert((*key).to_string(), value.clone());
+            }
+        }
+    }
+    Some(Value::Object(canonical))
+}
+
 impl ConnectionConfig {
     pub fn effective_transport_layers(&self) -> Vec<TransportLayerConfig> {
         self.transport_layers.iter().filter(|layer| layer.enabled()).cloned().collect()
@@ -947,6 +970,7 @@ impl ConnectionConfig {
                 config.driver_label = Some("TDengine".to_string());
             }
         }
+        config.external_config = canonical_external_table_config(config.db_type, config.external_config.as_ref());
         config
     }
 
@@ -3392,6 +3416,33 @@ mod tests {
         assert_eq!(canonical.driver_label.as_deref(), Some("SQL Server legacy compatibility component"));
         assert_eq!(canonical.url_params.as_deref(), Some("applicationName={DBX; Client};password=50%;encrypt=false"));
         assert_eq!(without_sqlserver_legacy_compatibility_param(Some("sqlserverEncryption=disabled")), None);
+    }
+
+    #[test]
+    fn external_table_config_canonicalization_drops_unknown_and_secret_fields() {
+        let mut config = mysql_config("app-id", "app-secret", None);
+        config.db_type = DatabaseType::FeishuSheets;
+        config.external_config = Some(serde_json::json!({
+            "spreadsheetToken": "sheet-token",
+            "sheetId": "sheet-id",
+            "dataRange": "A1:C20",
+            "hasHeader": true,
+            "appSecret": "must-not-persist",
+            "accessToken": "must-not-persist",
+            "unexpected": "drop-me"
+        }));
+
+        let canonical = config.canonicalized();
+
+        assert_eq!(
+            canonical.external_config,
+            Some(serde_json::json!({
+                "spreadsheetToken": "sheet-token",
+                "sheetId": "sheet-id",
+                "dataRange": "A1:C20",
+                "hasHeader": true
+            }))
+        );
     }
 
     #[test]
