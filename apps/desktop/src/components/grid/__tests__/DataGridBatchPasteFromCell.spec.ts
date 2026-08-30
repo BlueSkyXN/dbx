@@ -57,7 +57,7 @@ function defaultResult(): QueryResult {
   };
 }
 
-function mountGrid(options: { result?: QueryResult; quickEntry?: boolean; hideNullColumns?: boolean; readonlyColumnIndexes?: number[] } = {}) {
+function mountGrid(options: { result?: QueryResult; quickEntry?: boolean; hideNullColumns?: boolean; readonlyColumnIndexes?: number[]; isCellReadonly?: (sourceRowIndex: number, columnIndex: number) => boolean } = {}) {
   const pinia = createPinia();
   setActivePinia(pinia);
   const settingsStore = useSettingsStore();
@@ -80,6 +80,7 @@ function mountGrid(options: { result?: QueryResult; quickEntry?: boolean; hideNu
                 context: "table-data",
                 editable: true,
                 readonlyColumnIndexes: options.readonlyColumnIndexes,
+                isCellReadonly: options.isCellReadonly,
                 tableMeta: {
                   tableName: "paste_target",
                   columns: gridResult.columns.map((name, index) => ({
@@ -302,6 +303,19 @@ describe("DataGrid multi-row paste from a blank cell", () => {
     const rows = pendingRows(host);
     expect(rows).toHaveLength(1);
     expect(visibleCellTexts(rows[0]!)[2]).toBe("NULL");
+  });
+
+  it("does not paste into an existing source cell marked readonly by the adapter", async () => {
+    const isCellReadonly = vi.fn((sourceRowIndex: number, columnIndex: number) => sourceRowIndex === 0 && columnIndex === 2);
+    const { host } = mountGrid({ isCellReadonly });
+    await settle();
+
+    const [row] = displayRows(host);
+    await selectCell(visibleCells(row!)[2]!);
+    await paste(host, "blocked");
+
+    expect(visibleCellTexts(row!)[2]).toBe("seed-2");
+    expect(isCellReadonly).toHaveBeenCalledWith(0, 2);
   });
 
   it("does not append an empty clipboard", async () => {

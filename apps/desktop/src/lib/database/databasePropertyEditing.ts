@@ -63,6 +63,8 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   questdb: { deferred: "single database model in DBX" },
   gbase: { deferred: "schema properties need product-specific handling" },
   access: { deferred: "file-backed database properties are not edited in-place" },
+  csv: { deferred: "CSV options are configured on the connection" },
+  xlsx: { deferred: "XLSX range and header options are configured on the connection" },
   h2: { deferred: "schema properties need product-specific handling" },
   snowflake: { deferred: "database/schema properties need Snowflake-specific options" },
   trino: { deferred: "catalog properties are connector-managed" },
@@ -95,6 +97,8 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   nacos: { deferred: "Nacos namespace editing already uses the Nacos admin flow" },
   consul: { deferred: "Consul KV scopes are configured on the connection" },
   mqtt: { deferred: "MQTT topics are managed via the MQTT console" },
+  "feishu-sheets": { deferred: "worksheet properties are managed by Feishu Sheets" },
+  "feishu-base": { deferred: "Base table properties are managed by Feishu Base" },
 } satisfies Record<DatabaseType, DatabasePropertyEditingEntry>;
 
 function entryFor(connection: PropertyEditConnection): DatabasePropertyEditingEntry | null {

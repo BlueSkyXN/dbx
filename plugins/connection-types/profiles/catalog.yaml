@@ -1,5 +1,33 @@
 schemaVersion: 1
 profiles:
+  - id: csv
+    dbType: csv
+    label: CSV
+    icon: csv
+    port: 0
+    user: ""
+    category: lightweight
+  - id: xlsx
+    dbType: xlsx
+    label: XLSX
+    icon: xlsx
+    port: 0
+    user: ""
+    category: lightweight
+  - id: feishu-sheets
+    dbType: feishu-sheets
+    label: Feishu Sheets
+    icon: feishu-sheets
+    port: 443
+    user: ""
+    category: document
+  - id: feishu-base
+    dbType: feishu-base
+    label: Feishu Base
+    icon: feishu-base
+    port: 443
+    user: ""
+    category: document
   - id: mysql
     dbType: mysql
     label: MySQL

@@ -24,4 +24,12 @@ describe("DataGrid native clipboard regions", () => {
     expect(dataGridSource).toContain("'cursor-text': !isScrolling && !canEditCellItem(item, col.actualColIdx)");
     expect(dataGridSource).toContain("'cursor-text': !isScrolling,");
   });
+
+  it("routes per-cell readonly checks through the common edit gate", () => {
+    const gate = dataGridSource.slice(dataGridSource.indexOf("function canEditCellItem"), dataGridSource.indexOf("function cellUsesExpandedEditor"));
+    expect(gate).toContain("props.isCellReadonly?.(item.sourceIndex, columnIndex)");
+    expect(dataGridSource).toContain("if (!item || !isBooleanGridCell(item, actualColIdx) || !canEditCellItem(item, actualColIdx)) return;");
+    expect(dataGridSource).toContain("if (!canEditCellItem(item, actualColIdx)) {");
+    expect(dataGridSource).toContain("if (!item || !canEditCellItem(item, actualColIndex)) return false;");
+  });
 });

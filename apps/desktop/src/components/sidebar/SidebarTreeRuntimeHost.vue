@@ -176,6 +176,7 @@ import { buildSidebarDdlTemplateSql, sidebarDdlTargetsForExecutionContext } from
 import { sidebarStructureExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseBackup";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isExternalTableDatabaseType } from "@/types/externalTable";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
@@ -678,9 +679,33 @@ async function openDirectNavigationNode(node: TreeNode, requestId: number) {
   }
 }
 
+async function openExternalTableConnection(node: TreeNode, requestId: number) {
+  if (node.type !== "connection" || !node.connectionId) return false;
+  const config = connectionStore.getConfig(node.connectionId);
+  if (!isExternalTableDatabaseType(config?.db_type)) return false;
+  if (!isTauriRuntime()) {
+    toast(t("externalTable.desktopOnly"), 4000);
+    return true;
+  }
+  await connectionStore.ensureConnected(node.connectionId);
+  if (!isCurrentNavigationRequest(requestId)) return true;
+  connectionStore.activeConnectionId = node.connectionId;
+  queryStore.createTab(node.connectionId, "", config.name || node.label, "external-table");
+  return true;
+}
+
 async function toggle(requestId = beginNavigationRequest()) {
   const node = activeNode.value;
   const treeLoadSearchOptions = sidebarTreeContext?.getTreeLoadSearchOptions?.(node);
+  try {
+    if (await openExternalTableConnection(node, requestId)) return;
+  } catch (e: any) {
+    if (!isCurrentNavigationRequest(requestId)) return;
+    const errMsg = e?.message || String(e);
+    if (errMsg.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+    return;
+  }
   if (isDirectNavigationTreeNode(node.type)) {
     try {
       await openDirectNavigationNode(node, requestId);
@@ -1348,6 +1373,10 @@ function requestDeleteSelectedNode(): boolean {
 
 function onDoubleClick(event: MouseEvent) {
   if (dataTabOpenModeFromTreeClick(activeNode.value.type, event, settingsStore.editorSettings.shortcuts.openDataInNewTab) === "new-tab") return;
+  if (activeNode.value.type === "connection" && isExternalTableDatabaseType(currentDatabaseType())) {
+    void toggle();
+    return;
+  }
   if (activeNode.value.type === "event") {
     void openObjectBrowser(false, true);
     return;
@@ -1504,15 +1533,19 @@ async function confirmDeleteSavedSqlFile() {
   releaseActiveNodeReference([node.id]);
 }
 
-async function openObjectBrowser(eventReadOnly = false, openEventEditor = false) {
+async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean | "create" = false) {
   const node = activeNode.value;
   if (!node.connectionId) return;
   try {
     await connectionStore.ensureConnected(node.connectionId);
     connectionStore.activeConnectionId = node.connectionId;
 
+    const eventName = openEventEditor === true && node.type === "event" ? node.objectName || node.label : undefined;
+    const eventCreateRequestId = openEventEditor === "create" && node.type === "group-events" ? ++mysqlEventCreateRequestSeq : undefined;
+    const objectFilter = node.type === "event" || node.type === "group-events" ? "events" : undefined;
+
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, openEventEditor && node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "event" || node.type === "group-events" ? "events" : undefined);
+      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
       return;
     }
 
@@ -1521,7 +1554,7 @@ async function openObjectBrowser(eventReadOnly = false, openEventEditor = false)
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
-      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, openEventEditor && node.type === "event" ? node.objectName || node.label : undefined, eventReadOnly, node.type === "event" || node.type === "group-events" ? "events" : undefined);
+      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
     } else {
       await toggle();
     }
@@ -1529,6 +1562,14 @@ async function openObjectBrowser(eventReadOnly = false, openEventEditor = false)
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
     openDriverStoreForInstallError(e?.message || String(e));
   }
+}
+
+// 每次"新建事件"菜单点击都会分配一个单调递增的请求号，保证同一个
+// ObjectBrowser tab 被复用时也能重新进入 MySQL Event 的 CREATE 编辑器。
+let mysqlEventCreateRequestSeq = 0;
+
+function openMysqlEventCreateEditor() {
+  void openObjectBrowser(false, "create");
 }
 
 async function openDatabaseBrowser() {
@@ -5705,7 +5746,7 @@ function buildObjectGroupSidebarMenu(context: SidebarMenuFactoryContext): boolea
       items.push({ label: t("contextMenu.createView"), action: createView, icon: Plus });
     }
     if (node.type === "group-events" && node.connectionId && node.database) {
-      items.push({ label: t("contextMenu.createEvent"), action: openObjectBrowser, icon: Plus });
+      items.push({ label: t("contextMenu.createEvent"), action: openMysqlEventCreateEditor, icon: Plus });
     }
     if (mysqlObjectTemplate) {
       items.push({ label: t(mysqlObjectTemplate.titleKey), action: createMysqlObjectTemplate, icon: Plus });

@@ -1,0 +1,29 @@
+schemaVersion: 1
+order: 787
+dbType: feishu-sheets
+rustVariant: FeishuSheets
+label: Feishu Sheets
+runtimeMode: native
+mcpMode: unsupported
+singleConnectionPool: true
+metadataConnectionScoped: false
+skipTcpProbe: true
+defaultPort: 443
+supportLevel: operate
+capabilities:
+  queryExecution: false
+  metadataBrowse: true
+  objectBrowser: false
+  objectSource: false
+  schemaSearch: false
+  diagram: false
+  tableDataEdit: true
+  tableStructureEdit: false
+  tableImport: false
+  dataTransfer: false
+  sqlFileExecution: false
+  databaseCreate: false
+  fieldLineage: false
+  sqlExplain: false
+  userAdmin: false
+  driverManagement: false

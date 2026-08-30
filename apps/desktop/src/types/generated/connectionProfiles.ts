@@ -20,6 +20,10 @@ export interface ConnectionPickerOption {
 }
 
 export const CONNECTION_PROFILES = {
+  csv: { type: "csv", port: 0, user: "", label: "CSV", icon: "csv" },
+  xlsx: { type: "xlsx", port: 0, user: "", label: "XLSX", icon: "xlsx" },
+  "feishu-sheets": { type: "feishu-sheets", port: 443, user: "", label: "Feishu Sheets", icon: "feishu-sheets" },
+  "feishu-base": { type: "feishu-base", port: 443, user: "", label: "Feishu Base", icon: "feishu-base" },
   mysql: { type: "mysql", port: 3306, user: "root", label: "MySQL", icon: "mysql", urlParams: "" },
   postgres: { type: "postgres", port: 5432, user: "postgres", label: "PostgreSQL", icon: "postgres", urlParams: "" },
   cloudberry: { type: "postgres", port: 5432, user: "postgres", label: "Apache Cloudberry", icon: "cloudberry", urlParams: "" },
@@ -123,6 +127,10 @@ export const CONNECTION_PROFILES = {
 } as const satisfies Record<string, ConnectionProfileDefinition>;
 
 export const CONNECTION_PROFILE_ICONS = {
+  csv: "csv",
+  xlsx: "xlsx",
+  "feishu-sheets": "feishu-sheets",
+  "feishu-base": "feishu-base",
   mysql: "mysql",
   postgres: "postgres",
   cloudberry: "cloudberry",
@@ -226,6 +234,10 @@ export const CONNECTION_PROFILE_ICONS = {
 } as const satisfies Record<string, string>;
 
 export const CONNECTION_PICKER_OPTIONS = [
+  { value: "csv", label: "CSV", category: "lightweight" },
+  { value: "xlsx", label: "XLSX", category: "lightweight" },
+  { value: "feishu-sheets", label: "Feishu Sheets", category: "document" },
+  { value: "feishu-base", label: "Feishu Base", category: "document" },
   { value: "mysql", label: "MySQL", category: "sql" },
   { value: "postgres", label: "PostgreSQL", category: "sql" },
   { value: "cloudberry", label: "Apache Cloudberry", category: "analytics" },

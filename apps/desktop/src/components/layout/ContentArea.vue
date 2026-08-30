@@ -84,6 +84,7 @@ function preloadDataGridComponent() {
 }
 
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
+const ExternalTableBrowser = defineAsyncComponent(() => import("@/components/external/ExternalTableBrowser.vue"));
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
 const RedisDashboard = defineAsyncComponent(() => import("@/components/redis/RedisDashboard.vue"));
 const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
@@ -167,6 +168,7 @@ import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAcc
 type DataGridHandle = DataGridColumnLayoutHandle & {
   onToolbarRefresh: () => Promise<void> | void;
   focusSearch: () => boolean;
+  openGoToColumn: () => boolean;
   openCellDetailSearch: () => boolean;
   nullColumnsHidden: boolean;
   allNullColumnCount: number;
@@ -277,7 +279,7 @@ onMounted(() => {
 watch(
   () => [props.activeTab.mode, !!props.activeTab.result] as const,
   ([mode, hasResult]) => {
-    if (mode === "data" || hasResult) preloadDataGridComponent();
+    if (mode === "data" || mode === "external-table" || hasResult) preloadDataGridComponent();
   },
   { immediate: true },
 );
@@ -316,6 +318,7 @@ const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
+const externalTableBrowserRef = ref<{ refresh: () => Promise<boolean> }>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
 const activeResultExecutionTarget = computed(() => queryStore.activeResultExecutionTarget(props.activeTab.id));
@@ -902,6 +905,11 @@ function focusSearch(): boolean {
   return dataGridRef.value?.focusSearch() ?? false;
 }
 
+function openGoToColumn(): boolean {
+  if (props.activeTab.mode !== "data") return false;
+  return dataGridRef.value?.openGoToColumn() ?? false;
+}
+
 function refreshQueryEditorCompletionCache(): boolean {
   if (props.activeTab.mode !== "query" || !queryEditorRef.value) return false;
   queryEditorRef.value.refreshCompletionCache();
@@ -917,6 +925,11 @@ function refreshData(): boolean {
   if (props.activeTab.mode === "consul-overview") return consulOverviewRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "consul") return consulWorkspaceRef.value?.refresh?.() ?? false;
   if (props.activeTab.mode === "databases") return databaseBrowserRef.value?.refresh?.() ?? false;
+  if (props.activeTab.mode === "external-table") {
+    if (!externalTableBrowserRef.value) return false;
+    void externalTableBrowserRef.value.refresh();
+    return true;
+  }
   // Restored data tabs intentionally omit row data, so refresh must work before DataGrid mounts.
   if (canReloadUnavailableDataTab(props.activeTab)) {
     emit("reload");
@@ -1117,6 +1130,10 @@ function requestQueryEditorExecute() {
   return queryEditorRef.value?.requestExecute();
 }
 
+function captureQueryEditorExecutionSnapshot() {
+  return queryEditorRef.value?.captureExecutionSnapshot();
+}
+
 function requestQueryEditorExecuteInNewResultTab() {
   return queryEditorRef.value?.requestExecuteInNewResultTab();
 }
@@ -1163,11 +1180,13 @@ async function executeRedisCommand(command: string): Promise<boolean> {
 
 defineExpose({
   focusSearch,
+  openGoToColumn,
   refreshData,
   toggleResultsPane,
   refreshQueryEditorCompletionCache,
   handleModRTarget,
   requestQueryEditorExecute,
+  captureQueryEditorExecutionSnapshot,
   requestQueryEditorExecuteInNewResultTab,
   shouldBlockQueryEditorExecutionShortcut,
   acceptQueryEditorExecutionViewport,
@@ -1779,6 +1798,7 @@ defineExpose({
                 :total-row-count="activeTab.resultTotalRowCount"
                 :total-row-count-is-exact="activeTab.resultTotalRowCount !== undefined || activeTab.result.total_is_exact !== false"
                 :total-row-count-loading="activeTab.resultTotalRowCountLoading"
+                :page-jump-progress="activeTab.resultPageJumpProgress"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
                 :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
                 :query-result-export-request="
@@ -2191,6 +2211,10 @@ defineExpose({
       </div>
     </template>
 
+    <template v-else-if="activeTab.mode === 'external-table'">
+      <ExternalTableBrowser ref="externalTableBrowserRef" :connection-id="activeTab.connectionId" :pending-state-key="activeTab.id" />
+    </template>
+
     <!-- Redis mode: key browser -->
     <template v-else-if="activeTab.mode === 'redis'">
       <div class="flex-1 min-h-0">
@@ -2343,6 +2367,7 @@ defineExpose({
           :initial-event-name="activeTab.objectBrowser?.eventName"
           :initial-event-read-only="activeTab.objectBrowser?.eventReadOnly"
           :initial-event-open-request-id="activeTab.objectBrowser?.eventOpenRequestId"
+          :initial-event-create-request-id="activeTab.objectBrowser?.eventCreateRequestId"
           :initial-object-filter="activeTab.objectBrowser?.initialObjectFilter"
           :viewport="activeTab.objectBrowser?.viewport"
           @open-table="emit('openObjectTable', $event)"

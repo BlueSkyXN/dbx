@@ -45,6 +45,8 @@ import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl
 import { firstZooKeeperEndpoint, normalizeZooKeeperConnectString } from "@/lib/zookeeper/zookeeperConnection";
 import { setZooKeeperAuthScheme, zooKeeperAuthScheme as resolveZooKeeperAuthScheme, type ZooKeeperAuthScheme } from "@/lib/zookeeper/zookeeperConnectionOptions";
 import { isLocalFileTypeDb } from "@/lib/connection/connectionFile";
+import { connectionPickerOptionVisible, defaultExternalTableConfig, externalTableConnectionTargetIsComplete, normalizeExternalTableConnectionForSubmit } from "@/lib/connection/externalTableConnection";
+import { isExternalTableDatabaseType } from "@/types/externalTable";
 import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mq/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoConnectionUsesOidc, mongoUrlParam, mongoUrlParamIsTrue, normalizeMongoTlsFormState, setMongoUrlParam, setMongoUrlParamBoolean } from "@/lib/mongo/mongoConnectionOptions";
 import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
@@ -2291,13 +2293,32 @@ function applyProfile(val: string, preserveConnectionFields = false) {
   if (!profile) return;
 
   const previousDatabaseType = form.value.db_type;
+  const externalTableProfile = isExternalTableDatabaseType(profile.type) ? profile.type : undefined;
+  const preserveExternalTableConfig = !!externalTableProfile && preserveConnectionFields && previousDatabaseType === externalTableProfile;
   selectedType.value = val;
   form.value.db_type = profile.type;
   form.value.driver_profile = val;
   form.value.driver_label = isCustomCompatibleProfile() ? customDriverName.value.trim() || profile.label : profile.label;
   const preserveMeilisearchConfig = preserveConnectionFields && previousDatabaseType === "meilisearch" && profile.type === "meilisearch";
-  if (profile.type !== "sqlserver" && !preserveMeilisearchConfig) {
+  if (!externalTableProfile && profile.type !== "sqlserver" && !preserveMeilisearchConfig) {
     form.value.external_config = undefined;
+  }
+  if (externalTableProfile && !preserveExternalTableConfig) {
+    form.value.external_config = defaultExternalTableConfig(externalTableProfile);
+    form.value.host = "";
+    form.value.port = externalTableProfile === "csv" || externalTableProfile === "xlsx" ? 0 : 443;
+    form.value.username = "";
+    form.value.password = "";
+    form.value.database = undefined;
+    form.value.production_databases = [];
+    form.value.visible_databases = undefined;
+    form.value.visible_schemas = undefined;
+    form.value.show_system_schemas = false;
+    form.value.connection_string = undefined;
+    form.value.url_params = "";
+    form.value.transport_layers = [];
+    connectionUrlInput.value = "";
+    appliedConnectionUrlInput.value = "";
   }
   if (profile.type !== "elasticsearch" || previousDatabaseType !== "elasticsearch") {
     resetElasticsearchProxyFields();
@@ -2844,7 +2865,7 @@ const dbCategories = computed<DbCategory[]>(() => {
   return dbCategoryDefinitions.map((category) => ({
     key: category.key,
     title: t(category.titleKey),
-    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value)),
+    options: dbOptions.filter((option) => category.optionValues.includes(option.value) && !hiddenPickerOptionTypes.has(option.value) && connectionPickerOptionVisible(option.value, isDesktop)),
   }));
 });
 
@@ -2918,13 +2939,67 @@ const jdbcxHighPrivilegeExtensionsAllowed = computed({
   },
 });
 const supportsNativeAgentJdbcDriverConfig = computed(() => supportsNativeAgentJdbcDriverConfigType(form.value.db_type) && (form.value.db_type !== "dameng" || isDamengCustomDriver.value));
+const isExternalTableConnection = computed(() => isExternalTableDatabaseType(form.value.db_type));
+const isFeishuExternalTableConnection = computed(() => form.value.db_type === "feishu-sheets" || form.value.db_type === "feishu-base");
 const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionMode.value === "file");
 const isH2CustomDriver = computed(() => form.value.db_type === "h2" && form.value.driver_profile === "h2-custom");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
+function externalTableConfigField(key: string, fallback = ""): string {
+  const value = externalConfigRecord(form.value.external_config)[key];
+  return typeof value === "string" ? value : fallback;
+}
+
+function setExternalTableConfigField(key: string, value: unknown) {
+  form.value.external_config = { ...externalConfigRecord(form.value.external_config), [key]: value };
+  resetTestState();
+}
+
+const csvDelimiter = computed({
+  get: () => externalTableConfigField("delimiter", ",") || ",",
+  set: (value: string) => setExternalTableConfigField("delimiter", value),
+});
+const csvEncoding = computed({
+  get: () => externalTableConfigField("encoding", "utf-8") || "utf-8",
+  set: (value: string) => setExternalTableConfigField("encoding", value),
+});
+const externalTableHasHeader = computed({
+  get: () => {
+    const value = externalConfigRecord(form.value.external_config).hasHeader;
+    return typeof value === "boolean" ? value : true;
+  },
+  set: (value: boolean) => setExternalTableConfigField("hasHeader", value),
+});
+const externalTableDataRange = computed({
+  get: () => externalTableConfigField("dataRange"),
+  set: (value: string) => setExternalTableConfigField("dataRange", value),
+});
+const feishuSpreadsheetToken = computed({
+  get: () => externalTableConfigField("spreadsheetToken"),
+  set: (value: string) => setExternalTableConfigField("spreadsheetToken", value),
+});
+const feishuSheetId = computed({
+  get: () => externalTableConfigField("sheetId"),
+  set: (value: string) => setExternalTableConfigField("sheetId", value),
+});
+const feishuBaseToken = computed({
+  get: () => externalTableConfigField("baseToken"),
+  set: (value: string) => setExternalTableConfigField("baseToken", value),
+});
+const feishuTableId = computed({
+  get: () => externalTableConfigField("tableId"),
+  set: (value: string) => setExternalTableConfigField("tableId", value),
+});
+const feishuViewId = computed({
+  get: () => externalTableConfigField("viewId"),
+  set: (value: string) => setExternalTableConfigField("viewId", value),
+});
+
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type));
 const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" || isJdbcProductConnection.value ? "" : "sa"));
 const filePathPlaceholder = computed(() => {
+  if (form.value.db_type === "csv") return "/path/to/data.csv";
+  if (form.value.db_type === "xlsx") return "/path/to/workbook.xlsx";
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
   if (form.value.db_type === "h2") return "/path/to/database.mv.db";
@@ -3102,7 +3177,7 @@ const zookeeperAuthScheme = computed<ZooKeeperAuthScheme>({
     resetTestState();
   },
 });
-const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isCloudflareD1Connection(form.value) && !isH2FileMode.value && !(form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns"));
+const canUseTransportLayers = computed(() => !isExternalTableConnection.value && form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isCloudflareD1Connection(form.value) && !isH2FileMode.value && !(form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns"));
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
 const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const agentDriverFocus = computed<DriverStoreFocus>(() => ({ target: "driver", driver: agentDriverInstallKey(form.value.db_type, form.value.driver_profile) }));
@@ -3331,6 +3406,7 @@ const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
 const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
 const hasRequiredConnectionTarget = computed(() => {
+  if (isExternalTableConnection.value) return externalTableConnectionTargetIsComplete(form.value);
   if (form.value.db_type === "mq") {
     if (mqSystemKind.value === "kafka") return mqKafkaConnectionSource.value === "zookeeper" ? !!mqKafkaZooKeeperServers.value.trim() : !!mqKafkaBootstrapServers.value.trim();
     if (mqSystemKind.value === "rocketmq") return !!mqRocketmqNamesrvAddr.value.trim();
@@ -3780,7 +3856,9 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   if (!config.is_production) config.is_production = undefined;
   config.production_databases = [...new Set((config.production_databases || []).map((database) => database.trim()).filter(Boolean))];
   if (!config.production_databases.length) config.production_databases = undefined;
-  if (form.value.db_type === "mq") {
+  if (isExternalTableDatabaseType(config.db_type)) {
+    normalizeExternalTableConnectionForSubmit(config);
+  } else if (form.value.db_type === "mq") {
     const mqConfig = buildMqAdminConfig();
     config.external_config = mqConfig;
     config.driver_profile = mqConfig.systemKind;
@@ -5466,7 +5544,18 @@ async function browseKafkaKerberosFile(target: "keytab" | "krb5") {
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : undefined;
+    const filters =
+      form.value.db_type === "csv"
+        ? [{ name: "CSV", extensions: ["csv", "tsv"] }]
+        : form.value.db_type === "xlsx"
+          ? [{ name: "XLSX", extensions: ["xlsx"] }]
+          : form.value.db_type === "duckdb"
+            ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }]
+            : form.value.db_type === "access"
+              ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
+              : form.value.db_type === "h2"
+                ? [{ name: "H2", extensions: ["db"] }]
+                : undefined;
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -5810,7 +5899,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent value="connection" class="m-0 flex min-h-0 flex-1 flex-col overflow-hidden">
               <div class="connection-form-body grid min-h-0 flex-1 scroll-pb-6 gap-4 overflow-y-auto pt-4 pr-2 pb-6" :class="{ 'connection-form-body--nacos': form.db_type === 'nacos' }">
-                <div v-if="!isJdbcConnection && form.db_type !== 'nacos' && form.db_type !== 'consul'" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!isJdbcConnection && !isExternalTableConnection && form.db_type !== 'nacos' && form.db_type !== 'consul'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="connectionUrlInput" class="flex-1" :placeholder="connectionUrlPlaceholder" @keydown.enter.prevent="applyConnectionUrl" />
@@ -6150,6 +6239,45 @@ function openExternalUrl(url: string) {
                       </p>
                     </div>
                   </div>
+                  <div v-if="form.db_type === 'csv'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalCsvDelimiter") }}</Label>
+                    <Select v-model="csvDelimiter">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value=",">{{ t("connection.externalCsvDelimiterComma") }}</SelectItem>
+                        <SelectItem :value="'\t'">{{ t("connection.externalCsvDelimiterTab") }}</SelectItem>
+                        <SelectItem value=";">{{ t("connection.externalCsvDelimiterSemicolon") }}</SelectItem>
+                        <SelectItem value="|">{{ t("connection.externalCsvDelimiterPipe") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div v-if="form.db_type === 'csv'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalCsvEncoding") }}</Label>
+                    <Select v-model="csvEncoding">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="utf-8">UTF-8</SelectItem>
+                        <SelectItem value="gb18030">GB18030</SelectItem>
+                        <SelectItem value="big5">Big5</SelectItem>
+                        <SelectItem value="windows-1252">Windows-1252</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div v-if="form.db_type === 'xlsx'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalDataRange") }}{{ t("connection.optionalSuffix") }}</Label>
+                    <Input v-model="externalTableDataRange" class="col-span-3" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                  </div>
+                  <div v-if="form.db_type === 'csv' || form.db_type === 'xlsx'" class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalHasHeader") }}</Label>
+                    <div class="col-span-3 flex items-center gap-2">
+                      <Switch v-model="externalTableHasHeader" />
+                      <span class="text-xs text-muted-foreground">{{ t("connection.externalHasHeaderHint") }}</span>
+                    </div>
+                  </div>
                   <div v-if="form.db_type === 'sqlite'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.sqliteCipherKey") }}</Label>
                     <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.sqliteCipherKeyPlaceholder')" />
@@ -6200,6 +6328,64 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.password") }}{{ form.db_type === "access" ? t("connection.optionalSuffix") : "" }}</Label>
                       <PasswordInput v-model="form.password" class="col-span-3" />
+                    </div>
+                  </template>
+                </template>
+
+                <template v-else-if="isFeishuExternalTableConnection">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalFeishuAppId") }}</Label>
+                    <Input v-model="form.username" class="col-span-3" autocomplete="username" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label :class="connectionLabelClass">{{ t("connection.externalFeishuAppSecret") }}</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <span />
+                    <div class="col-span-3 flex items-center gap-1.5 text-sm">
+                      <label class="flex items-center gap-2">
+                        <input v-model="form.save_password" type="checkbox" class="h-4 w-4 rounded border-border accent-primary" :aria-label="t('connection.savePassword')" />
+                        <span class="whitespace-nowrap">{{ t("connection.savePassword") }}</span>
+                      </label>
+                      <HelpTooltip :label="t('connection.savePassword')">
+                        {{ form.save_password ? t("connection.savePasswordHint") : t("connection.savePasswordSessionHint") }}
+                      </HelpTooltip>
+                    </div>
+                  </div>
+                  <template v-if="form.db_type === 'feishu-sheets'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalFeishuSpreadsheetToken") }}</Label>
+                      <Input v-model="feishuSpreadsheetToken" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalFeishuSheetId") }}{{ t("connection.optionalSuffix") }}</Label>
+                      <Input v-model="feishuSheetId" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalDataRange") }}{{ t("connection.optionalSuffix") }}</Label>
+                      <Input v-model="externalTableDataRange" class="col-span-3" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalHasHeader") }}</Label>
+                      <div class="col-span-3 flex items-center gap-2">
+                        <Switch v-model="externalTableHasHeader" />
+                        <span class="text-xs text-muted-foreground">{{ t("connection.externalHasHeaderHint") }}</span>
+                      </div>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalFeishuBaseToken") }}</Label>
+                      <Input v-model="feishuBaseToken" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalFeishuTableId") }}{{ t("connection.optionalSuffix") }}</Label>
+                      <Input v-model="feishuTableId" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelClass">{{ t("connection.externalFeishuViewId") }}{{ t("connection.optionalSuffix") }}</Label>
+                      <Input v-model="feishuViewId" class="col-span-3" />
                     </div>
                   </template>
                 </template>
