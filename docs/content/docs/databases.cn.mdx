@@ -28,6 +28,19 @@ DBX 的新建连接窗口提供 90+ 数据库和服务 profile。Profile 决定�
 
 Desktop 的文件路径属于本机。Docker/Web 的文件路径属于服务器容器或宿主机挂载目录；浏览器电脑上的路径不会自动映射到服务器。
 
+### 外部表格（Desktop）
+
+DBX Desktop 可以通过直接表格 Browser 打开四类外部表格来源，不经过 SQL 或 DuckDB cache：
+
+- CSV 文件，可指定分隔符、文本编码和是否使用首行表头
+- 普通 `.xlsx` workbook，可选择 worksheet、限制 A1 数据范围，公式单元格保持只读
+- Feishu Sheets，使用 app ID 和 app secret 认证
+- Feishu Base，使用 app ID 和 app secret 认证
+
+四类来源都支持分页浏览、按来源能力受限更新、新增或追加、删除、手动刷新和保存后回读。写入前会检查文件快照或远端 revision。冲突项继续保留；部分成功只清除已确认写入的操作；网络结果未知时会阻止再次保存，直到用户重新加载来源。
+
+这条通道仅支持 Desktop，不增加 SQL 查询、自动同步、轮询、Webhook、CLI/MCP 工具或 `dbx-web` 路由。XLSX 编辑只面向普通 `.xlsx` 数据区域；宏、加密 workbook、旧 Excel 格式、公式编辑和 workbook 结构编辑不在支持范围内。
+
 ### 专用数据模型和服务
 
 - Redis、MongoDB

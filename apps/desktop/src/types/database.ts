@@ -1170,6 +1170,7 @@ export interface QueryTab {
   completionContextVersion?: number;
   mode:
     | "data"
+    | "external-table"
     | "query"
     | "redis"
     | "redis-dashboard"

@@ -9,12 +9,14 @@ import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import SidebarTreeRuntimeHost from "@/components/sidebar/SidebarTreeRuntimeHost.vue";
 
 const connectionStore = {
+  activeConnectionId: "",
   treeNodes: [] as TreeNode[],
   sidebarSearchQuery: "",
   canUseLoadedTreeNodeToggle: vi.fn(() => true),
   releaseCollapsedTreeNodeChildren: vi.fn(),
   getConfig: vi.fn(() => ({ db_type: "mysql", name: "connection" })),
   ensureConnected: vi.fn(async () => undefined),
+  loadDatabases: vi.fn(async () => undefined),
   loadPackageMembers: vi.fn(async (node: TreeNode) => {
     node.isExpanded = true;
   }),
@@ -34,7 +36,7 @@ vi.mock("@/stores/connectionStore", () => ({
 }));
 
 vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => queryStore }));
-vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { sidebarActivation: "single" } }) }));
+vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { sidebarActivation: "single", shortcuts: { openDataInNewTab: "Mod+Enter" } } }) }));
 vi.mock("@/stores/savedSqlStore", () => ({ useSavedSqlStore: () => ({}) }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock("@/composables/useSqlHighlighter", () => ({ useSqlHighlighter: () => ({ highlight: vi.fn() }) }));
@@ -45,6 +47,7 @@ vi.mock("@/composables/useSidebarDatabaseSpecificMutationRuntime", () => ({ useS
 vi.mock("@/composables/useSidebarTableMutationRuntime", () => ({ useSidebarTableMutationRuntime: () => ({}) }));
 vi.mock("@/composables/useSidebarTreeExportRuntime", () => ({ useSidebarTreeExportRuntime: () => ({}) }));
 vi.mock("@/composables/useSidebarTreeToolRuntime", () => ({ useSidebarTreeToolRuntime: () => ({}) }));
+vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
 
 const mountedApps: App[] = [];
 
@@ -53,12 +56,45 @@ afterEach(() => {
   document.body.innerHTML = "";
   connectionStore.treeNodes = [];
   connectionStore.sidebarSearchQuery = "";
+  connectionStore.activeConnectionId = "";
   vi.clearAllMocks();
   connectionStore.canUseLoadedTreeNodeToggle.mockReturnValue(true);
   connectionStore.getConfig.mockReturnValue({ db_type: "mysql", name: "connection" });
 });
 
 describe("SidebarTreeRuntimeHost expansion", () => {
+  it("opens a Desktop external-table tab without loading SQL database metadata", async () => {
+    connectionStore.getConfig.mockReturnValue({ db_type: "csv", name: "People CSV" });
+    const connectionNode: TreeNode = {
+      id: "external-csv",
+      label: "People CSV",
+      type: "connection",
+      connectionId: "external-csv",
+      isExpanded: false,
+      children: [],
+    };
+    connectionStore.treeNodes = [connectionNode];
+
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(
+      defineComponent({
+        setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: connectionNode, depth: 0 }),
+      }),
+    );
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+
+    host.value?.handleRowDoubleClick(connectionNode, new MouseEvent("dblclick"));
+
+    await vi.waitFor(() => expect(queryStore.createTab).toHaveBeenCalledWith("external-csv", "", "People CSV", "external-table"));
+    expect(connectionStore.ensureConnected).toHaveBeenCalledWith("external-csv");
+    expect(connectionStore.activeConnectionId).toBe("external-csv");
+    expect(connectionStore.loadDatabases).not.toHaveBeenCalled();
+  });
+
   it("publishes a rendered group collapse and synchronizes the live tree", async () => {
     const liveGroup: TreeNode = {
       id: "connection:database:__tables",

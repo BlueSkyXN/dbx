@@ -859,6 +859,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[tokio::test]
+    async fn sync_connection_configs_invalidates_external_adapters_on_config_change_or_delete() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-external-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let mut initial = mongodb_config();
+        initial.id = "external-csv".to_string();
+        initial.db_type = DatabaseType::Csv;
+        initial.host = "/tmp/source.csv".to_string();
+        initial.port = 0;
+        initial.username.clear();
+        initial.password.clear();
+        initial.database = None;
+        initial.external_config = Some(serde_json::json!({ "delimiter": ",", "hasHeader": true }));
+        state.configs.write().await.insert(initial.id.clone(), initial.clone());
+
+        let mut updated = initial.clone();
+        updated.host = "/tmp/other.csv".to_string();
+        let changed = sync_connection_configs(&state, std::slice::from_ref(&updated)).await;
+        assert_eq!(changed.external_adapter_ids_to_drop.as_slice(), std::slice::from_ref(&initial.id));
+
+        let deleted = sync_connection_configs(&state, &[]).await;
+        assert_eq!(deleted.external_adapter_ids_to_drop.as_slice(), std::slice::from_ref(&initial.id));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[tauri::command]
@@ -880,12 +908,14 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
     state.storage.save_connections(configs).await?;
     let sync = sync_connection_configs(state, configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
+    drop_external_table_adapters_for_connection_ids(state, &sync.external_adapter_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
     Ok(())
 }
 
 struct ConnectionConfigSync {
+    external_adapter_ids_to_drop: Vec<String>,
     nacos_adapter_ids_to_drop: Vec<String>,
     mq_adapter_ids_to_drop: Vec<String>,
     connection_pool_ids_to_drop: Vec<String>,
@@ -893,6 +923,7 @@ struct ConnectionConfigSync {
 
 async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> ConnectionConfigSync {
     let saved_ids: HashSet<&str> = configs.iter().map(|config| config.id.as_str()).collect();
+    let mut external_adapter_ids_to_drop = HashSet::new();
     let mut nacos_adapter_ids_to_drop = HashSet::new();
     let mut mq_adapter_ids_to_drop = HashSet::new();
     let mut connection_pool_ids_to_drop = HashSet::new();
@@ -906,6 +937,9 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             state.session_credentials.clear_connection(id);
             if existing.db_type == DatabaseType::Nacos {
                 nacos_adapter_ids_to_drop.insert(id.clone());
+            }
+            if existing.db_type.is_external_tabular() {
+                external_adapter_ids_to_drop.insert(id.clone());
             }
             if existing.db_type == DatabaseType::MessageQueue {
                 mq_adapter_ids_to_drop.insert(id.clone());
@@ -921,6 +955,11 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             mq_adapter_ids_to_drop.insert(config.id.clone());
         }
         if let Some(previous) = runtime_configs.insert(config.id.clone(), config.clone()) {
+            if (previous.db_type.is_external_tabular() || config.db_type.is_external_tabular())
+                && !connection_configs_pool_equivalent(&previous, config)
+            {
+                external_adapter_ids_to_drop.insert(config.id.clone());
+            }
             if previous.db_type == DatabaseType::Nacos {
                 nacos_adapter_ids_to_drop.insert(config.id.clone());
             }
@@ -931,6 +970,9 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
                 // 端点或认证身份变化后，旧密码不能安全复用。显示范围等本地设置
                 // 不影响凭据归属，因此必须保留 no-save 连接的新会话密码。
                 state.session_credentials.clear_connection(&config.id);
+                if previous.db_type.is_external_tabular() || config.db_type.is_external_tabular() {
+                    external_adapter_ids_to_drop.insert(config.id.clone());
+                }
             }
             // 仅在真实连接参数变化时销毁池；save_password=false 连接因持久化
             // 空密码与运行态密码产生的差异被忽略（见 connection_configs_pool_equivalent）。
@@ -940,9 +982,16 @@ async fn sync_connection_configs(state: &AppState, configs: &[ConnectionConfig])
         }
     }
     ConnectionConfigSync {
+        external_adapter_ids_to_drop: external_adapter_ids_to_drop.into_iter().collect(),
         nacos_adapter_ids_to_drop: nacos_adapter_ids_to_drop.into_iter().collect(),
         mq_adapter_ids_to_drop: mq_adapter_ids_to_drop.into_iter().collect(),
         connection_pool_ids_to_drop: connection_pool_ids_to_drop.into_iter().collect(),
+    }
+}
+
+async fn drop_external_table_adapters_for_connection_ids(state: &AppState, connection_ids: &[String]) {
+    for connection_id in connection_ids {
+        state.external_tables.remove(connection_id).await;
     }
 }
 
@@ -978,6 +1027,7 @@ async fn load_connection_configs(state: &AppState) -> Result<Vec<ConnectionConfi
         state.storage.load_connections().await?.into_iter().map(|config| config.canonicalized()).collect();
     let sync = sync_connection_configs(state, &configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
+    drop_external_table_adapters_for_connection_ids(state, &sync.external_adapter_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
     drop_mq_adapters_for_connection_ids(state, &sync.mq_adapter_ids_to_drop).await;
     Ok(configs)
@@ -1068,7 +1118,13 @@ async fn test_connection_with_info_inner(
     state: &Arc<AppState>,
     config: ConnectionConfig,
 ) -> Result<ConnectionTestResult, String> {
-    let config = if config.uses_mongodb_oidc() { config.canonicalized() } else { config };
+    let mut config = if config.uses_mongodb_oidc() { config.canonicalized() } else { config };
+    if config.db_type.is_external_tabular() {
+        let supplied = config.clone();
+        state.apply_session_credential(&supplied, &mut config, &supplied.id);
+        let adapter = dbx_core::external::adapter_from_connection(&config).map_err(String::from)?;
+        return adapter.test_connection().await.map_err(String::from);
+    }
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };
@@ -1590,8 +1646,27 @@ pub async fn connect_db(
     let mut connected_db_config = db_config.clone();
 
     state.remove_connection_pools_detached(&id).await;
+    state.external_tables.remove(&id).await;
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&id)).await;
     state.reset_connection_transport_for_config(&id, &db_config).await;
+
+    if db_config.db_type.is_external_tabular() {
+        let adapter = dbx_core::external::adapter_from_connection(&db_config).map_err(String::from)?;
+        adapter.test_connection().await.map_err(String::from)?;
+        state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+        state.external_tables.insert(id.clone(), adapter).await;
+        if let Err(error) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
+            state.external_tables.remove(&id).await;
+            return Err(error);
+        }
+        record_session_credential(state.inner(), &config, &id);
+        let mut stored = config;
+        if !stored.save_password {
+            stored.password.clear();
+        }
+        state.configs.write().await.insert(id.clone(), stored);
+        return Ok(id);
+    }
 
     let (host, port) = state.connection_host_port(&id, &db_config).await?;
     if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
@@ -2009,6 +2084,7 @@ pub async fn disconnect_db(
     }
     state.running_queries.cancel_connection(&connection_id);
     state.remove_connection_pools_detached(&connection_id).await;
+    state.external_tables.remove(&connection_id).await;
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     state.reset_connection_transport(&connection_id).await;
@@ -2042,6 +2118,7 @@ pub async fn forget_session_credential(state: State<'_, Arc<AppState>>, connecti
         return Err(format!("Connection has no transient session credential to forget: {connection_id}"));
     }
     state.session_credentials.remove("", &connection_id);
+    state.external_tables.remove(&connection_id).await;
     Ok(())
 }
 
@@ -2067,6 +2144,7 @@ pub async fn replace_nacos_session_credential(
 #[tauri::command]
 pub async fn clear_all_session_credentials(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.session_credentials.clear();
+    state.external_tables.clear().await;
     Ok(())
 }
 
@@ -2078,6 +2156,19 @@ pub async fn refresh_connections(state: State<'_, Arc<AppState>>) -> Result<(), 
 
 #[tauri::command]
 pub async fn check_connection_health(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
+    let is_external =
+        state.configs.read().await.get(&connection_id).is_some_and(|config| config.db_type.is_external_tabular());
+    if is_external {
+        return state
+            .external_tables
+            .get(&connection_id)
+            .await
+            .map_err(String::from)?
+            .test_connection()
+            .await
+            .map(|_| ())
+            .map_err(String::from);
+    }
     state.check_connection_health(&connection_id).await
 }
 

@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from "vue";
+import { computed, nextTick, ref, type Ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearDataGridPendingSnapshot, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor } from "@/composables/useDataGridEditor";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
@@ -527,7 +527,7 @@ describe("useDataGridEditor saveChanges reload", () => {
     mocks.getConfig.mockReset();
   });
 
-  function createSaveTestEditor(options: { currentPage?: Ref<number>; prepareFullReload?: () => void; customSaveHandler?: { save: ReturnType<typeof vi.fn> } } = {}) {
+  function createSaveTestEditor(options: { currentPage?: Ref<number>; prepareFullReload?: () => void; customSaveHandler?: { save: ReturnType<typeof vi.fn>; applySavedChanges?: () => void } } = {}) {
     const emit = vi.fn();
     const currentPage = options.currentPage ?? ref(1);
     const result = ref<{ columns: string[]; rows: CellValue[][] }>({
@@ -568,7 +568,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       prepareFullReload: options.prepareFullReload,
       emit,
     });
-    return { editor, emit, currentPage };
+    return { editor, emit, currentPage, result };
   }
 
   it("reloads after a pure row update, so database-computed columns (e.g. ON UPDATE CURRENT_TIMESTAMP) refresh without a manual page reload", async () => {
@@ -761,5 +761,72 @@ describe("useDataGridEditor saveChanges reload", () => {
     expect(customSave).toHaveBeenCalledTimes(1);
     expect(prepareFullReload).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalledWith("reload", expect.anything());
+  });
+
+  it("clears only applied custom-save cells and preserves conflicts", async () => {
+    const customSave = vi.fn().mockResolvedValue({
+      appliedDirtyCells: [{ sourceRowIndex: 0, columnIndex: 1 }],
+      appliedNewRowTokens: [],
+      appliedDeletedRows: [],
+      conflicts: ["row 2 changed remotely"],
+      rejected: [],
+      unknown: [],
+      reloadRequired: true,
+      saveBlocked: false,
+    });
+    let resultRef: Ref<{ columns: string[]; rows: CellValue[][] }> | undefined;
+    const { editor, emit, result } = createSaveTestEditor({
+      customSaveHandler: {
+        save: customSave,
+        applySavedChanges: () => {
+          if (resultRef) resultRef.value = { ...resultRef.value, rows: resultRef.value.rows.map((row) => [...row]) };
+        },
+      },
+    });
+    resultRef = result;
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+    editor.dirtyRows.value.set(1, new Map([[1, "cancelled"]]));
+
+    await editor.saveChanges();
+
+    expect(result.value.rows[0][1]).toBe("shipped");
+    expect(result.value.rows[1][1]).toBe("pending");
+    expect(editor.dirtyRows.value.has(0)).toBe(false);
+    expect(editor.dirtyRows.value.get(1)?.get(1)).toBe("cancelled");
+    expect(editor.saveError.value).toContain("changed remotely");
+    expect(emit).not.toHaveBeenCalledWith("reload", expect.anything());
+
+    await nextTick();
+    expect(editor.dirtyRows.value.get(1)?.get(1)).toBe("cancelled");
+  });
+
+  it("blocks automatic retry and preserves pending changes when a custom save is unknown", async () => {
+    const customSave = vi.fn().mockResolvedValue({
+      appliedDirtyCells: [],
+      appliedNewRowTokens: [],
+      appliedDeletedRows: [],
+      conflicts: [],
+      rejected: [],
+      unknown: ["outcome unknown; reload required"],
+      reloadRequired: true,
+      saveBlocked: true,
+    });
+    const { editor, result } = createSaveTestEditor({ customSaveHandler: { save: customSave } });
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+
+    await editor.saveChanges();
+    await editor.saveChanges();
+
+    expect(customSave).toHaveBeenCalledTimes(1);
+    expect(editor.customSaveBlocked.value).toBe(true);
+    expect(editor.dirtyRows.value.get(0)?.get(1)).toBe("shipped");
+
+    result.value = { ...result.value, rows: result.value.rows.map((row) => [...row]) };
+    await nextTick();
+    expect(editor.dirtyRows.value.get(0)?.get(1)).toBe("shipped");
+
+    editor.discardChanges();
+    expect(editor.customSaveBlocked.value).toBe(false);
+    expect(editor.hasPendingChanges.value).toBe(false);
   });
 });

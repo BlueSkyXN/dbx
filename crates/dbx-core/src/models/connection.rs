@@ -502,6 +502,16 @@ pub enum ProxyType {
 
 include!(concat!(env!("OUT_DIR"), "/database_type.rs"));
 
+impl DatabaseType {
+    pub fn is_external_tabular(self) -> bool {
+        matches!(self, Self::Csv | Self::Xlsx | Self::FeishuSheets | Self::FeishuBase)
+    }
+
+    pub fn is_external_file(self) -> bool {
+        matches!(self, Self::Csv | Self::Xlsx)
+    }
+}
+
 #[derive(Deserialize)]
 struct ConnectionConfigData {
     pub id: String,
@@ -982,6 +992,9 @@ impl ConnectionConfig {
             DatabaseType::Sqlite | DatabaseType::DuckDb => {
                 format!("{}?mode=rwc", self.host)
             }
+            DatabaseType::Csv | DatabaseType::Xlsx | DatabaseType::FeishuSheets | DatabaseType::FeishuBase => {
+                format!("external://{}", self.db_type.as_str())
+            }
             DatabaseType::Access => self.host.clone(),
             DatabaseType::Redis => {
                 let scheme = if self.ssl { "rediss" } else { "redis" };
@@ -1142,6 +1155,9 @@ impl ConnectionConfig {
         match self.db_type {
             DatabaseType::Sqlite | DatabaseType::DuckDb => {
                 format!("{}?mode=rwc", self.host)
+            }
+            DatabaseType::Csv | DatabaseType::Xlsx | DatabaseType::FeishuSheets | DatabaseType::FeishuBase => {
+                format!("external://{}", self.db_type.as_str())
             }
             DatabaseType::Access => self.host.clone(),
             DatabaseType::Redis => {

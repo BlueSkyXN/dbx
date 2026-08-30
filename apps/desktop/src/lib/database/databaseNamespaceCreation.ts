@@ -63,6 +63,8 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   questdb: { deferred: "single database model in DBX" },
   gbase: { database: "schema" },
   access: { deferred: "file-backed; create a new connection/file instead" },
+  csv: { deferred: "the CSV file is the complete external table source" },
+  xlsx: { deferred: "worksheets are selected inside the external table browser" },
   h2: { database: "schema" },
   snowflake: { connection: "database", database: "schema" },
   trino: { database: "schema" },
@@ -95,6 +97,8 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   nacos: { deferred: "Nacos namespace creation already uses the Nacos admin flow" },
   consul: { deferred: "Consul namespaces and partitions are connection scopes, not KV resources" },
   mqtt: { deferred: "MQTT topics are managed via the MQTT console" },
+  "feishu-sheets": { deferred: "worksheets are managed by Feishu Sheets" },
+  "feishu-base": { deferred: "Base tables are managed by Feishu Base" },
 } satisfies Record<DatabaseType, DatabaseNamespaceCreationMatrixEntry>;
 
 export function connectionNamespaceCreationTarget(connection: CreationConnection): ConnectionCreationTarget | null {

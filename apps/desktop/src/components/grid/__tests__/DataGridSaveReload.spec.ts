@@ -20,6 +20,8 @@ describe("DataGrid save reload integration", () => {
     expect(dataGridSource).toContain("prepareFullReload,\n  emit,");
     expect(dataGridSource).toContain("refreshSavedRows,\n  onCellValueChanged");
     expect(toolbarSource).toContain("prepareFullReload();");
+    expect(toolbarSource).toContain("customSaveHandler?.confirmDiscardPending");
+    expect(toolbarSource).toContain("if (confirmDiscard && !(await confirmDiscard())) return;");
     expect(rollbackSource).toContain("prepareFullReload();");
     expect(toolbarSource).toContain("const resetToFirstPage = hasPendingConditionInputs();");
     expect(toolbarSource).toContain("resetToFirstPage ? 0 : (currentPage.value - 1) * pageSize.value");
@@ -32,6 +34,12 @@ describe("DataGrid save reload integration", () => {
     expect(prepareSource).toContain("preserveTransposeOnNextResult.value = showTranspose.value;");
     expect(dataGridSource).toContain("if (detailsSnapshot) restoreDetailsAfterRefresh(detailsSnapshot);");
     expect(dataGridSource).toContain("if (viewportAnchorSnapshot) restoreViewportAnchorAfterRefresh(viewportAnchorSnapshot);");
+  });
+
+  it("can hide automatic refresh for sources that require explicit reconciliation", () => {
+    expect(dataGridSource).toContain("allowAutoRefresh?: boolean;");
+    expect(dataGridSource).toContain("visible: props.allowAutoRefresh");
+    expect(dataGridSource).toContain("props.allowAutoRefresh && !isSaving.value");
   });
 
   it("resets accumulated infinite-scroll pagination before reloading from offset zero", () => {

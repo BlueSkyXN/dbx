@@ -452,6 +452,7 @@ interface DataGridProps {
   autoTransposeSingleRow?: boolean;
   sourceColumns?: Array<string | undefined>;
   readonlyColumnIndexes?: number[];
+  isCellReadonly?: (sourceRowIndex: number, columnIndex: number) => boolean;
   /**
    * Column comments for a multi-source query result (e.g. JOIN), indexed by
    * result-column ordinal (projection order). Populated even when the result is
@@ -515,6 +516,7 @@ interface DataGridProps {
   queryEditabilityReason?: QueryEditabilityReason;
   allowInsertRows?: boolean;
   allowDeleteRows?: boolean;
+  allowAutoRefresh?: boolean;
 }
 
 const props = withDefaults(defineProps<DataGridProps>(), {
@@ -526,6 +528,7 @@ const props = withDefaults(defineProps<DataGridProps>(), {
   // Omitted row-action limits must keep normal table-data editing.
   allowInsertRows: undefined,
   allowDeleteRows: undefined,
+  allowAutoRefresh: true,
 });
 
 const tableColumnsByResultIndex = computed(() =>
@@ -563,7 +566,7 @@ const emit = defineEmits<{
 }>();
 
 const autoRefresh = useDataGridAutoRefresh({
-  canRefresh: computed(() => !isSaving.value && !props.loading),
+  canRefresh: computed(() => props.allowAutoRefresh && !isSaving.value && !props.loading),
   refresh: onToolbarRefresh,
 });
 const autoRefreshIntervalSeconds = autoRefresh.intervalSeconds;
@@ -4224,6 +4227,7 @@ const {
   newRows,
   newRowMeta: editorNewRowMeta,
   deletedRows,
+  customSaveBlocked,
   quickEntryDraftRow,
   quickEntryDraftRowId,
   pendingChangesVersion,
@@ -4392,6 +4396,7 @@ function canEditRowItem(item: RowItem | undefined): boolean {
 function canEditCellItem(item: RowItem | undefined, columnIndex: number): boolean {
   if (!canEditRowItem(item) || !canEditColumn(columnIndex)) return false;
   if (isSavingNewRow(item)) return false;
+  if (item?.sourceIndex !== undefined && props.isCellReadonly?.(item.sourceIndex, columnIndex)) return false;
   const column = props.result.columns[columnIndex] ?? "";
   if (customReadonlyColumns.value.has(column.toLowerCase())) return false;
   if (!item?.isNew && !item?.isDraft) {
@@ -4678,6 +4683,8 @@ function prepareFullReload() {
 
 async function onToolbarRefresh() {
   if (transactionActive.value) {
+    const confirmDiscard = props.customSaveHandler?.confirmDiscardPending;
+    if (confirmDiscard && !(await confirmDiscard())) return;
     discardChanges();
   }
   const resetToFirstPage = hasPendingConditionInputs();
@@ -4729,6 +4736,7 @@ const autoRefreshToolbarCapability = computed<DataGridToolbarAutoRefreshCapabili
   intervalSeconds: autoRefreshIntervalSeconds.value,
   intervalOptions: AUTO_REFRESH_INTERVAL_OPTIONS,
   intervalLabel: (seconds) => t("tabs.autoRefreshEvery", { seconds }),
+  visible: props.allowAutoRefresh,
   onToggle: toggleAutoRefresh,
   onSelectInterval: setAutoRefreshInterval,
 }));
@@ -11635,7 +11643,7 @@ watch(gridSurfaceBusy, (isLoading) => {
 });
 
 onActivated(() => {
-  autoRefresh.start();
+  if (props.allowAutoRefresh) autoRefresh.start();
 });
 onDeactivated(() => {
   autoRefresh.stop();
@@ -11836,6 +11844,9 @@ defineExpose({
   useTransaction,
   transactionActive,
   isSaving,
+  hasPendingChanges: () => hasPendingChanges.value,
+  isCustomSaveBlocked: () => customSaveBlocked.value,
+  discardPendingChanges: discardChanges,
   onToolbarRefresh,
   onToolbarCommit,
   onToolbarRollback,

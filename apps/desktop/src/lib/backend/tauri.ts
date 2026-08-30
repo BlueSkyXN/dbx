@@ -70,6 +70,7 @@ import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult } from "@/types/ai";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
+import type { ApplyChangesRequest, ApplyChangesResult, ExternalTableRef, ExternalTableSchema, PageSnapshot, ReadPageRequest } from "@/types/externalTable";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
@@ -1063,6 +1064,22 @@ export async function replaceNacosSessionCredential(connectionId: string, userna
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
   return invokeBackend("check_connection_health", { connectionId });
+}
+
+export async function externalTableList(connectionId: string): Promise<ExternalTableRef[]> {
+  return invokeBackend("external_table_list", { connectionId });
+}
+
+export async function externalTableDescribe(connectionId: string, table: ExternalTableRef): Promise<ExternalTableSchema> {
+  return invokeBackend("external_table_describe", { connectionId, table });
+}
+
+export async function externalTableReadPage(connectionId: string, request: ReadPageRequest): Promise<PageSnapshot> {
+  return invokeBackend("external_table_read_page", { connectionId, request });
+}
+
+export async function externalTableApplyChanges(connectionId: string, request: ApplyChangesRequest): Promise<ApplyChangesResult> {
+  return invokeBackend("external_table_apply_changes", { connectionId, request });
 }
 
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {

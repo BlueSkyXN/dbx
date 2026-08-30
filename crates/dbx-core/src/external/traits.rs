@@ -1,21 +1,21 @@
 use async_trait::async_trait;
 
-use super::types::{ExternalCapabilities, ExternalColumnDef, ExternalTableRef, ExternalTableSnapshot};
+use super::types::{
+    AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ExternalConnectionTestResult, ExternalTableError,
+    ExternalTableRef, ExternalTableSchema, PageSnapshot, ReadPageRequest,
+};
 
-/// Trait for external tabular data sources.
 #[async_trait]
-pub trait ExternalTabularSource: Send + Sync + std::fmt::Debug {
-    fn capabilities(&self) -> ExternalCapabilities;
+pub trait ExternalTableAdapter: Send + Sync + std::fmt::Debug {
+    fn capabilities(&self) -> AdapterCapabilities;
 
-    async fn list_tables(&self) -> Result<Vec<ExternalTableRef>, String>;
+    async fn test_connection(&self) -> Result<ExternalConnectionTestResult, ExternalTableError>;
 
-    async fn get_columns(&self, table: &ExternalTableRef) -> Result<Vec<ExternalColumnDef>, String>;
+    async fn list_tables(&self) -> Result<Vec<ExternalTableRef>, ExternalTableError>;
 
-    async fn load_table(&self, table: &ExternalTableRef) -> Result<ExternalTableSnapshot, String>;
+    async fn describe_table(&self, table: &ExternalTableRef) -> Result<ExternalTableSchema, ExternalTableError>;
 
-    async fn source_version(&self, table: &ExternalTableRef) -> Result<String, String>;
+    async fn read_page(&self, request: ReadPageRequest) -> Result<PageSnapshot, ExternalTableError>;
 
-    async fn test_connection(&self) -> Result<String, String>;
-
-    fn display_name(&self) -> String;
+    async fn apply_changes(&self, request: ApplyChangesRequest) -> Result<ApplyChangesResult, ExternalTableError>;
 }

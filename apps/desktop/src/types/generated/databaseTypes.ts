@@ -78,6 +78,10 @@ export const DATABASE_TYPES = [
   "victoriametrics",
   "jdbc",
   "spark",
+  "csv",
+  "xlsx",
+  "feishu-sheets",
+  "feishu-base",
 ] as const;
 
 export type DatabaseType = (typeof DATABASE_TYPES)[number];

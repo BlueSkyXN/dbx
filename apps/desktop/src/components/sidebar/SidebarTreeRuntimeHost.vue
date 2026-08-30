@@ -176,6 +176,7 @@ import { buildSidebarDdlTemplateSql, sidebarDdlTargetsForExecutionContext } from
 import { sidebarStructureExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { supportsScheduledDatabaseBackup } from "@/lib/backup/scheduledDatabaseBackup";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isExternalTableDatabaseType } from "@/types/externalTable";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { rankSavedSqlHistory, type SavedSqlHistoryScope } from "@/lib/savedSql/savedSqlHistory";
 import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/savedSql/savedSqlClipboard";
@@ -678,9 +679,33 @@ async function openDirectNavigationNode(node: TreeNode, requestId: number) {
   }
 }
 
+async function openExternalTableConnection(node: TreeNode, requestId: number) {
+  if (node.type !== "connection" || !node.connectionId) return false;
+  const config = connectionStore.getConfig(node.connectionId);
+  if (!isExternalTableDatabaseType(config?.db_type)) return false;
+  if (!isTauriRuntime()) {
+    toast(t("externalTable.desktopOnly"), 4000);
+    return true;
+  }
+  await connectionStore.ensureConnected(node.connectionId);
+  if (!isCurrentNavigationRequest(requestId)) return true;
+  connectionStore.activeConnectionId = node.connectionId;
+  queryStore.createTab(node.connectionId, "", config.name || node.label, "external-table");
+  return true;
+}
+
 async function toggle(requestId = beginNavigationRequest()) {
   const node = activeNode.value;
   const treeLoadSearchOptions = sidebarTreeContext?.getTreeLoadSearchOptions?.(node);
+  try {
+    if (await openExternalTableConnection(node, requestId)) return;
+  } catch (e: any) {
+    if (!isCurrentNavigationRequest(requestId)) return;
+    const errMsg = e?.message || String(e);
+    if (errMsg.includes(CONNECTION_ATTEMPT_CANCELLED_MESSAGE)) return;
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
+    return;
+  }
   if (isDirectNavigationTreeNode(node.type)) {
     try {
       await openDirectNavigationNode(node, requestId);
@@ -1348,6 +1373,10 @@ function requestDeleteSelectedNode(): boolean {
 
 function onDoubleClick(event: MouseEvent) {
   if (dataTabOpenModeFromTreeClick(activeNode.value.type, event, settingsStore.editorSettings.shortcuts.openDataInNewTab) === "new-tab") return;
+  if (activeNode.value.type === "connection" && isExternalTableDatabaseType(currentDatabaseType())) {
+    void toggle();
+    return;
+  }
   if (activeNode.value.type === "event") {
     void openObjectBrowser(false, true);
     return;
