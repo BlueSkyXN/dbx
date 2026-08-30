@@ -210,7 +210,8 @@ jobs:
           find "$bundle_dir" -type f -name "*.AppImage" -exec cp {} cloud-artifacts/appimage/ \;
           find "$bundle_dir" -type f -name "*.rpm" -exec cp {} cloud-artifacts/rpm/ \;
           find "$bundle_dir" -type f -name "*.zip" -exec cp {} cloud-artifacts/zip/ \;
-          find "$bundle_dir" -type f -name "*.tar.gz" -exec cp {} cloud-artifacts/tar-gz/ \;
+          # Debian bundles contain internal data/control tarballs; they are not standalone DBX artifacts.
+          find "$bundle_dir" -type f -name "*.tar.gz" ! -path "$bundle_dir/deb/*" -exec cp {} cloud-artifacts/tar-gz/ \;
           find "$bundle_dir" -type f -name "*.sig" -exec cp {} cloud-artifacts/updater/ \;
 
           if [[ "${{ runner.os }}" == "macOS" ]]; then
