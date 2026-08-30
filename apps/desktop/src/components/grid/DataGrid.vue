@@ -174,6 +174,8 @@ import {
   applyColumnFormatter,
   buildColumnFormatterKey,
   defaultIoTDBTimestampFormatter,
+  DataGridDateTimePatterns,
+  displayTimeZoneOption,
   formatIoTDBTimestampEditorValue,
   getSupportedTimeZoneOptions,
   iotdbTimestampFractionDigits,
@@ -184,7 +186,6 @@ import {
   type ColumnFormatterConfig,
   type DateTimeFormatterUnit,
   type ForeignKeyDisplayFilterConfig,
-  DateTimePatterns,
 } from "@/lib/dataGrid/columnFormatter";
 import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
 import { BOOLEAN_CELL_EDITOR_VALUES, booleanCellEditorValue, isBooleanCellValue, isBooleanColumnType, isPointInBooleanCheckbox, nextBooleanCellValue, normalizeBooleanCellValue, parseBooleanCellEditorValue } from "@/lib/dataGrid/dataGridBooleanColumn";
@@ -12994,7 +12995,7 @@ function openGridSnapshot() {
                                   </div>
                                   <SearchableSelect
                                     :model-value="formatterDatetimePattern"
-                                    :options="DateTimePatterns"
+                                    :options="DataGridDateTimePatterns"
                                     :placeholder="t('grid.formatterDatetimePatternPlaceholder')"
                                     :search-placeholder="t('grid.formatterDatetimePatternPlaceholder')"
                                     :empty-text="t('grid.formatterDatetimePatternEmpty')"
@@ -13013,6 +13014,7 @@ function openGridSnapshot() {
                                   <SearchableSelect
                                     :model-value="formatterDateTimezone"
                                     :options="timezoneOptions"
+                                    :display-name="displayTimeZoneOption"
                                     :placeholder="t('grid.formatterDatetimeTimezonePlaceholder')"
                                     :search-placeholder="t('grid.formatterDatetimeTimezonePlaceholder')"
                                     :empty-text="t('grid.formatterDatetimeTimezonePlaceholder')"
