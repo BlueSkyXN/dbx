@@ -100,5 +100,9 @@ export const databaseSupport: DatabaseSupportItem[] = [
   { id: "consul", name: "Consul", icon: "/icons/database/consul.svg", tone: "#e03875" },
   { id: "iris", name: "IRIS", icon: "/icons/database/iris.svg", tone: "#0085ca" },
   { id: "jdbcx", name: "JDBC", icon: "/icons/database/jdbcx.svg", tone: "#6ea8ff" },
+  { id: "csv", name: "CSV", icon: "/icons/database/external-table.svg", tone: "#16a34a" },
+  { id: "xlsx", name: "XLSX", icon: "/icons/database/external-table.svg", tone: "#217346" },
+  { id: "feishu-sheets", name: "Feishu Sheets", icon: "/icons/database/external-table.svg", tone: "#3370ff" },
+  { id: "feishu-base", name: "Feishu Base", icon: "/icons/database/external-table.svg", tone: "#7c3aed" },
   { id: "request", name: "Your DB?", icon: "/icons/database/jdbcx.svg", tone: "#6ea8ff", href: "https://github.com/t8y2/dbx/discussions" },
 ];
