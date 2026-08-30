@@ -23,6 +23,19 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String, ExternalTableError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+pub(crate) fn bytes_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(crate) fn scoped_snapshot_token(namespace: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{namespace}:v1:{:x}", digest.finalize())
+}
+
 pub(crate) fn parse_index_key(key: &str, prefix: &str) -> Result<usize, ExternalTableError> {
     key.strip_prefix(prefix)
         .ok_or_else(|| ExternalTableError::invalid(format!("Invalid stable key: {key}")))?
@@ -47,6 +60,18 @@ pub(crate) fn unique_display_names(raw: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<Option<String>, ExternalTableError> {
+    if std::fs::symlink_metadata(destination)
+        .map_err(|error| {
+            ExternalTableError::io(format!("Failed to inspect {} before replacement: {error}", destination.display()))
+        })?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(ExternalTableError::unsupported(format!(
+            "Refusing to replace symlinked external table file: {}",
+            destination.display()
+        )));
+    }
     let destination_permissions = std::fs::metadata(destination)
         .map_err(|error| {
             ExternalTableError::io(format!("Failed to inspect permissions for {}: {error}", destination.display()))

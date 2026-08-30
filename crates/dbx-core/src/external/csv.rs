@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use encoding_rs::{Encoding, UTF_8};
 use serde_json::Value;
 
-use super::file_support::{file_sha256, parse_index_key, replace_staged_file, unique_display_names};
+use super::file_support::{bytes_sha256, file_sha256, parse_index_key, replace_staged_file, unique_display_names};
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, CsvExternalConfig, DeleteMode,
     ExternalColumn, ExternalConnectionTestResult, ExternalOperation, ExternalRow, ExternalTableAdapter,
@@ -121,7 +121,7 @@ impl ExternalTableAdapter for CsvAdapter {
         let config = self.config.clone();
         let table = request.table;
         tokio::task::spawn_blocking(move || {
-            let document = read_document(&path, &config)?;
+            let (document, snapshot_token) = read_document_with_snapshot(&path, &config)?;
             let columns = csv_columns(&document.display_headers);
             if offset > document.rows.len() {
                 return Err(ExternalTableError::invalid(format!("CSV cursor is past the end of the file: {offset}")));
@@ -141,7 +141,7 @@ impl ExternalTableAdapter for CsvAdapter {
                 columns,
                 rows,
                 next_cursor: (end < document.rows.len()).then(|| end.to_string()),
-                snapshot_token: file_sha256(&path)?,
+                snapshot_token,
                 read_state: ReadState::Complete,
             })
         })
@@ -168,9 +168,29 @@ fn read_document(path: &Path, config: &CsvExternalConfig) -> Result<CsvDocument,
     if !path.is_file() {
         return Err(ExternalTableError::invalid(format!("CSV path is not a file: {}", path.display())));
     }
-    let delimiter = config.delimiter_byte().map_err(ExternalTableError::invalid)?;
     let bytes = std::fs::read(path)
         .map_err(|error| ExternalTableError::io(format!("Failed to read CSV file {}: {error}", path.display())))?;
+    read_document_bytes(&bytes, config)
+}
+
+fn read_document_with_snapshot(
+    path: &Path,
+    config: &CsvExternalConfig,
+) -> Result<(CsvDocument, String), ExternalTableError> {
+    if !path.exists() {
+        return Err(ExternalTableError::io(format!("CSV file not found: {}", path.display())));
+    }
+    if !path.is_file() {
+        return Err(ExternalTableError::invalid(format!("CSV path is not a file: {}", path.display())));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| ExternalTableError::io(format!("Failed to read CSV file {}: {error}", path.display())))?;
+    let snapshot = bytes_sha256(&bytes);
+    Ok((read_document_bytes(&bytes, config)?, snapshot))
+}
+
+fn read_document_bytes(bytes: &[u8], config: &CsvExternalConfig) -> Result<CsvDocument, ExternalTableError> {
+    let delimiter = config.delimiter_byte().map_err(ExternalTableError::invalid)?;
     let utf8_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
     let label = config.encoding.trim();
     let encoding = if label.is_empty() || label.eq_ignore_ascii_case("auto") {
@@ -275,7 +295,7 @@ fn apply_csv_changes(
     config: &CsvExternalConfig,
     request: ApplyChangesRequest,
 ) -> Result<ApplyChangesResult, ExternalTableError> {
-    let current_snapshot = file_sha256(path)?;
+    let (mut document, current_snapshot) = read_document_with_snapshot(path, config)?;
     if current_snapshot != request.snapshot_token {
         return Ok(ApplyChangesResult {
             operation_results: request
@@ -286,13 +306,12 @@ fn apply_csv_changes(
                         .message("CSV file changed after it was read")
                 })
                 .collect(),
-            new_snapshot_token: Some(current_snapshot),
+            new_snapshot_token: None,
             reload_required: true,
-            save_blocked: false,
+            save_blocked: true,
         });
     }
 
-    let mut document = read_document(path, config)?;
     let mut operation_results = Vec::with_capacity(request.operations.len());
     let mut deleted_rows = std::collections::HashSet::new();
     let mut appended_rows = Vec::new();
@@ -401,12 +420,14 @@ fn apply_csv_changes(
     }
 
     if !operation_results.iter().any(|result| result.outcome == OperationOutcome::Applied) {
-        let reload_required = operation_results.iter().any(|result| result.outcome == OperationOutcome::Conflict);
+        let has_unresolved = operation_results
+            .iter()
+            .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
         return Ok(ApplyChangesResult {
             operation_results,
-            new_snapshot_token: Some(current_snapshot),
-            reload_required,
-            save_blocked: false,
+            new_snapshot_token: (!has_unresolved).then_some(current_snapshot),
+            reload_required: has_unresolved,
+            save_blocked: has_unresolved,
         });
     }
 
@@ -437,9 +458,9 @@ fn apply_csv_changes(
         }
         return Ok(ApplyChangesResult {
             operation_results,
-            new_snapshot_token: Some(before_replace),
+            new_snapshot_token: None,
             reload_required: true,
-            save_blocked: false,
+            save_blocked: true,
         });
     }
 
@@ -448,30 +469,31 @@ fn apply_csv_changes(
     let new_snapshot = match file_sha256(path) {
         Ok(snapshot) => Some(snapshot),
         Err(error) => {
-            annotate_csv_applied(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
+            mark_csv_applied_unknown(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
             None
         }
     };
     match read_document(path, config) {
         Ok(readback) if readback.raw_headers == document.raw_headers && readback.rows == document.rows => {}
-        Ok(_) => annotate_csv_applied(&mut operation_results, "saved, but content readback differs; reload required"),
+        Ok(_) => {
+            mark_csv_applied_unknown(&mut operation_results, "saved, but content readback differs; reload required")
+        }
         Err(error) => {
-            annotate_csv_applied(&mut operation_results, &format!("saved, but content readback failed: {error}"));
+            mark_csv_applied_unknown(&mut operation_results, &format!("saved, but content readback failed: {error}"));
         }
     }
     if let Some(warning) = replace_warning {
-        annotate_csv_applied(&mut operation_results, &warning);
+        mark_csv_applied_unknown(&mut operation_results, &warning);
     }
-    Ok(ApplyChangesResult {
-        operation_results,
-        new_snapshot_token: new_snapshot,
-        reload_required: true,
-        save_blocked: false,
-    })
+    let save_blocked = operation_results
+        .iter()
+        .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
+    Ok(ApplyChangesResult { operation_results, new_snapshot_token: new_snapshot, reload_required: true, save_blocked })
 }
 
-fn annotate_csv_applied(results: &mut [OperationResult], message: &str) {
+fn mark_csv_applied_unknown(results: &mut [OperationResult], message: &str) {
     for result in results.iter_mut().filter(|result| result.outcome == OperationOutcome::Applied) {
+        result.outcome = OperationOutcome::Unknown;
         result.message = Some(match result.message.take() {
             Some(existing) => format!("{existing}; {message}"),
             None => message.to_string(),
@@ -608,7 +630,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert!(result.new_snapshot_token.is_none());
+        assert!(result.save_blocked);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "id,name\n1,External\n");
+    }
+
+    #[test]
+    fn csv_snapshot_hashes_the_exact_bytes_that_are_parsed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.csv");
+        let bytes = b"id,name\n1,Ada\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        let (document, snapshot) = read_document_with_snapshot(&path, &CsvExternalConfig::default()).unwrap();
+
+        assert_eq!(snapshot, bytes_sha256(bytes));
+        assert_eq!(document.rows[0][1], "Ada");
     }
 
     #[cfg(unix)]
@@ -640,5 +677,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn csv_write_refuses_to_replace_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.csv");
+        let path = directory.path().join("linked.csv");
+        std::fs::write(&target, "id,name\n1,Ada\n").unwrap();
+        symlink(&target, &path).unwrap();
+        let adapter = CsvAdapter::new(path.clone(), CsvExternalConfig::default());
+        let page =
+            adapter.read_page(ReadPageRequest { table: adapter.table_ref(), cursor: None, limit: 20 }).await.unwrap();
+
+        let error = adapter
+            .apply_changes(request(
+                &page.snapshot_token,
+                vec![ExternalOperation::Update {
+                    operation_id: "update".to_string(),
+                    row_key: "row:0".to_string(),
+                    column_key: "col:1".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Grace".to_string()),
+                }],
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("symlinked external table file"));
+        assert!(std::fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "id,name\n1,Ada\n");
     }
 }
