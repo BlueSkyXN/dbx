@@ -87,6 +87,7 @@ const customSaveHandler = computed<CustomSaveHandler | undefined>(() => {
     supportsInsert: canInsert.value,
     canDelete: canDelete.value,
     targetLabel: selectedTable.value?.displayName,
+    confirmDiscardPending: () => window.confirm(t("externalTable.discardPendingConfirm")),
     readonlyColumns: schema.value.columns.filter((column) => !column.writable).map((column) => column.displayName),
     preview: async (changes) => externalSavePreview(buildExternalSavePlan(changes, page.value!, schema.value!)),
     save: async (changes) => {
@@ -268,6 +269,7 @@ defineExpose({ refresh });
         :custom-save-handler="customSaveHandler"
         :allow-insert-rows="canInsert"
         :allow-delete-rows="canDelete"
+        :allow-auto-refresh="false"
         :is-cell-readonly="isCellReadonly"
         :cache-key="`${pendingStateKey}:${selectedTableKey}:${currentCursor ?? 'first'}`"
         :pending-state-key="`${pendingStateKey}:${selectedTableKey}:${currentCursor ?? 'first'}`"

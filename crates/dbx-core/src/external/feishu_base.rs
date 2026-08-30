@@ -195,6 +195,7 @@ impl FeishuBaseAdapter {
         let path = self.base_path("/tables");
         let mut offset = 0_usize;
         let mut tables = Vec::new();
+        let mut completed = false;
         for _ in 0..MAX_METADATA_PAGES {
             let data = self
                 .client
@@ -205,6 +206,9 @@ impl FeishuBaseAdapter {
                 data.get("tables").or_else(|| data.get("items")).and_then(Value::as_array).cloned().unwrap_or_default();
             let batch = raw.iter().filter_map(parse_table).collect::<Vec<_>>();
             let batch_len = batch.len();
+            if batch_len != raw.len() {
+                return Err(ExternalTableError::invalid("Feishu Base table metadata contains malformed entries"));
+            }
             tables.extend(
                 batch.into_iter().filter(|table| {
                     self.config.table_id.as_deref().is_none_or(|configured| configured == table.table_id)
@@ -213,10 +217,19 @@ impl FeishuBaseAdapter {
             let total = usize_value(data.get("total"));
             let has_more = bool_value(data.get("has_more"))
                 .unwrap_or_else(|| total.is_some_and(|total| offset.saturating_add(batch_len) < total));
-            if !has_more || batch_len == 0 {
+            if !has_more {
+                completed = true;
                 break;
             }
+            if batch_len == 0 {
+                return Err(ExternalTableError::invalid(
+                    "Feishu Base table metadata reported more pages but returned no items",
+                ));
+            }
             offset = offset.saturating_add(batch_len);
+        }
+        if !completed {
+            return Err(ExternalTableError::invalid("Feishu Base table metadata exceeded the pagination limit"));
         }
         if let Some(configured) = self.config.table_id.as_deref() {
             if tables.iter().all(|table| table.table_id != configured) {
@@ -255,13 +268,21 @@ impl FeishuBaseAdapter {
                 data.get("fields").or_else(|| data.get("items")).and_then(Value::as_array).cloned().unwrap_or_default();
             let batch = raw.iter().filter_map(parse_field).collect::<Vec<_>>();
             let batch_len = batch.len();
+            if batch_len != raw.len() {
+                return Err(ExternalTableError::invalid("Feishu Base field metadata contains malformed entries"));
+            }
             fields.extend(batch);
             let total = usize_value(data.get("total"));
             let has_more = bool_value(data.get("has_more"))
                 .unwrap_or_else(|| total.is_some_and(|total| offset.saturating_add(batch_len) < total));
-            if !has_more || batch_len == 0 {
+            if !has_more {
                 completed = true;
                 break;
+            }
+            if batch_len == 0 {
+                return Err(ExternalTableError::invalid(
+                    "Feishu Base field metadata reported more pages but returned no items",
+                ));
             }
             offset = offset.saturating_add(batch_len);
         }
@@ -321,6 +342,11 @@ impl FeishuBaseAdapter {
 
     async fn current_snapshot(&self, table_id: &str, metadata: &BaseMetadata) -> Result<String, ExternalTableError> {
         let page = self.fetch_records_page(table_id, &metadata.fields, 0, 1).await?;
+        if page.incomplete {
+            return Err(ExternalTableError::unsupported(
+                "Feishu Base returned an incomplete record snapshot; writes are blocked",
+            ));
+        }
         let revision = page.revision.filter(|revision| !revision.is_empty()).ok_or_else(|| {
             ExternalTableError::unsupported("Feishu Base did not return a revision; writes are blocked")
         })?;
@@ -620,6 +646,18 @@ async fn preflight_updates(
     }
     for record_chunk in record_ids.chunks(MAX_BATCH_SIZE) {
         let page = adapter.fetch_records_by_ids(table_id, record_chunk, &field_ids).await?;
+        if page.incomplete || page.revision.as_deref().is_none_or(str::is_empty) {
+            for update in updates.iter().filter(|update| record_chunk.contains(&update.record_id)) {
+                results[update.operation_index] = Some(
+                    OperationResult::new(
+                        request.operations[update.operation_index].operation_id(),
+                        OperationOutcome::Conflict,
+                    )
+                    .message("Feishu Base preflight response is incomplete; reload before saving"),
+                );
+            }
+            continue;
+        }
         let records = page.records.iter().map(|record| (record.record_id.as_str(), record)).collect::<HashMap<_, _>>();
         for update in updates.iter().filter(|update| record_chunk.contains(&update.record_id)) {
             let Some(record) = records.get(update.record_id.as_str()) else {
@@ -992,8 +1030,16 @@ async fn read_back_applied(
     let mut revision = None;
     for chunk in record_ids.chunks(MAX_BATCH_SIZE) {
         let page = adapter.fetch_records_by_ids(table_id, chunk, &field_ids).await?;
-        if revision.is_none() {
-            revision = page.revision;
+        if page.incomplete {
+            return Err(ExternalTableError::invalid("Feishu Base record readback was incomplete"));
+        }
+        if let Some(page_revision) = page.revision.filter(|value| !value.is_empty()) {
+            if revision.as_ref().is_some_and(|revision| revision != &page_revision) {
+                return Err(ExternalTableError::invalid(
+                    "Feishu Base revision changed while reading back applied operations",
+                ));
+            }
+            revision = Some(page_revision);
         }
         for record in page.records {
             readback_records.insert(record.record_id.clone(), record);

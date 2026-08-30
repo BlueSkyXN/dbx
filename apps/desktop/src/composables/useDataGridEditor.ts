@@ -92,6 +92,7 @@ export interface CustomSaveHandler {
   readonlyColumns?: string[];
   supportsInsert?: boolean;
   targetLabel?: string;
+  confirmDiscardPending?: () => boolean | Promise<boolean>;
 }
 
 export interface UseDataGridEditorOptions {

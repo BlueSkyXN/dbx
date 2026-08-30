@@ -516,6 +516,7 @@ interface DataGridProps {
   queryEditabilityReason?: QueryEditabilityReason;
   allowInsertRows?: boolean;
   allowDeleteRows?: boolean;
+  allowAutoRefresh?: boolean;
 }
 
 const props = withDefaults(defineProps<DataGridProps>(), {
@@ -527,6 +528,7 @@ const props = withDefaults(defineProps<DataGridProps>(), {
   // Omitted row-action limits must keep normal table-data editing.
   allowInsertRows: undefined,
   allowDeleteRows: undefined,
+  allowAutoRefresh: true,
 });
 
 const tableColumnsByResultIndex = computed(() =>
@@ -564,7 +566,7 @@ const emit = defineEmits<{
 }>();
 
 const autoRefresh = useDataGridAutoRefresh({
-  canRefresh: computed(() => !isSaving.value && !props.loading),
+  canRefresh: computed(() => props.allowAutoRefresh && !isSaving.value && !props.loading),
   refresh: onToolbarRefresh,
 });
 const autoRefreshIntervalSeconds = autoRefresh.intervalSeconds;
@@ -4681,6 +4683,8 @@ function prepareFullReload() {
 
 async function onToolbarRefresh() {
   if (transactionActive.value) {
+    const confirmDiscard = props.customSaveHandler?.confirmDiscardPending;
+    if (confirmDiscard && !(await confirmDiscard())) return;
     discardChanges();
   }
   const resetToFirstPage = hasPendingConditionInputs();
@@ -4732,6 +4736,7 @@ const autoRefreshToolbarCapability = computed<DataGridToolbarAutoRefreshCapabili
   intervalSeconds: autoRefreshIntervalSeconds.value,
   intervalOptions: AUTO_REFRESH_INTERVAL_OPTIONS,
   intervalLabel: (seconds) => t("tabs.autoRefreshEvery", { seconds }),
+  visible: props.allowAutoRefresh,
   onToggle: toggleAutoRefresh,
   onSelectInterval: setAutoRefreshInterval,
 }));
@@ -11638,7 +11643,7 @@ watch(gridSurfaceBusy, (isLoading) => {
 });
 
 onActivated(() => {
-  autoRefresh.start();
+  if (props.allowAutoRefresh) autoRefresh.start();
 });
 onDeactivated(() => {
   autoRefresh.stop();

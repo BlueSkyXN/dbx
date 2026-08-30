@@ -40,8 +40,15 @@ struct XlsxSheetDocument {
     columns: Vec<ExternalColumn>,
     values: HashMap<(u32, u32), Value>,
     readonly_cells: HashSet<(u32, u32)>,
+    protected_rows: HashSet<u32>,
     bounds: SheetBounds,
     data_start_row: u32,
+}
+
+#[derive(Debug)]
+struct MergedCellProtection {
+    readonly_cells: HashSet<(u32, u32)>,
+    protected_rows: HashSet<u32>,
 }
 
 impl XlsxAdapter {
@@ -262,6 +269,7 @@ fn read_sheet_document(
     let display_headers = unique_display_names(&raw_headers);
     let mut values = HashMap::new();
     let mut readonly_cells = HashSet::new();
+    let mut protected_rows = HashSet::new();
     let mut inferred_types = vec![ExternalValueType::Unknown; width];
     if data_start_row <= bounds.end_row {
         for row in data_start_row..=bounds.end_row {
@@ -271,13 +279,14 @@ fn read_sheet_document(
                 values.insert((row, column), value);
                 if formulas.get_value((row, column)).is_some_and(|formula| !formula.trim().is_empty()) {
                     readonly_cells.insert((row, column));
+                    protected_rows.insert(row);
                 }
             }
         }
     }
-    for cell in merged_non_anchor_cells(path, sheet_name)? {
-        readonly_cells.insert(cell);
-    }
+    let merged = merged_cell_protection(path, sheet_name)?;
+    readonly_cells.extend(merged.readonly_cells);
+    protected_rows.extend(merged.protected_rows);
     let columns = display_headers
         .into_iter()
         .enumerate()
@@ -288,7 +297,7 @@ fn read_sheet_document(
             writable: true,
         })
         .collect();
-    Ok(XlsxSheetDocument { columns, values, readonly_cells, bounds, data_start_row })
+    Ok(XlsxSheetDocument { columns, values, readonly_cells, protected_rows, bounds, data_start_row })
 }
 
 fn resolve_sheet_bounds(
@@ -346,13 +355,14 @@ fn parse_a1_cell(value: &str) -> Result<A1Cell, ExternalTableError> {
     Ok((row_index - 1, column_index - 1))
 }
 
-fn merged_non_anchor_cells(path: &Path, sheet_name: &str) -> Result<HashSet<(u32, u32)>, ExternalTableError> {
+fn merged_cell_protection(path: &Path, sheet_name: &str) -> Result<MergedCellProtection, ExternalTableError> {
     let workbook = umya_spreadsheet::reader::xlsx::read(path)
         .map_err(|error| ExternalTableError::invalid(format!("Failed to inspect XLSX merge cells: {error}")))?;
     let sheet = workbook
         .sheet_by_name(sheet_name)
         .map_err(|error| ExternalTableError::invalid(format!("Worksheet not found: {error}")))?;
     let mut cells = HashSet::new();
+    let mut rows = HashSet::new();
     for range in sheet.merge_cells() {
         let Some(start_col) = range.coordinate_start_col().map(|value| value.num()) else {
             continue;
@@ -363,6 +373,7 @@ fn merged_non_anchor_cells(path: &Path, sheet_name: &str) -> Result<HashSet<(u32
         let end_col = range.coordinate_end_col().map(|value| value.num()).unwrap_or(start_col);
         let end_row = range.coordinate_end_row().map(|value| value.num()).unwrap_or(start_row);
         for row in start_row..=end_row {
+            rows.insert(row - 1);
             for column in start_col..=end_col {
                 if row != start_row || column != start_col {
                     cells.insert((row - 1, column - 1));
@@ -370,7 +381,7 @@ fn merged_non_anchor_cells(path: &Path, sheet_name: &str) -> Result<HashSet<(u32
             }
         }
     }
-    Ok(cells)
+    Ok(MergedCellProtection { readonly_cells: cells, protected_rows: rows })
 }
 
 fn data_to_json(data: &Data) -> Value {
@@ -539,6 +550,11 @@ fn apply_xlsx_changes(
                         OperationResult::new(operation_id, OperationOutcome::Rejected)
                             .message("XLSX row key is outside the selected data range or points to the header"),
                     );
+                } else if document.protected_rows.contains(&(row - 1)) {
+                    results[operation_index] = Some(
+                        OperationResult::new(operation_id, OperationOutcome::Rejected)
+                            .message("XLSX rows containing formulas or merged cells cannot be deleted"),
+                    );
                 } else if !seen_delete_rows.insert(row) {
                     results[operation_index] = Some(
                         OperationResult::new(operation_id, OperationOutcome::Rejected)
@@ -675,7 +691,7 @@ fn apply_xlsx_changes(
             save_blocked: false,
         });
     }
-    replace_staged_file(&staged_path, path)?;
+    let replace_warning = replace_staged_file(&staged_path, path)?;
     let new_snapshot = match file_sha256(path) {
         Ok(snapshot) => Some(snapshot),
         Err(error) => {
@@ -685,6 +701,9 @@ fn apply_xlsx_changes(
     };
     if let Err(error) = read_sheet_document(path, sheet_name, config) {
         annotate_xlsx_applied(&mut operation_results, &format!("saved, but worksheet readback failed: {error}"));
+    }
+    if let Some(warning) = replace_warning {
+        annotate_xlsx_applied(&mut operation_results, &warning);
     }
     Ok(ApplyChangesResult {
         operation_results,
@@ -860,5 +879,31 @@ mod tests {
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
         let readback = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
         assert_eq!(readback.sheet_by_name("Sheet1").unwrap().cell("B2").unwrap().value(), "External");
+    }
+
+    #[tokio::test]
+    async fn xlsx_rejects_deleting_rows_with_formulas_or_merged_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("protected-row.xlsx");
+        create_round_trip_fixture(&path);
+        let adapter = XlsxAdapter::new(path.clone(), XlsxExternalConfig::default());
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let page = adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: page.snapshot_token,
+                operations: vec![ExternalOperation::Delete {
+                    operation_id: "delete-protected".to_string(),
+                    row_key: "row:2".to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Rejected);
+        let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        assert!(!workbook.sheet_by_name("Sheet1").unwrap().cell("D2").unwrap().formula().is_empty());
     }
 }

@@ -46,18 +46,30 @@ pub(crate) fn unique_display_names(raw: &[String]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<(), ExternalTableError> {
+pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<Option<String>, ExternalTableError> {
+    let destination_permissions = std::fs::metadata(destination)
+        .map_err(|error| {
+            ExternalTableError::io(format!("Failed to inspect permissions for {}: {error}", destination.display()))
+        })?
+        .permissions();
+    std::fs::set_permissions(staged, destination_permissions).map_err(|error| {
+        ExternalTableError::io(format!("Failed to preserve permissions for {}: {error}", destination.display()))
+    })?;
+
     #[cfg(unix)]
     {
         std::fs::rename(staged, destination).map_err(|error| {
             ExternalTableError::io(format!("Failed to atomically replace {}: {error}", destination.display()))
         })?;
         if let Some(parent) = destination.parent() {
-            File::open(parent).and_then(|directory| directory.sync_all()).map_err(|error| {
-                ExternalTableError::io(format!("Failed to sync directory {} after replace: {error}", parent.display()))
-            })?;
+            if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+                return Ok(Some(format!(
+                    "file was replaced, but directory {} could not be synced: {error}",
+                    parent.display()
+                )));
+            }
         }
-        return Ok(());
+        return Ok(None);
     }
 
     #[cfg(windows)]
@@ -84,7 +96,7 @@ pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<(
                 std::io::Error::last_os_error()
             )));
         }
-        return Ok(());
+        return Ok(None);
     }
 
     #[allow(unreachable_code)]

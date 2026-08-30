@@ -444,7 +444,7 @@ fn apply_csv_changes(
     }
 
     let staged_path = staged.into_temp_path();
-    replace_staged_file(&staged_path, path)?;
+    let replace_warning = replace_staged_file(&staged_path, path)?;
     let new_snapshot = match file_sha256(path) {
         Ok(snapshot) => Some(snapshot),
         Err(error) => {
@@ -458,6 +458,9 @@ fn apply_csv_changes(
         Err(error) => {
             annotate_csv_applied(&mut operation_results, &format!("saved, but content readback failed: {error}"));
         }
+    }
+    if let Some(warning) = replace_warning {
+        annotate_csv_applied(&mut operation_results, &warning);
     }
     Ok(ApplyChangesResult {
         operation_results,
@@ -606,5 +609,36 @@ mod tests {
 
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "id,name\n1,External\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn csv_replace_preserves_original_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("permissions.csv");
+        std::fs::write(&path, "id,name\n1,Ada\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let adapter = CsvAdapter::new(path.clone(), CsvExternalConfig::default());
+        let page =
+            adapter.read_page(ReadPageRequest { table: adapter.table_ref(), cursor: None, limit: 20 }).await.unwrap();
+
+        adapter
+            .apply_changes(ApplyChangesRequest {
+                table: adapter.table_ref(),
+                snapshot_token: page.snapshot_token,
+                operations: vec![ExternalOperation::Update {
+                    operation_id: "update".to_string(),
+                    row_key: "row:0".to_string(),
+                    column_key: "col:1".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Grace".to_string()),
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o640);
     }
 }

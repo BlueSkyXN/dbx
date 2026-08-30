@@ -16,6 +16,7 @@ use super::{
 const SHEET_KEY_PREFIX: &str = "sheet:";
 const MAX_PAGE_SIZE: usize = 500;
 const MAX_COLUMNS: u32 = 500;
+const USED_RANGE_PROBE_MAX_CHARS: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct FeishuSheetsAdapter {
@@ -136,6 +137,59 @@ impl FeishuSheetsAdapter {
         parse_cell_ranges(&output)
     }
 
+    async fn bounds(&self, sheet: &WorkbookSheet) -> Result<SheetBounds, ExternalTableError> {
+        if self.config.data_range.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            return resolve_bounds(sheet, self.config.data_range.as_deref());
+        }
+        let anchor = format!("A1:{}{}", column_label(sheet.column_count), sheet.row_count);
+        let output = self
+            .client
+            .invoke_sheet_tool(
+                &self.config.spreadsheet_token,
+                "get_range_as_csv",
+                json!({
+                    "excel_id": self.config.spreadsheet_token,
+                    "sheet_id": sheet.sheet_id,
+                    "range": anchor,
+                    "max_rows": sheet.row_count,
+                    "max_chars": USED_RANGE_PROBE_MAX_CHARS
+                }),
+                false,
+            )
+            .await
+            .map_err(|error| error.as_external_error())?;
+        if output.get("truncated").and_then(Value::as_bool).unwrap_or(false)
+            || output.get("has_more").and_then(Value::as_bool).unwrap_or(false)
+            || output.get("truncation_warning").is_some()
+        {
+            return Err(ExternalTableError::unsupported(
+                "Feishu Sheets used-range probe was truncated; configure an explicit data range before editing",
+            ));
+        }
+        let region = output
+            .get("current_region")
+            .or_else(|| output.get("actual_range"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(region) = region else {
+            return Ok(SheetBounds { start_row: 1, end_row: 1, start_col: 1, end_col: sheet.column_count });
+        };
+        let (start_row, start_col, end_row, end_col) = parse_a1_range(region)?;
+        let end_row = end_row.unwrap_or(start_row);
+        let end_col = end_col.unwrap_or(start_col);
+        if end_row > sheet.row_count || end_col > sheet.column_count {
+            return Err(ExternalTableError::invalid("Feishu Sheets used range exceeds the workbook grid dimensions"));
+        }
+        let width = end_col.saturating_sub(start_col).saturating_add(1);
+        if width > MAX_COLUMNS {
+            return Err(ExternalTableError::unsupported(format!(
+                "Feishu Sheets data range has {width} columns; at most {MAX_COLUMNS} are supported"
+            )));
+        }
+        Ok(SheetBounds { start_row, end_row, start_col, end_col })
+    }
+
     async fn page(&self, request: ReadPageRequest) -> Result<PageSnapshot, ExternalTableError> {
         let limit = request.bounded_limit(MAX_PAGE_SIZE)?;
         let offset = parse_cursor(request.cursor.as_deref())?;
@@ -146,7 +200,7 @@ impl FeishuSheetsAdapter {
             .iter()
             .find(|sheet| sheet.sheet_id == sheet_id)
             .ok_or_else(|| ExternalTableError::invalid(format!("Feishu worksheet no longer exists: {sheet_id}")))?;
-        let bounds = resolve_bounds(sheet, self.config.data_range.as_deref())?;
+        let bounds = self.bounds(sheet).await?;
         let data_start_row = bounds.start_row + u32::from(self.config.has_header);
         let data_row_count = bounds.end_row.saturating_sub(data_start_row).saturating_add(1) as usize;
         if offset > data_row_count {
@@ -294,7 +348,7 @@ async fn apply_sheet_changes(
         .iter()
         .find(|sheet| sheet.sheet_id == sheet_id)
         .ok_or_else(|| ExternalTableError::invalid(format!("Feishu worksheet no longer exists: {sheet_id}")))?;
-    let bounds = resolve_bounds(sheet, adapter.config.data_range.as_deref())?;
+    let bounds = adapter.bounds(sheet).await?;
     let data_start_row = bounds.start_row + u32::from(adapter.config.has_header);
     let current_snapshot = format!("revision:{}", structure.revision);
     let mut results = vec![None; request.operations.len()];
@@ -465,11 +519,13 @@ async fn apply_sheet_changes(
         {
             Ok(output) => {
                 let failed = batch_failure_indexes(&output);
+                let first_failed = failed.iter().copied().min();
                 for (batch_index, (operation_index, _, _, _)) in updates.iter().enumerate() {
-                    let outcome = if failed.contains(&batch_index) {
-                        OperationOutcome::Rejected
-                    } else {
-                        OperationOutcome::Applied
+                    let outcome = match first_failed {
+                        Some(failed) if batch_index < failed => OperationOutcome::Applied,
+                        Some(failed) if batch_index == failed => OperationOutcome::Rejected,
+                        Some(_) => OperationOutcome::NotAttempted,
+                        None => OperationOutcome::Applied,
                     };
                     results[*operation_index] =
                         Some(OperationResult::new(request.operations[*operation_index].operation_id(), outcome));
@@ -558,7 +614,7 @@ async fn apply_sheet_changes(
                 results[*index].as_ref().is_some_and(|result| result.outcome == OperationOutcome::Applied)
             })
             .count() as u32;
-        let mut append_row = sheet.row_count.saturating_sub(deleted_count).saturating_add(1).max(bounds.start_row);
+        let mut append_row = bounds.end_row.saturating_sub(deleted_count).saturating_add(1).max(data_start_row);
         for (position, (operation_index, values)) in inserts.iter().enumerate() {
             let input = json!({
                 "excel_id": adapter.config.spreadsheet_token,
@@ -698,7 +754,7 @@ fn parse_structure(output: &Value, configured_sheet_id: Option<&str>) -> Result<
         .get("revision")
         .map(value_as_stable_string)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+        .ok_or_else(|| ExternalTableError::unsupported("Feishu workbook structure did not return a revision"))?;
     let raw_sheets = output
         .get("sheets")
         .and_then(Value::as_array)
@@ -717,8 +773,12 @@ fn parse_structure(output: &Value, configured_sheet_id: Option<&str>) -> Result<
             .and_then(Value::as_str)
             .unwrap_or(sheet_id)
             .to_string();
-        let row_count = u32_value(sheet.get("row_count")).unwrap_or(1).max(1);
-        let column_count = u32_value(sheet.get("column_count")).unwrap_or(1).clamp(1, MAX_COLUMNS);
+        let row_count = u32_value(sheet.get("row_count")).filter(|value| *value > 0).ok_or_else(|| {
+            ExternalTableError::invalid(format!("Feishu worksheet '{title}' is missing a valid row_count"))
+        })?;
+        let column_count = u32_value(sheet.get("column_count")).filter(|value| *value > 0).ok_or_else(|| {
+            ExternalTableError::invalid(format!("Feishu worksheet '{title}' is missing a valid column_count"))
+        })?;
         sheets.push(WorkbookSheet { sheet_id: sheet_id.to_string(), title, row_count, column_count });
     }
     if sheets.is_empty() {
@@ -785,14 +845,26 @@ fn parse_sheet_cell(value: &Value) -> SheetCell {
 fn resolve_bounds(sheet: &WorkbookSheet, configured: Option<&str>) -> Result<SheetBounds, ExternalTableError> {
     if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
         let (start_row, start_col, end_row, end_col) = parse_a1_range(value)?;
-        return Ok(SheetBounds {
-            start_row,
-            start_col,
-            end_row: end_row.unwrap_or(sheet.row_count).max(start_row),
-            end_col: end_col.unwrap_or(sheet.column_count).max(start_col).min(MAX_COLUMNS),
-        });
+        let end_row = end_row.unwrap_or(sheet.row_count).max(start_row);
+        let end_col = end_col.unwrap_or(sheet.column_count).max(start_col);
+        if start_row > sheet.row_count
+            || start_col > sheet.column_count
+            || end_row > sheet.row_count
+            || end_col > sheet.column_count
+        {
+            return Err(ExternalTableError::invalid(
+                "Feishu Sheets configured data range exceeds the workbook grid dimensions",
+            ));
+        }
+        let width = end_col.saturating_sub(start_col).saturating_add(1);
+        if width > MAX_COLUMNS {
+            return Err(ExternalTableError::unsupported(format!(
+                "Feishu Sheets data range has {width} columns; at most {MAX_COLUMNS} are supported"
+            )));
+        }
+        return Ok(SheetBounds { start_row, start_col, end_row, end_col });
     }
-    Ok(SheetBounds { start_row: 1, end_row: sheet.row_count, start_col: 1, end_col: sheet.column_count })
+    Err(ExternalTableError::invalid("Feishu Sheets data bounds were not resolved"))
 }
 
 fn parse_a1_range(value: &str) -> Result<(u32, u32, Option<u32>, Option<u32>), ExternalTableError> {
@@ -821,7 +893,10 @@ fn parse_a1_cell(value: &str) -> Result<(u32, u32), ExternalTableError> {
         if !character.is_ascii_alphabetic() {
             return Err(ExternalTableError::invalid(format!("Invalid A1 column: {column}")));
         }
-        column_number = column_number * 26 + character.to_ascii_uppercase() as u32 - 'A' as u32 + 1;
+        column_number = column_number
+            .checked_mul(26)
+            .and_then(|value| value.checked_add(character.to_ascii_uppercase() as u32 - 'A' as u32 + 1))
+            .ok_or_else(|| ExternalTableError::invalid(format!("A1 column is too large: {column}")))?;
     }
     if row == 0 || column_number == 0 {
         return Err(ExternalTableError::invalid(format!("A1 coordinates start at 1: {value}")));
@@ -982,6 +1057,80 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn adapter_without_range(client: FeishuClient) -> FeishuSheetsAdapter {
+        FeishuSheetsAdapter::from_client(
+            client,
+            FeishuSheetsExternalConfig {
+                spreadsheet_token: "spreadsheet".to_string(),
+                sheet_id: Some("sh1".to_string()),
+                data_range: None,
+                has_header: true,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn structure_without_revision_or_grid_dimensions_is_rejected() {
+        assert!(parse_structure(
+            &json!({ "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 3, "column_count": 2 }] }),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("revision"));
+        assert!(
+            parse_structure(&json!({ "revision": 1, "sheets": [{ "sheet_id": "sh1", "title": "Sheet1" }] }), None,)
+                .unwrap_err()
+                .to_string()
+                .contains("row_count")
+        );
+    }
+
+    #[tokio::test]
+    async fn sheets_append_uses_actual_used_range_instead_of_physical_grid_end() {
+        let structure = json!({
+            "revision": 7,
+            "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 200, "column_count": 20 }]
+        });
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            tool_reply(structure),
+            tool_reply(json!({ "current_region": "A1:B10", "annotated_csv": "" })),
+            tool_reply(json!({})),
+            tool_reply(json!({
+                "revision": 8,
+                "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 200, "column_count": 20 }]
+            })),
+            tool_reply(json!({ "ranges": [{ "cells": [[{ "value": "Grace" }, { "value": 5 }]] }] })),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+
+        let result = adapter_without_range(client)
+            .apply_changes(ApplyChangesRequest {
+                table: ExternalTableRef { table_key: "sheet:sh1".to_string(), display_name: "Sheet1".to_string() },
+                snapshot_token: "revision:7".to_string(),
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "append".to_string(),
+                    values: vec![
+                        ExternalCellInput {
+                            column_key: "col:1".to_string(),
+                            value: Value::String("Grace".to_string()),
+                        },
+                        ExternalCellInput { column_key: "col:2".to_string(), value: Value::Number(5.into()) },
+                    ],
+                }],
+            })
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Applied);
+        assert!(requests[3].contains("A11"), "append request must target the first row after the used range");
+        assert!(!requests[3].contains("A201"));
     }
 
     #[tokio::test]

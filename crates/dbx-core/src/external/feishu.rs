@@ -184,6 +184,12 @@ impl FeishuClient {
         let status = response.status();
         let bytes = bounded_body(response, mutation).await?;
         if !status.is_success() {
+            if mutation && (status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT) {
+                return Err(FeishuRequestError::unknown(format!(
+                    "{}; the server may have applied the operation, so automatic retry is blocked",
+                    http_status_message(status)
+                )));
+            }
             return Err(FeishuRequestError::rejected(http_status_message(status)));
         }
         let envelope: Value = serde_json::from_slice(&bytes)
@@ -496,5 +502,25 @@ mod tests {
         assert_eq!(error.kind, FeishuRequestErrorKind::Unknown);
         assert!(error.message.contains("automatic retry is blocked"));
         assert!(!error.message.contains("customer-sensitive-invalid-json"));
+    }
+
+    #[tokio::test]
+    async fn mutation_server_error_is_unknown_but_rate_limit_is_rejected() {
+        for (status, expected_kind) in [
+            (503, FeishuRequestErrorKind::Unknown),
+            (408, FeishuRequestErrorKind::Unknown),
+            (429, FeishuRequestErrorKind::Rejected),
+        ] {
+            let (base_url, server) = serve(vec![token(), MockReply::Status(status, "ignored".to_string())]).await;
+            let client = FeishuClient::with_base_url(base_url, "app-id", "app-secret", Duration::from_secs(5)).unwrap();
+
+            let error = client.post_json("/write", json!({ "value": 1 }), true).await.unwrap_err();
+
+            server.await.unwrap();
+            assert_eq!(error.kind, expected_kind);
+            if expected_kind == FeishuRequestErrorKind::Unknown {
+                assert!(error.message.contains("automatic retry is blocked"));
+            }
+        }
     }
 }
