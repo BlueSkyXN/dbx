@@ -595,35 +595,47 @@ async fn apply_base_changes(
         })
         .collect::<Vec<_>>();
     let has_applied = operation_results.iter().any(|result| result.outcome == OperationOutcome::Applied);
-    let has_unknown = operation_results.iter().any(|result| result.outcome == OperationOutcome::Unknown);
-    let mut reload_required = operation_results.iter().any(|result| {
-        matches!(result.outcome, OperationOutcome::Applied | OperationOutcome::Conflict | OperationOutcome::Unknown)
-    });
-    let mut new_snapshot_token = (!has_applied).then_some(current_snapshot);
+    let has_unresolved = operation_results
+        .iter()
+        .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
+    let mut new_snapshot_token = (!has_applied && !has_unresolved).then_some(current_snapshot);
+    let mut force_save_blocked = false;
 
     if has_applied {
-        match read_back_applied(adapter, &table_id, &metadata.fields, &updates, &inserts, &mut operation_results).await
+        match read_back_applied(
+            adapter,
+            &table_id,
+            &metadata.fields,
+            &updates,
+            &deletes,
+            &inserts,
+            &mut operation_results,
+        )
+        .await
         {
             Ok(revision) => match adapter.metadata(&table_id).await {
                 Ok(after_metadata) => {
-                    if after_metadata.schema_digest != metadata.schema_digest {
-                        reload_required = true;
-                    }
+                    force_save_blocked = after_metadata.schema_digest != metadata.schema_digest;
                     new_snapshot_token = Some(snapshot_token(&table_id, &revision, &after_metadata.schema_digest));
                 }
                 Err(error) => {
                     annotate_applied_readback_failure(&mut operation_results, &error.to_string());
-                    reload_required = true;
                 }
             },
             Err(error) => {
                 annotate_applied_readback_failure(&mut operation_results, &error.to_string());
-                reload_required = true;
             }
         }
     }
 
-    Ok(ApplyChangesResult { operation_results, new_snapshot_token, reload_required, save_blocked: has_unknown })
+    let reload_required = operation_results.iter().any(|result| {
+        matches!(result.outcome, OperationOutcome::Applied | OperationOutcome::Conflict | OperationOutcome::Unknown)
+    });
+    let save_blocked = force_save_blocked
+        || operation_results
+            .iter()
+            .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
+    Ok(ApplyChangesResult { operation_results, new_snapshot_token, reload_required, save_blocked })
 }
 
 async fn preflight_updates(
@@ -1004,6 +1016,7 @@ async fn read_back_applied(
     table_id: &str,
     fields: &[BaseField],
     updates: &[PreparedUpdate],
+    deletes: &[PreparedDelete],
     inserts: &[PreparedInsert],
     results: &mut [OperationResult],
 ) -> Result<String, ExternalTableError> {
@@ -1023,6 +1036,12 @@ async fn read_back_applied(
             }
         }
     }
+    record_ids.extend(
+        deletes
+            .iter()
+            .filter(|delete| results[delete.operation_index].outcome == OperationOutcome::Applied)
+            .map(|delete| delete.record_id.clone()),
+    );
     record_ids.sort();
     record_ids.dedup();
     let field_ids = fields.iter().map(|field| field.field_id.clone()).collect::<Vec<_>>();
@@ -1055,8 +1074,10 @@ async fn read_back_applied(
             .and_then(|field| readback_records.get(&update.record_id).map(|record| record_value(record, field)))
             .is_some_and(|value| value == update.new_value);
         if !matches {
-            results[update.operation_index].message =
-                Some("Feishu Base acknowledged the update, but readback differs; reload required".to_string());
+            mark_result_unknown(
+                &mut results[update.operation_index],
+                "Feishu Base acknowledged the update, but readback differs; reload required",
+            );
         }
     }
     for insert in inserts {
@@ -1069,8 +1090,21 @@ async fn read_back_applied(
             .and_then(|key| decode_key(key, ROW_KEY_PREFIX, "Feishu Base record").ok())
             .is_some_and(|record_id| readback_records.contains_key(&record_id));
         if !exists {
-            results[insert.operation_index].message =
-                Some("Feishu Base returned a record ID, but created-record readback was incomplete".to_string());
+            mark_result_unknown(
+                &mut results[insert.operation_index],
+                "Feishu Base returned a record ID, but created-record readback was incomplete",
+            );
+        }
+    }
+    for delete in deletes {
+        if results[delete.operation_index].outcome != OperationOutcome::Applied {
+            continue;
+        }
+        if readback_records.contains_key(&delete.record_id) {
+            mark_result_unknown(
+                &mut results[delete.operation_index],
+                "Feishu Base acknowledged the deletion, but the record still exists; reload required",
+            );
         }
     }
     if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
@@ -1085,8 +1119,13 @@ async fn read_back_applied(
 
 fn annotate_applied_readback_failure(results: &mut [OperationResult], message: &str) {
     for result in results.iter_mut().filter(|result| result.outcome == OperationOutcome::Applied) {
-        result.message = Some(format!("Feishu Base acknowledged the operation, but readback failed: {message}"));
+        mark_result_unknown(result, &format!("Feishu Base acknowledged the operation, but readback failed: {message}"));
     }
+}
+
+fn mark_result_unknown(result: &mut OperationResult, message: &str) {
+    result.outcome = OperationOutcome::Unknown;
+    result.message = Some(message.to_string());
 }
 
 fn prepare_insert_fields(
@@ -1724,6 +1763,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn base_readback_mismatch_keeps_update_and_delete_pending_as_unknown() {
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            table_reply(),
+            fields_reply(false),
+            matrix_reply(
+                7,
+                &["fld_name", "fld_amount"],
+                &["Name", "Amount"],
+                &["rec1", "rec2"],
+                json!([["Ada", 3], ["Delete", 4]]),
+                false,
+            ),
+            matrix_reply(7, &["fld_name"], &["Name"], &["rec1"], json!([["Ada"]]), false),
+            api_reply(json!({})),
+            api_reply(json!({})),
+            matrix_reply(
+                8,
+                &["fld_name", "fld_amount"],
+                &["Name", "Amount"],
+                &["rec1", "rec2"],
+                json!([["Ada", 3], ["Delete", 4]]),
+                false,
+            ),
+            table_reply(),
+            fields_reply(false),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+
+        let result = adapter(client)
+            .apply_changes(ApplyChangesRequest {
+                table: table_ref(),
+                snapshot_token: snapshot("7", false),
+                operations: vec![
+                    ExternalOperation::Update {
+                        operation_id: "update".to_string(),
+                        row_key: "record:rec1".to_string(),
+                        column_key: "field:fld_name".to_string(),
+                        old_value: Value::String("Ada".to_string()),
+                        new_value: Value::String("Ada Lovelace".to_string()),
+                    },
+                    ExternalOperation::Delete {
+                        operation_id: "delete".to_string(),
+                        row_key: "record:rec2".to_string(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        finish_server(server).await;
+        assert!(result.operation_results.iter().all(|result| result.outcome == OperationOutcome::Unknown));
+        assert!(result.reload_required);
+        assert!(result.save_blocked);
+    }
+
+    #[tokio::test]
     async fn base_unknown_create_is_not_retried_and_blocks_save() {
         let (base_url, server) = serve(vec![
             token_reply(),
@@ -1753,6 +1850,39 @@ mod tests {
         let requests = finish_server(server).await;
         assert_eq!(requests.len(), 5, "unknown create must not be retried");
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Unknown);
+        assert!(result.save_blocked);
+    }
+
+    #[tokio::test]
+    async fn base_conflict_does_not_advance_the_pending_snapshot_baseline() {
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            table_reply(),
+            fields_reply(false),
+            matrix_reply(8, &["fld_name", "fld_amount"], &["Name", "Amount"], &[], json!([]), false),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+
+        let result = adapter(client)
+            .apply_changes(ApplyChangesRequest {
+                table: table_ref(),
+                snapshot_token: snapshot("7", false),
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "insert".to_string(),
+                    values: vec![ExternalCellInput {
+                        column_key: "field:fld_name".to_string(),
+                        value: Value::String("Ada".to_string()),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+
+        finish_server(server).await;
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert!(result.new_snapshot_token.is_none());
+        assert!(result.reload_required);
         assert!(result.save_blocked);
     }
 }
