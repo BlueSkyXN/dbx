@@ -434,6 +434,8 @@ export default withEnglishFallback({
     host: "Host",
     addHost: "Añadir Host",
     filePath: "Ruta del archivo",
+    externalXlsxDataRangeHint: "La inserción y la eliminación física de filas se deshabilitan cuando este rango excluye otras celdas usadas del libro.",
+    externalFeishuDataRangeHint: "Déjalo vacío para navegar en modo de solo lectura. La edición requiere un rango explícito; los cambios estructurales también requieren que incluya todas las celdas usadas detectadas.",
     h2FileMode: "Archivo",
     h2TcpMode: "TCP",
     h2FilePathRequired: "La ruta del archivo H2 no puede estar vacía",
@@ -1457,6 +1459,9 @@ export default withEnglishFallback({
       skipped: "No ejecutada",
       cancelled: "Cancelada",
     },
+  },
+  externalTable: {
+    schemaChangedDuringLoad: "La tabla externa cambió mientras se cargaba. Vuelve a cargarla antes de editar.",
   },
   queryMessages: {
     empty: "Sin mensajes",

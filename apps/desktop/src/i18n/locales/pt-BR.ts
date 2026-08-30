@@ -434,6 +434,8 @@ export default withEnglishFallback({
     host: "Host",
     addHost: "Adicionar Host",
     filePath: "Caminho do Arquivo",
+    externalXlsxDataRangeHint: "A inserção e a exclusão física de linhas são desativadas quando este intervalo exclui outras células usadas da pasta de trabalho.",
+    externalFeishuDataRangeHint: "Deixe em branco para navegação somente leitura. A edição exige um intervalo explícito; alterações estruturais também exigem que ele inclua todas as células usadas detectadas.",
     h2FileMode: "Arquivo",
     h2TcpMode: "TCP",
     h2FilePathRequired: "O caminho do arquivo H2 não pode ficar vazio",
@@ -1457,6 +1459,9 @@ export default withEnglishFallback({
       skipped: "Não executada",
       cancelled: "Cancelada",
     },
+  },
+  externalTable: {
+    schemaChangedDuringLoad: "A tabela externa mudou durante o carregamento. Recarregue antes de editar.",
   },
   queryMessages: {
     empty: "Nenhuma mensagem",

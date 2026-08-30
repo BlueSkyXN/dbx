@@ -434,6 +434,8 @@ export default withEnglishFallback({
     host: "主機",
     addHost: "新增主機",
     filePath: "檔案路徑",
+    externalXlsxDataRangeHint: "如果此範圍未包含 workbook 中其他已使用的儲存格，將停用附加與實體刪除列。",
+    externalFeishuDataRangeHint: "留空時僅供唯讀瀏覽。編輯必須指定明確範圍；結構性變更還要求該範圍包含偵測到的所有已使用儲存格。",
     h2FileMode: "檔案",
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2 檔案路徑不能為空",
@@ -1456,6 +1458,9 @@ export default withEnglishFallback({
       skipped: "未執行",
       cancelled: "已取消",
     },
+  },
+  externalTable: {
+    schemaChangedDuringLoad: "外部表格在載入期間發生變更，請重新載入後再編輯。",
   },
   queryMessages: {
     empty: "沒有訊息",

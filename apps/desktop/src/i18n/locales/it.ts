@@ -433,6 +433,8 @@ export default withEnglishFallback({
     host: "Host",
     addHost: "Aggiungi Host",
     filePath: "Percorso File",
+    externalXlsxDataRangeHint: "L'aggiunta e l'eliminazione fisica delle righe sono disabilitate quando questo intervallo esclude altre celle utilizzate della cartella di lavoro.",
+    externalFeishuDataRangeHint: "Lascia vuoto per la sola consultazione. La modifica richiede un intervallo esplicito; anche le modifiche strutturali richiedono che includa tutte le celle utilizzate rilevate.",
     h2FileMode: "File",
     h2TcpMode: "TCP",
     h2FilePathRequired: "Il percorso del file H2 non può essere vuoto",
@@ -1455,6 +1457,9 @@ export default withEnglishFallback({
       skipped: "Non eseguita",
       cancelled: "Annullata",
     },
+  },
+  externalTable: {
+    schemaChangedDuringLoad: "La tabella esterna è cambiata durante il caricamento. Ricaricala prima di modificarla.",
   },
   queryMessages: {
     empty: "Nessun messaggio",
