@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildExternalSavePlan, customSaveResultFromExternal, gridValueForExternal } from "./externalTableEditing";
+import { buildExternalSavePlan, customSaveResultFromExternal, externalSavePreview, gridValueForExternal } from "./externalTableEditing";
 import type { ExternalTableSchema, PageSnapshot } from "@/types/externalTable";
 
 const schema: ExternalTableSchema = {
@@ -106,6 +106,22 @@ describe("externalTableEditing", () => {
     expect(() => gridValueForExternal("not-json", schema.columns[1])).toThrow("valid JSON");
   });
 
+  it("makes physical row deletion explicit in the save preview", () => {
+    const plan = buildExternalSavePlan(
+      {
+        dirtyRows: new Map(),
+        newRows: [],
+        newRowMeta: [],
+        deletedRows: new Set([0]),
+      },
+      page,
+      schema,
+    );
+
+    expect(externalSavePreview(plan, "remove_row")).toEqual(["DELETE ENTIRE SOURCE ROW record:1"]);
+    expect(externalSavePreview(plan, "delete_record")).toEqual(["DELETE RECORD record:1"]);
+  });
+
   it("blocks another save when a dispatched operation has no returned outcome", () => {
     const plan = buildExternalSavePlan(
       {
@@ -127,5 +143,30 @@ describe("externalTableEditing", () => {
     expect(result.unknown).toEqual(["update-1: no result returned"]);
     expect(result.reloadRequired).toBe(true);
     expect(result.saveBlocked).toBe(true);
+  });
+
+  it("blocks retrying pending changes after any conflict until reload", () => {
+    const plan = buildExternalSavePlan(
+      {
+        dirtyRows: new Map(),
+        newRows: [],
+        newRowMeta: [],
+        deletedRows: new Set([0]),
+      },
+      page,
+      schema,
+    );
+
+    const result = customSaveResultFromExternal(plan, {
+      operationResults: [{ operationId: "delete-1", outcome: "conflict", message: "source changed" }],
+      newSnapshotToken: null,
+      reloadRequired: false,
+      saveBlocked: false,
+    });
+
+    expect(result.conflicts).toEqual(["source changed"]);
+    expect(result.reloadRequired).toBe(true);
+    expect(result.saveBlocked).toBe(true);
+    expect(result.appliedDeletedRows).toEqual([]);
   });
 });

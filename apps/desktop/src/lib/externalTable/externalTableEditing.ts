@@ -1,7 +1,7 @@
 import type { CustomSaveResult } from "@/composables/useDataGridEditor";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
 import type { GridNewRowMeta } from "@/lib/dataGrid/gridNewRowPlacement";
-import type { ApplyChangesResult, ExternalColumn, ExternalOperation, ExternalTableSchema, PageSnapshot } from "@/types/externalTable";
+import type { ApplyChangesResult, DeleteMode, ExternalColumn, ExternalOperation, ExternalTableSchema, PageSnapshot } from "@/types/externalTable";
 
 export interface ExternalGridSaveChanges {
   dirtyRows: Map<number, Map<number, CellValue>>;
@@ -92,10 +92,12 @@ export function buildExternalSavePlan(changes: ExternalGridSaveChanges, page: Pa
   return { operations, changesByOperationId };
 }
 
-export function externalSavePreview(plan: ExternalSavePlan): string[] {
+export function externalSavePreview(plan: ExternalSavePlan, deleteMode: DeleteMode): string[] {
   return plan.operations.map((operation) => {
     if (operation.kind === "update") return `UPDATE ${operation.rowKey} ${operation.columnKey}`;
-    if (operation.kind === "delete") return `DELETE ${operation.rowKey}`;
+    if (operation.kind === "delete") {
+      return deleteMode === "delete_record" ? `DELETE RECORD ${operation.rowKey}` : `DELETE ENTIRE SOURCE ROW ${operation.rowKey}`;
+    }
     return `APPEND ${operation.values.length} cell(s)`;
   });
 }
@@ -145,6 +147,8 @@ export function customSaveResultFromExternal(plan: ExternalSavePlan, result: App
       }
     } else if (operationResult.outcome === "conflict") {
       custom.conflicts.push(message);
+      custom.reloadRequired = true;
+      custom.saveBlocked = true;
     } else if (operationResult.outcome === "unknown") {
       custom.unknown.push(message);
       custom.reloadRequired = true;
