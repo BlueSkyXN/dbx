@@ -200,7 +200,7 @@ fn read_document_bytes(bytes: &[u8], config: &CsvExternalConfig) -> Result<CsvDo
             ExternalTableError::invalid(format!("Unsupported CSV encoding label: {}", config.encoding))
         })?
     };
-    let (decoded, actual_encoding, had_errors) = encoding.decode(&bytes);
+    let (decoded, actual_encoding, had_errors) = encoding.decode(bytes);
     if had_errors {
         return Err(ExternalTableError::invalid(format!(
             "CSV file contains bytes invalid for encoding {}",

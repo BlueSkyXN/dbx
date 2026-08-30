@@ -799,9 +799,7 @@ fn copy_u64(
 }
 
 fn canonical_external_table_config(db_type: DatabaseType, value: Option<&Value>) -> Option<Value> {
-    if value.is_none() {
-        return None;
-    }
+    value?;
     let keys: &[&str] = match db_type {
         DatabaseType::Csv => &["delimiter", "hasHeader", "encoding"],
         DatabaseType::Xlsx => &["hasHeader", "dataRange"],
