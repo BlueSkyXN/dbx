@@ -170,10 +170,10 @@ jobs:
             perl -MLocale::Maketext::Simple -e 'print "Strawberry Perl ready"'
           fi
 
-          build_args=(--ci --no-sign --target "${{ matrix.rust-target }}")
+          build_args=(--ci --target "${{ matrix.rust-target }}")
 
           if [[ "${{ github.event_name }}" != "workflow_dispatch" || "${{ inputs.updater_artifacts }}" != "true" ]]; then
-            build_args+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+            build_args+=(--no-sign --config '{"bundle":{"createUpdaterArtifacts":false}}')
           fi
 
           pnpm exec tauri build "${build_args[@]}"
