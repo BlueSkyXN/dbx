@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+use serde_json::Number;
 use sha2::{Digest, Sha256};
 
 use super::ExternalTableError;
@@ -21,6 +22,57 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String, ExternalTableError> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn bytes_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub(crate) fn canonical_path_fingerprint(path: &Path) -> Result<String, ExternalTableError> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        ExternalTableError::io(format!("Failed to resolve external table path {}: {error}", path.display()))
+    })?;
+    Ok(bytes_sha256(canonical.as_os_str().as_encoded_bytes()))
+}
+
+pub(crate) fn scoped_snapshot_token(namespace: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("{namespace}:v1:{:x}", digest.finalize())
+}
+
+const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
+
+fn exact_integer(number: &Number) -> Option<i128> {
+    number.as_i64().map(i128::from).or_else(|| number.as_u64().map(i128::from))
+}
+
+pub(crate) fn json_numbers_equal(left: &Number, right: &Number) -> bool {
+    match (exact_integer(left), exact_integer(right)) {
+        (Some(left), Some(right)) => left == right,
+        (Some(integer), None) => integer_float_equal(integer, right),
+        (None, Some(integer)) => integer_float_equal(integer, left),
+        (None, None) => left.as_f64() == right.as_f64(),
+    }
+}
+
+fn integer_float_equal(integer: i128, float: &Number) -> bool {
+    if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&integer) {
+        return false;
+    }
+    float.as_f64().is_some_and(|float| float.is_finite() && float.fract() == 0.0 && float == integer as f64)
+}
+
+pub(crate) fn json_number_as_safe_f64(number: &Number) -> Option<f64> {
+    if let Some(integer) = exact_integer(number) {
+        return (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&integer).then_some(integer as f64);
+    }
+    number
+        .as_f64()
+        .filter(|value| value.is_finite() && !(value.fract() == 0.0 && value.abs() > MAX_SAFE_INTEGER as f64))
 }
 
 pub(crate) fn parse_index_key(key: &str, prefix: &str) -> Result<usize, ExternalTableError> {
@@ -47,6 +99,18 @@ pub(crate) fn unique_display_names(raw: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn replace_staged_file(staged: &Path, destination: &Path) -> Result<Option<String>, ExternalTableError> {
+    if std::fs::symlink_metadata(destination)
+        .map_err(|error| {
+            ExternalTableError::io(format!("Failed to inspect {} before replacement: {error}", destination.display()))
+        })?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(ExternalTableError::unsupported(format!(
+            "Refusing to replace symlinked external table file: {}",
+            destination.display()
+        )));
+    }
     let destination_permissions = std::fs::metadata(destination)
         .map_err(|error| {
             ExternalTableError::io(format!("Failed to inspect permissions for {}: {error}", destination.display()))

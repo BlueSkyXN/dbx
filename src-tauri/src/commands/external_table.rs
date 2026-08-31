@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use dbx_core::external::{
-    ApplyChangesRequest, ApplyChangesResult, ExternalTableRef, ExternalTableSchema, PageSnapshot, ReadPageRequest,
+    ApplyChangesRequest, ApplyChangesResult, DeleteMode, ExternalOperation, ExternalTableRef, ExternalTableSchema,
+    InsertMode, PageSnapshot, ReadPageRequest,
 };
 use tauri::State;
 
@@ -55,8 +56,20 @@ pub async fn external_table_apply_changes(
 ) -> Result<ApplyChangesResult, String> {
     ensure_connection_writable(state.inner(), &connection_id, "Write external table").await?;
     let adapter = state.external_tables.get(&connection_id).await.map_err(String::from)?;
-    if !adapter.capabilities().can_update {
-        return Err("External table adapter does not support updates".to_string());
+    let capabilities = adapter.capabilities();
+    for operation in &request.operations {
+        match operation {
+            ExternalOperation::Update { .. } if !capabilities.can_update => {
+                return Err("External table adapter does not support updates".to_string());
+            }
+            ExternalOperation::Insert { .. } if capabilities.insert_mode == InsertMode::Unsupported => {
+                return Err("External table adapter does not support inserts".to_string());
+            }
+            ExternalOperation::Delete { .. } if capabilities.delete_mode == DeleteMode::Unsupported => {
+                return Err("External table adapter does not support deletes".to_string());
+            }
+            _ => {}
+        }
     }
     adapter.apply_changes(request).await.map_err(String::from)
 }

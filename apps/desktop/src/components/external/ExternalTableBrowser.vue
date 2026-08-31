@@ -21,9 +21,20 @@ const props = defineProps<{
 }>();
 
 type DataGridHandle = {
+  isSaving: boolean;
   hasPendingChanges: () => boolean;
   isCustomSaveBlocked: () => boolean;
   discardPendingChanges: () => void;
+};
+
+type SaveContext = {
+  connectionId: string;
+  tableKey: string;
+  cursor: string | null;
+  loadGeneration: number;
+  page: PageSnapshot;
+  schema: ExternalTableSchema;
+  snapshotToken: string;
 };
 
 const { t } = useI18n();
@@ -37,11 +48,14 @@ const loading = ref(false);
 const error = ref("");
 const saveStatus = ref("");
 const saveBlocked = ref(false);
+const saveInFlight = ref(false);
 const currentCursor = ref<string | null>(null);
 const previousCursors = ref<Array<string | null>>([]);
+let loadGeneration = 0;
 const pageNumber = computed(() => previousCursors.value.length + 1);
 const connection = computed(() => connectionStore.getConfig(props.connectionId));
 const selectedTable = computed(() => tables.value.find((table) => table.tableKey === selectedTableKey.value));
+const saveInProgress = computed(() => saveInFlight.value || gridRef.value?.isSaving === true);
 const isDesktop = isTauriRuntime();
 
 function queryColumnType(valueType: string) {
@@ -53,8 +67,8 @@ function queryColumnType(valueType: string) {
 }
 
 const gridResult = computed<QueryResult>(() => ({
-  columns: (schema.value?.columns ?? page.value?.columns ?? []).map((column) => column.displayName),
-  column_types: (schema.value?.columns ?? page.value?.columns ?? []).map((column) => queryColumnType(column.valueType)),
+  columns: (page.value?.columns ?? schema.value?.columns ?? []).map((column) => column.displayName),
+  column_types: (page.value?.columns ?? schema.value?.columns ?? []).map((column) => queryColumnType(column.valueType)),
   rows: (page.value?.rows ?? []).map((row) => row.values.map(externalValueForGrid)),
   affected_rows: page.value?.rows.length ?? 0,
   execution_time_ms: 0,
@@ -62,60 +76,111 @@ const gridResult = computed<QueryResult>(() => ({
   has_more: !!page.value?.nextCursor,
 }));
 
-const editable = computed(() => !!schema.value?.writable && page.value?.readState === "complete" && schema.value.capabilities.canUpdate && !saveBlocked.value);
+const editable = computed(() => !!schema.value?.writable && page.value?.readState === "complete" && page.value.columns.some((column) => column.writable) && schema.value.capabilities.canUpdate && !saveBlocked.value);
 const canInsert = computed(() => schema.value?.capabilities.insertMode === "append");
 const canDelete = computed(() => schema.value?.capabilities.deleteMode !== "unsupported");
 
 function isCellReadonly(sourceRowIndex: number, columnIndex: number) {
-  const column = schema.value?.columns[columnIndex];
+  const column = page.value?.columns[columnIndex] ?? schema.value?.columns[columnIndex];
   const row = page.value?.rows[sourceRowIndex];
   if (!column || !row || !column.writable) return true;
   return (row.readonlyColumnKeys ?? []).includes(column.columnKey);
 }
 
 function saveSummary(result: CustomSaveResult) {
-  if (result.saveBlocked) return t("externalTable.saveUnknown");
+  if (result.unknown.length) return t("externalTable.saveUnknown");
   if (result.conflicts.length) return t("externalTable.saveConflict", { count: result.conflicts.length });
+  if (result.saveBlocked) return t("externalTable.saveUnknown");
   if (result.rejected.length) return t("externalTable.saveRejected", { count: result.rejected.length });
   return t("externalTable.saveApplied");
 }
 
+function tableMatches(left: ExternalTableRef | undefined, right: ExternalTableRef | undefined) {
+  return !!left && !!right && left.tableKey === right.tableKey;
+}
+
+function columnsMatch(left: ExternalTableSchema["columns"], right: PageSnapshot["columns"]) {
+  return left.length === right.length && left.every((column, index) => column.columnKey === right[index]?.columnKey);
+}
+
+function ownsCurrentPage(context: SaveContext) {
+  return (
+    context.loadGeneration === loadGeneration &&
+    props.connectionId === context.connectionId &&
+    selectedTableKey.value === context.tableKey &&
+    currentCursor.value === context.cursor &&
+    page.value === context.page &&
+    schema.value === context.schema &&
+    tableMatches(context.page.table, selectedTable.value)
+  );
+}
+
+function assertSaveContext(context: SaveContext) {
+  if (!ownsCurrentPage(context) || context.page.snapshotToken !== context.snapshotToken) {
+    throw new Error(t("externalTable.saveContextChanged"));
+  }
+}
+
 const customSaveHandler = computed<CustomSaveHandler | undefined>(() => {
-  if (!schema.value || !page.value) return undefined;
+  const currentPage = page.value;
+  const currentSchema = schema.value;
+  const currentTable = selectedTable.value;
+  if (!currentSchema || !currentPage || !tableMatches(currentPage.table, currentSchema.table) || !tableMatches(currentPage.table, currentTable)) return undefined;
+  const context: SaveContext = {
+    connectionId: props.connectionId,
+    tableKey: currentPage.table.tableKey,
+    cursor: currentCursor.value,
+    loadGeneration,
+    page: currentPage,
+    schema: currentSchema,
+    snapshotToken: currentPage.snapshotToken,
+  };
+  let completedSave: SaveContext | undefined;
   return {
     canInsert: canInsert.value,
     supportsInsert: canInsert.value,
     canDelete: canDelete.value,
-    targetLabel: selectedTable.value?.displayName,
-    confirmDiscardPending: () => window.confirm(t("externalTable.discardPendingConfirm")),
-    readonlyColumns: schema.value.columns.filter((column) => !column.writable).map((column) => column.displayName),
-    preview: async (changes) => externalSavePreview(buildExternalSavePlan(changes, page.value!, schema.value!)),
+    targetLabel: currentPage.table.displayName,
+    confirmDiscardPending: () => !saveInProgress.value && window.confirm(t("externalTable.discardPendingConfirm")),
+    readonlyColumns: currentPage.columns.filter((column) => !column.writable).map((column) => column.displayName),
+    preview: async (changes) => {
+      assertSaveContext(context);
+      return externalSavePreview(buildExternalSavePlan(changes, currentPage, currentSchema), currentSchema.capabilities.deleteMode);
+    },
     save: async (changes) => {
-      const currentPage = page.value;
-      const currentSchema = schema.value;
-      if (!currentPage || !currentSchema || !selectedTable.value) throw new Error(t("externalTable.notLoaded"));
+      assertSaveContext(context);
       const plan = buildExternalSavePlan(changes, currentPage, currentSchema);
       if (!plan.operations.length) throw new Error(t("externalTable.noValidChanges"));
-      const result = await api.externalTableApplyChanges(props.connectionId, {
-        table: selectedTable.value,
-        snapshotToken: currentPage.snapshotToken,
-        operations: plan.operations,
-      });
-      if (result.newSnapshotToken) currentPage.snapshotToken = result.newSnapshotToken;
-      const custom = customSaveResultFromExternal(plan, result);
-      saveBlocked.value = custom.saveBlocked;
-      saveStatus.value = saveSummary(custom);
-      return custom;
+      saveInFlight.value = true;
+      try {
+        const result = await api.externalTableApplyChanges(context.connectionId, {
+          table: currentPage.table,
+          snapshotToken: context.snapshotToken,
+          operations: plan.operations,
+        });
+        assertSaveContext(context);
+        if (result.newSnapshotToken) {
+          currentPage.snapshotToken = result.newSnapshotToken;
+          context.snapshotToken = result.newSnapshotToken;
+        }
+        const custom = customSaveResultFromExternal(plan, result);
+        saveBlocked.value = custom.saveBlocked;
+        saveStatus.value = saveSummary(custom);
+        completedSave = context;
+        return custom;
+      } finally {
+        saveInFlight.value = false;
+      }
     },
     applySavedChanges: ({ dirtyRows }) => {
-      const currentPage = page.value;
-      const currentSchema = schema.value;
-      if (!currentPage || !currentSchema) return;
+      const ownsCompletion = completedSave === context && ownsCurrentPage(context);
+      completedSave = undefined;
+      if (!ownsCompletion) return;
       for (const [sourceRowIndex, changes] of dirtyRows) {
         const row = currentPage.rows[sourceRowIndex];
         if (!row) continue;
         for (const [columnIndex, value] of changes) {
-          const column = currentSchema.columns[columnIndex];
+          const column = currentPage.columns[columnIndex] ?? currentSchema.columns[columnIndex];
           if (column) row.values[columnIndex] = gridValueForExternal(value, column);
         }
       }
@@ -126,30 +191,44 @@ const customSaveHandler = computed<CustomSaveHandler | undefined>(() => {
 async function loadPage(cursor: string | null, refreshSchema: boolean) {
   const table = selectedTable.value;
   if (!table) return false;
+  const generation = ++loadGeneration;
+  const connectionId = props.connectionId;
   loading.value = true;
   error.value = "";
   try {
-    if (refreshSchema || !schema.value) schema.value = await api.externalTableDescribe(props.connectionId, table);
-    page.value = await api.externalTableReadPage(props.connectionId, { table, cursor, limit: 200 });
+    const nextSchema = refreshSchema || !schema.value ? await api.externalTableDescribe(connectionId, table) : schema.value;
+    const nextPage = await api.externalTableReadPage(connectionId, { table, cursor, limit: 200 });
+    if (generation !== loadGeneration || props.connectionId !== connectionId || selectedTable.value?.tableKey !== table.tableKey) {
+      return false;
+    }
+    if (!tableMatches(nextSchema.table, nextPage.table) || !columnsMatch(nextSchema.columns, nextPage.columns)) {
+      throw new Error(t("externalTable.schemaChangedDuringLoad"));
+    }
+    schema.value = nextSchema;
+    page.value = nextPage;
     currentCursor.value = cursor;
     saveBlocked.value = false;
-    saveStatus.value = page.value.readState === "incomplete" ? t("externalTable.incompleteRead") : "";
+    saveStatus.value = nextPage.readState === "incomplete" ? t("externalTable.incompleteRead") : "";
     return true;
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause);
+    if (generation === loadGeneration) error.value = cause instanceof Error ? cause.message : String(cause);
     return false;
   } finally {
-    loading.value = false;
+    if (generation === loadGeneration) loading.value = false;
   }
 }
 
 async function loadTables() {
+  const generation = ++loadGeneration;
+  const connectionId = props.connectionId;
   loading.value = true;
   error.value = "";
   try {
     if (!isDesktop) throw new Error(t("externalTable.desktopOnly"));
-    await connectionStore.ensureConnected(props.connectionId);
-    tables.value = await api.externalTableList(props.connectionId);
+    await connectionStore.ensureConnected(connectionId);
+    const nextTables = await api.externalTableList(connectionId);
+    if (generation !== loadGeneration || props.connectionId !== connectionId) return;
+    tables.value = nextTables;
     selectedTableKey.value = tables.value[0]?.tableKey ?? "";
     schema.value = undefined;
     page.value = undefined;
@@ -157,13 +236,14 @@ async function loadTables() {
     currentCursor.value = null;
     if (selectedTableKey.value) await loadPage(null, true);
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause);
+    if (generation === loadGeneration) error.value = cause instanceof Error ? cause.message : String(cause);
   } finally {
-    loading.value = false;
+    if (generation === loadGeneration) loading.value = false;
   }
 }
 
 function confirmDiscardPending() {
+  if (saveInProgress.value) return false;
   if (!gridRef.value?.hasPendingChanges()) return true;
   if (!window.confirm(t("externalTable.discardPendingConfirm"))) return false;
   gridRef.value.discardPendingChanges();
@@ -217,7 +297,7 @@ defineExpose({ refresh });
   <div class="flex h-full min-h-0 flex-col bg-background">
     <div class="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-2">
       <Select v-if="tables.length > 1" :model-value="selectedTableKey" @update:model-value="(value) => selectTable(String(value))">
-        <SelectTrigger class="h-8 w-64 max-w-full">
+        <SelectTrigger class="h-8 w-64 max-w-full" :disabled="loading || saveInProgress">
           <SelectValue :placeholder="t('externalTable.selectTable')" />
         </SelectTrigger>
         <SelectContent>
@@ -230,13 +310,13 @@ defineExpose({ refresh });
       <span v-if="schema?.readonlyReason" class="max-w-xl truncate text-xs text-muted-foreground" :title="schema.readonlyReason">{{ schema.readonlyReason }}</span>
       <span class="flex-1" />
       <span class="text-xs text-muted-foreground">{{ t("externalTable.page", { page: pageNumber }) }}</span>
-      <Button size="icon" variant="outline" class="h-8 w-8" :disabled="loading || previousCursors.length === 0" :title="t('externalTable.previousPage')" @click="previousPage">
+      <Button size="icon" variant="outline" class="h-8 w-8" :disabled="loading || saveInProgress || previousCursors.length === 0" :title="t('externalTable.previousPage')" @click="previousPage">
         <ChevronLeft class="h-4 w-4" />
       </Button>
-      <Button size="icon" variant="outline" class="h-8 w-8" :disabled="loading || !page?.nextCursor" :title="t('externalTable.nextPage')" @click="nextPage">
+      <Button size="icon" variant="outline" class="h-8 w-8" :disabled="loading || saveInProgress || !page?.nextCursor" :title="t('externalTable.nextPage')" @click="nextPage">
         <ChevronRight class="h-4 w-4" />
       </Button>
-      <Button size="sm" variant="outline" class="h-8 gap-1.5" :disabled="loading" @click="refresh">
+      <Button size="sm" variant="outline" class="h-8 gap-1.5" :disabled="loading || saveInProgress" @click="refresh">
         <RefreshCw class="h-3.5 w-3.5" />
         {{ t("common.refresh") }}
       </Button>
@@ -245,14 +325,14 @@ defineExpose({ refresh });
     <div v-if="saveBlocked" class="flex shrink-0 items-center gap-2 border-b border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
       <ShieldAlert class="h-4 w-4 shrink-0" />
       <span class="min-w-0 flex-1">{{ saveStatus || t("externalTable.saveUnknown") }}</span>
-      <Button size="sm" variant="outline" class="h-7" @click="refresh">{{ t("externalTable.reload") }}</Button>
+      <Button size="sm" variant="outline" class="h-7" :disabled="saveInProgress" @click="refresh">{{ t("externalTable.reload") }}</Button>
     </div>
     <div v-else-if="saveStatus" class="shrink-0 border-b bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground">{{ saveStatus }}</div>
 
     <div v-if="error" class="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
       <ShieldAlert class="h-8 w-8 text-destructive" />
       <p class="max-w-2xl text-sm text-destructive">{{ error }}</p>
-      <Button variant="outline" size="sm" @click="loadTables">{{ t("common.retry") }}</Button>
+      <Button variant="outline" size="sm" :disabled="saveInProgress" @click="loadTables">{{ t("common.retry") }}</Button>
     </div>
     <div v-else-if="!selectedTable && !loading" class="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">{{ t("externalTable.noTables") }}</div>
     <div v-else class="relative min-h-0 flex-1">

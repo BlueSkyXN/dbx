@@ -1,7 +1,7 @@
 import type { CustomSaveResult } from "@/composables/useDataGridEditor";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
 import type { GridNewRowMeta } from "@/lib/dataGrid/gridNewRowPlacement";
-import type { ApplyChangesResult, ExternalColumn, ExternalOperation, ExternalTableSchema, PageSnapshot } from "@/types/externalTable";
+import type { ApplyChangesResult, DeleteMode, ExternalColumn, ExternalOperation, ExternalTableSchema, PageSnapshot } from "@/types/externalTable";
 
 export interface ExternalGridSaveChanges {
   dirtyRows: Map<number, Map<number, CellValue>>;
@@ -34,6 +34,7 @@ export function gridValueForExternal(value: CellValue, column: ExternalColumn): 
 }
 
 export function buildExternalSavePlan(changes: ExternalGridSaveChanges, page: PageSnapshot, schema: ExternalTableSchema): ExternalSavePlan {
+  const columns = page.columns.length ? page.columns : schema.columns;
   const operations: ExternalOperation[] = [];
   const changesByOperationId = new Map<string, PlannedChange>();
   let sequence = 0;
@@ -44,7 +45,7 @@ export function buildExternalSavePlan(changes: ExternalGridSaveChanges, page: Pa
     const row = page.rows[sourceRowIndex];
     if (!row) throw new Error(`External row ${sourceRowIndex + 1} is no longer available; reload first.`);
     for (const [columnIndex, value] of dirtyColumns) {
-      const column = schema.columns[columnIndex];
+      const column = columns[columnIndex];
       if (!column) throw new Error(`External column ${columnIndex + 1} is no longer available; reload first.`);
       const id = operationId("update");
       operations.push({
@@ -75,7 +76,7 @@ export function buildExternalSavePlan(changes: ExternalGridSaveChanges, page: Pa
     const meta = changes.newRowMeta[newRowIndex];
     if (!meta) throw new Error(`External inserted row ${newRowIndex + 1} has no stable pending-row token.`);
     const id = operationId("insert");
-    const values = schema.columns.flatMap((column, columnIndex) =>
+    const values = columns.flatMap((column, columnIndex) =>
       column.writable
         ? [
             {
@@ -92,10 +93,12 @@ export function buildExternalSavePlan(changes: ExternalGridSaveChanges, page: Pa
   return { operations, changesByOperationId };
 }
 
-export function externalSavePreview(plan: ExternalSavePlan): string[] {
+export function externalSavePreview(plan: ExternalSavePlan, deleteMode: DeleteMode): string[] {
   return plan.operations.map((operation) => {
     if (operation.kind === "update") return `UPDATE ${operation.rowKey} ${operation.columnKey}`;
-    if (operation.kind === "delete") return `DELETE ${operation.rowKey}`;
+    if (operation.kind === "delete") {
+      return deleteMode === "delete_record" ? `DELETE RECORD ${operation.rowKey}` : `DELETE ENTIRE SOURCE ROW ${operation.rowKey}`;
+    }
     return `APPEND ${operation.values.length} cell(s)`;
   });
 }
@@ -145,6 +148,8 @@ export function customSaveResultFromExternal(plan: ExternalSavePlan, result: App
       }
     } else if (operationResult.outcome === "conflict") {
       custom.conflicts.push(message);
+      custom.reloadRequired = true;
+      custom.saveBlocked = true;
     } else if (operationResult.outcome === "unknown") {
       custom.unknown.push(message);
       custom.reloadRequired = true;

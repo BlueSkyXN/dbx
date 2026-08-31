@@ -7,7 +7,10 @@ use calamine::{open_workbook_auto, Data, Reader};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::Value;
 
-use super::file_support::{file_sha256, parse_index_key, replace_staged_file, unique_display_names};
+use super::file_support::{
+    canonical_path_fingerprint, file_sha256, json_number_as_safe_f64, json_numbers_equal, parse_index_key,
+    replace_staged_file, scoped_snapshot_token, unique_display_names,
+};
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, DeleteMode, ExternalColumn,
     ExternalConnectionTestResult, ExternalOperation, ExternalRow, ExternalTableAdapter, ExternalTableError,
@@ -35,6 +38,15 @@ struct SheetBounds {
     end_col: u32,
 }
 
+impl SheetBounds {
+    fn contains(self, other: Self) -> bool {
+        self.start_row <= other.start_row
+            && self.end_row >= other.end_row
+            && self.start_col <= other.start_col
+            && self.end_col >= other.end_col
+    }
+}
+
 #[derive(Debug)]
 struct XlsxSheetDocument {
     columns: Vec<ExternalColumn>,
@@ -43,6 +55,8 @@ struct XlsxSheetDocument {
     protected_rows: HashSet<u32>,
     bounds: SheetBounds,
     data_start_row: u32,
+    data_row_count: usize,
+    structural_mutations_safe: bool,
 }
 
 #[derive(Debug)]
@@ -112,9 +126,15 @@ impl ExternalTableAdapter for XlsxAdapter {
         let table = table.clone();
         let capabilities = self.capabilities();
         tokio::task::spawn_blocking(move || {
-            let readonly_reason = workbook_write_restriction(&path)?;
-            let document = read_sheet_document(&path, &sheet_name, &config)?;
+            let (stable_path, _) = stable_xlsx_copy(&path)?;
+            let readonly_reason = workbook_write_restriction(&stable_path)?;
+            let document = read_sheet_document(&stable_path, &sheet_name, &config)?;
             let mut columns = document.columns;
+            let mut capabilities = capabilities;
+            if !document.structural_mutations_safe {
+                capabilities.insert_mode = InsertMode::Unsupported;
+                capabilities.delete_mode = DeleteMode::Unsupported;
+            }
             let writable = readonly_reason.is_none();
             if !writable {
                 for column in &mut columns {
@@ -135,14 +155,15 @@ impl ExternalTableAdapter for XlsxAdapter {
         let config = self.config.clone();
         let table = request.table;
         tokio::task::spawn_blocking(move || {
-            let mut document = read_sheet_document(&path, &sheet_name, &config)?;
-            let readonly_reason = workbook_write_restriction(&path)?;
+            let (stable_path, file_hash) = stable_xlsx_copy(&path)?;
+            let mut document = read_sheet_document(&stable_path, &sheet_name, &config)?;
+            let readonly_reason = workbook_write_restriction(&stable_path)?;
             if readonly_reason.is_some() {
                 for column in &mut document.columns {
                     column.writable = false;
                 }
             }
-            let row_count = document.bounds.end_row.saturating_sub(document.data_start_row).saturating_add(1) as usize;
+            let row_count = document.data_row_count;
             if offset > row_count {
                 return Err(ExternalTableError::invalid(format!(
                     "XLSX cursor is past the end of the worksheet: {offset}"
@@ -169,7 +190,7 @@ impl ExternalTableAdapter for XlsxAdapter {
                 columns: document.columns,
                 rows,
                 next_cursor: (end < row_count).then(|| end.to_string()),
-                snapshot_token: file_sha256(&path)?,
+                snapshot_token: xlsx_snapshot_token(&path, &file_hash, &sheet_name, &config)?,
                 read_state: ReadState::Complete,
             })
         })
@@ -210,6 +231,43 @@ fn validate_xlsx_path(path: &Path) -> Result<(), ExternalTableError> {
         ));
     }
     Ok(())
+}
+
+fn stable_xlsx_copy(path: &Path) -> Result<(tempfile::TempPath, String), ExternalTableError> {
+    validate_xlsx_path(path)?;
+    let parent = path.parent().ok_or_else(|| ExternalTableError::io("XLSX path has no parent directory"))?;
+    for _ in 0..3 {
+        let before = file_sha256(path)?;
+        let staged = tempfile::Builder::new()
+            .prefix(".dbx-read-")
+            .suffix(".xlsx")
+            .tempfile_in(parent)
+            .or_else(|_| tempfile::Builder::new().prefix("dbx-read-").suffix(".xlsx").tempfile())
+            .map_err(|error| ExternalTableError::io(format!("Failed to stage XLSX snapshot: {error}")))?;
+        let staged_path = staged.into_temp_path();
+        std::fs::copy(path, &staged_path)
+            .map_err(|error| ExternalTableError::io(format!("Failed to copy XLSX snapshot: {error}")))?;
+        let staged_hash = file_sha256(&staged_path)?;
+        let after = file_sha256(path)?;
+        if before == after && before == staged_hash {
+            return Ok((staged_path, before));
+        }
+    }
+    Err(ExternalTableError::io(
+        "XLSX workbook changed repeatedly while it was being read; retry after external writes finish",
+    ))
+}
+
+fn xlsx_snapshot_token(
+    path: &Path,
+    file_hash: &str,
+    sheet_name: &str,
+    config: &XlsxExternalConfig,
+) -> Result<String, ExternalTableError> {
+    let path_fingerprint = canonical_path_fingerprint(path)?;
+    let data_range = config.data_range.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("<used>");
+    let has_header = if config.has_header { "header" } else { "no-header" };
+    Ok(scoped_snapshot_token("xlsx", &[&path_fingerprint, file_hash, sheet_name, data_range, has_header]))
 }
 
 fn workbook_write_restriction(path: &Path) -> Result<Option<String>, ExternalTableError> {
@@ -256,8 +314,25 @@ fn read_sheet_document(
     let formulas = workbook
         .worksheet_formula(sheet_name)
         .map_err(|error| ExternalTableError::invalid(format!("Failed to read worksheet formulas: {error}")))?;
+    let used_bounds = range.start().zip(range.end()).map(|(start, end)| SheetBounds {
+        start_row: start.0,
+        end_row: end.0,
+        start_col: start.1,
+        end_col: end.1,
+    });
     let bounds = resolve_sheet_bounds(&range, config.data_range.as_deref())?;
     let data_start_row = bounds.start_row + u32::from(config.has_header);
+    let selected_used_end_row = (bounds.start_row..=bounds.end_row).rev().find(|row| {
+        (bounds.start_col..=bounds.end_col).any(|column| {
+            range.get_value((*row, column)).is_some_and(|value| !matches!(value, Data::Empty))
+                || formulas.get_value((*row, column)).is_some_and(|formula| !formula.trim().is_empty())
+        })
+    });
+    let data_row_count = selected_used_end_row
+        .filter(|end_row| data_start_row <= *end_row)
+        .map(|end_row| end_row.saturating_sub(data_start_row).saturating_add(1) as usize)
+        .unwrap_or(0);
+    let structural_mutations_safe = used_bounds.is_none_or(|used| bounds.contains(used));
     let width = bounds.end_col.saturating_sub(bounds.start_col).saturating_add(1) as usize;
     let raw_headers = if config.has_header {
         (bounds.start_col..=bounds.end_col)
@@ -271,8 +346,9 @@ fn read_sheet_document(
     let mut readonly_cells = HashSet::new();
     let mut protected_rows = HashSet::new();
     let mut inferred_types = vec![ExternalValueType::Unknown; width];
-    if data_start_row <= bounds.end_row {
-        for row in data_start_row..=bounds.end_row {
+    if data_row_count > 0 {
+        let data_end_row = data_start_row + data_row_count as u32 - 1;
+        for row in data_start_row..=data_end_row {
             for (column_index, column) in (bounds.start_col..=bounds.end_col).enumerate() {
                 let value = range.get_value((row, column)).map(data_to_json).unwrap_or(Value::Null);
                 inferred_types[column_index] = merge_value_type(inferred_types[column_index], value_type(&value));
@@ -297,7 +373,70 @@ fn read_sheet_document(
             writable: true,
         })
         .collect();
-    Ok(XlsxSheetDocument { columns, values, readonly_cells, protected_rows, bounds, data_start_row })
+    Ok(XlsxSheetDocument {
+        columns,
+        values,
+        readonly_cells,
+        protected_rows,
+        bounds,
+        data_start_row,
+        data_row_count,
+        structural_mutations_safe,
+    })
+}
+
+fn xlsx_data_rows(document: &XlsxSheetDocument) -> Vec<Vec<Value>> {
+    (0..document.data_row_count)
+        .map(|row_offset| {
+            let row = document.data_start_row + row_offset as u32;
+            (document.bounds.start_col..=document.bounds.end_col)
+                .map(|column| document.values.get(&(row, column)).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect()
+}
+
+fn xlsx_readonly_rows(document: &XlsxSheetDocument) -> Vec<Vec<bool>> {
+    (0..document.data_row_count)
+        .map(|row_offset| {
+            let row = document.data_start_row + row_offset as u32;
+            (document.bounds.start_col..=document.bounds.end_col)
+                .map(|column| document.readonly_cells.contains(&(row, column)))
+                .collect()
+        })
+        .collect()
+}
+
+fn xlsx_readback_matches(
+    expected_rows: &[Vec<Value>],
+    expected_readonly: &[Vec<bool>],
+    actual: &XlsxSheetDocument,
+) -> bool {
+    let actual_rows = xlsx_data_rows(actual);
+    let actual_readonly = xlsx_readonly_rows(actual);
+    expected_rows.len() == actual_rows.len()
+        && expected_rows.iter().enumerate().all(|(row_index, expected_row)| {
+            expected_row.len() == actual_rows[row_index].len()
+                && expected_row.iter().enumerate().all(|(column_index, expected)| {
+                    let expected_is_readonly = expected_readonly
+                        .get(row_index)
+                        .and_then(|row| row.get(column_index))
+                        .copied()
+                        .unwrap_or(false);
+                    let actual_is_readonly =
+                        actual_readonly.get(row_index).and_then(|row| row.get(column_index)).copied().unwrap_or(false);
+                    expected_is_readonly
+                        || (!actual_is_readonly
+                            && external_values_equal(expected, &actual_rows[row_index][column_index]))
+                })
+        })
+}
+
+fn external_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => json_numbers_equal(left, right),
+        _ => left == right,
+    }
 }
 
 fn resolve_sheet_bounds(
@@ -440,21 +579,8 @@ fn apply_xlsx_changes(
     config: &XlsxExternalConfig,
     request: ApplyChangesRequest,
 ) -> Result<ApplyChangesResult, ExternalTableError> {
-    if let Some(reason) = workbook_write_restriction(path)? {
-        return Ok(ApplyChangesResult {
-            operation_results: request
-                .operations
-                .iter()
-                .map(|operation| {
-                    OperationResult::new(operation.operation_id(), OperationOutcome::Rejected).message(reason.clone())
-                })
-                .collect(),
-            new_snapshot_token: Some(file_sha256(path)?),
-            reload_required: false,
-            save_blocked: false,
-        });
-    }
-    let current_snapshot = file_sha256(path)?;
+    let (stable_path, file_hash) = stable_xlsx_copy(path)?;
+    let current_snapshot = xlsx_snapshot_token(path, &file_hash, sheet_name, config)?;
     if current_snapshot != request.snapshot_token {
         return Ok(ApplyChangesResult {
             operation_results: request
@@ -465,20 +591,37 @@ fn apply_xlsx_changes(
                         .message("XLSX workbook changed after it was read")
                 })
                 .collect(),
-            new_snapshot_token: Some(current_snapshot),
+            new_snapshot_token: None,
             reload_required: true,
+            save_blocked: true,
+        });
+    }
+    if let Some(reason) = workbook_write_restriction(&stable_path)? {
+        return Ok(ApplyChangesResult {
+            operation_results: request
+                .operations
+                .iter()
+                .map(|operation| {
+                    OperationResult::new(operation.operation_id(), OperationOutcome::Rejected).message(reason.clone())
+                })
+                .collect(),
+            new_snapshot_token: Some(current_snapshot),
+            reload_required: false,
             save_blocked: false,
         });
     }
-
-    let document = read_sheet_document(path, sheet_name, config)?;
-    let mut workbook = umya_spreadsheet::reader::xlsx::read(path)
+    let document = read_sheet_document(&stable_path, sheet_name, config)?;
+    let mut expected_rows = xlsx_data_rows(&document);
+    let mut expected_readonly = xlsx_readonly_rows(&document);
+    let mut workbook = umya_spreadsheet::reader::xlsx::read(&stable_path)
         .map_err(|error| ExternalTableError::invalid(format!("Failed to open XLSX workbook for editing: {error}")))?;
     let mut results = vec![None; request.operations.len()];
     let mut updates = Vec::new();
     let mut deletes = Vec::new();
     let mut inserts = Vec::new();
     let mut seen_delete_rows = HashSet::new();
+    let data_end_row =
+        (document.data_row_count > 0).then(|| document.data_start_row + document.data_row_count as u32 - 1);
 
     for (operation_index, operation) in request.operations.iter().enumerate() {
         match operation {
@@ -504,7 +647,7 @@ fn apply_xlsx_changes(
                 if row == 0
                     || column == 0
                     || row - 1 < document.data_start_row
-                    || row - 1 > document.bounds.end_row
+                    || data_end_row.is_none_or(|data_end_row| row - 1 > data_end_row)
                     || column - 1 < document.bounds.start_col
                     || column - 1 > document.bounds.end_col
                 {
@@ -521,7 +664,10 @@ fn apply_xlsx_changes(
                     );
                     continue;
                 }
-                if document.values.get(&(row - 1, column - 1)).cloned().unwrap_or(Value::Null) != *old_value {
+                if !external_values_equal(
+                    &document.values.get(&(row - 1, column - 1)).cloned().unwrap_or(Value::Null),
+                    old_value,
+                ) {
                     results[operation_index] = Some(
                         OperationResult::new(operation_id, OperationOutcome::Conflict)
                             .message("XLSX cell value changed after it was read"),
@@ -532,6 +678,13 @@ fn apply_xlsx_changes(
                     results[operation_index] =
                         Some(OperationResult::new(operation_id, OperationOutcome::Rejected).message(error.to_string()));
                     continue;
+                }
+                let expected_row = (row - 1 - document.data_start_row) as usize;
+                let expected_column = (column - 1 - document.bounds.start_col) as usize;
+                if let Some(cell) =
+                    expected_rows.get_mut(expected_row).and_then(|expected_row| expected_row.get_mut(expected_column))
+                {
+                    *cell = new_value.clone();
                 }
                 updates.push((operation_index, row, column, new_value.clone()));
             }
@@ -545,10 +698,19 @@ fn apply_xlsx_changes(
                         continue;
                     }
                 };
-                if row == 0 || row - 1 < document.data_start_row || row - 1 > document.bounds.end_row {
+                if row == 0
+                    || row - 1 < document.data_start_row
+                    || data_end_row.is_none_or(|data_end_row| row - 1 > data_end_row)
+                {
                     results[operation_index] = Some(
                         OperationResult::new(operation_id, OperationOutcome::Rejected)
                             .message("XLSX row key is outside the selected data range or points to the header"),
+                    );
+                } else if !document.structural_mutations_safe {
+                    results[operation_index] = Some(
+                        OperationResult::new(operation_id, OperationOutcome::Rejected).message(
+                            "XLSX row deletion is disabled because the selected data range does not contain all used workbook cells",
+                        ),
                     );
                 } else if document.protected_rows.contains(&(row - 1)) {
                     results[operation_index] = Some(
@@ -565,6 +727,14 @@ fn apply_xlsx_changes(
                 }
             }
             ExternalOperation::Insert { operation_id, values } => {
+                if !document.structural_mutations_safe {
+                    results[operation_index] = Some(
+                        OperationResult::new(operation_id, OperationOutcome::Rejected).message(
+                            "XLSX append is disabled because the selected data range does not contain all used workbook cells",
+                        ),
+                    );
+                    continue;
+                }
                 let mut row = vec![Value::Null; document.columns.len()];
                 let mut seen_columns = HashSet::new();
                 let mut rejected = None;
@@ -604,6 +774,38 @@ fn apply_xlsx_changes(
         }
     }
 
+    if config.data_range.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        let capacity = if document.data_start_row > document.bounds.end_row {
+            0
+        } else {
+            document.bounds.end_row.saturating_sub(document.data_start_row).saturating_add(1) as usize
+        };
+        let remaining_rows = document.data_row_count.saturating_sub(deletes.len());
+        let available_rows = capacity.saturating_sub(remaining_rows);
+        if inserts.len() > available_rows {
+            for (operation_index, _) in inserts.split_off(available_rows) {
+                results[operation_index] = Some(
+                    OperationResult::new(
+                        request.operations[operation_index].operation_id(),
+                        OperationOutcome::Rejected,
+                    )
+                    .message("XLSX append would exceed the configured data range"),
+                );
+            }
+        }
+    }
+
+    deletes.sort_by_key(|(_, row)| std::cmp::Reverse(*row));
+    for (_, row) in &deletes {
+        let expected_index = (*row - 1 - document.data_start_row) as usize;
+        if expected_index < expected_rows.len() {
+            expected_rows.remove(expected_index);
+            expected_readonly.remove(expected_index);
+        }
+    }
+    expected_rows.extend(inserts.iter().map(|(_, row)| row.clone()));
+    expected_readonly.extend(inserts.iter().map(|(_, row)| vec![false; row.len()]));
+
     {
         let sheet = workbook
             .sheet_by_name_mut(sheet_name)
@@ -617,15 +819,14 @@ fn apply_xlsx_changes(
         }
     }
 
-    deletes.sort_by_key(|(_, row)| std::cmp::Reverse(*row));
     for (operation_index, row) in &deletes {
         workbook.remove_row(sheet_name, *row, 1);
         results[*operation_index] =
             Some(OperationResult::new(request.operations[*operation_index].operation_id(), OperationOutcome::Applied));
     }
 
-    let deleted_count = deletes.len() as u32;
-    let mut append_row = document.bounds.end_row.saturating_add(2).saturating_sub(deleted_count);
+    let remaining_rows = document.data_row_count.saturating_sub(deletes.len()) as u32;
+    let mut append_row = document.data_start_row.saturating_add(remaining_rows).saturating_add(1);
     {
         let sheet = workbook
             .sheet_by_name_mut(sheet_name)
@@ -654,12 +855,14 @@ fn apply_xlsx_changes(
         })
         .collect::<Vec<_>>();
     if !operation_results.iter().any(|result| result.outcome == OperationOutcome::Applied) {
-        let reload_required = operation_results.iter().any(|result| result.outcome == OperationOutcome::Conflict);
+        let has_unresolved = operation_results
+            .iter()
+            .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
         return Ok(ApplyChangesResult {
             operation_results,
-            new_snapshot_token: Some(current_snapshot),
-            reload_required,
-            save_blocked: false,
+            new_snapshot_token: (!has_unresolved).then_some(current_snapshot),
+            reload_required: has_unresolved,
+            save_blocked: has_unresolved,
         });
     }
 
@@ -672,7 +875,8 @@ fn apply_xlsx_changes(
     File::open(&staged_path)
         .and_then(|file| file.sync_all())
         .map_err(|error| ExternalTableError::io(format!("Failed to sync XLSX staging file: {error}")))?;
-    let before_replace = file_sha256(path)?;
+    let before_replace_hash = file_sha256(path)?;
+    let before_replace = xlsx_snapshot_token(path, &before_replace_hash, sheet_name, config)?;
     if before_replace != request.snapshot_token {
         let operation_results = operation_results
             .into_iter()
@@ -686,35 +890,44 @@ fn apply_xlsx_changes(
             .collect();
         return Ok(ApplyChangesResult {
             operation_results,
-            new_snapshot_token: Some(before_replace),
+            new_snapshot_token: None,
             reload_required: true,
-            save_blocked: false,
+            save_blocked: true,
         });
     }
     let replace_warning = replace_staged_file(&staged_path, path)?;
-    let new_snapshot = match file_sha256(path) {
-        Ok(snapshot) => Some(snapshot),
+    let new_snapshot = match stable_xlsx_copy(path) {
+        Ok((readback_path, snapshot_hash)) => {
+            match read_sheet_document(&readback_path, sheet_name, config) {
+                Ok(readback) if xlsx_readback_matches(&expected_rows, &expected_readonly, &readback) => {}
+                Ok(_) => mark_xlsx_applied_unknown(
+                    &mut operation_results,
+                    "saved, but worksheet content readback differs; reload required",
+                ),
+                Err(error) => mark_xlsx_applied_unknown(
+                    &mut operation_results,
+                    &format!("saved, but worksheet readback failed: {error}"),
+                ),
+            }
+            Some(xlsx_snapshot_token(path, &snapshot_hash, sheet_name, config)?)
+        }
         Err(error) => {
-            annotate_xlsx_applied(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
+            mark_xlsx_applied_unknown(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
             None
         }
     };
-    if let Err(error) = read_sheet_document(path, sheet_name, config) {
-        annotate_xlsx_applied(&mut operation_results, &format!("saved, but worksheet readback failed: {error}"));
-    }
     if let Some(warning) = replace_warning {
-        annotate_xlsx_applied(&mut operation_results, &warning);
+        mark_xlsx_applied_unknown(&mut operation_results, &warning);
     }
-    Ok(ApplyChangesResult {
-        operation_results,
-        new_snapshot_token: new_snapshot,
-        reload_required: true,
-        save_blocked: false,
-    })
+    let save_blocked = operation_results
+        .iter()
+        .any(|result| matches!(result.outcome, OperationOutcome::Conflict | OperationOutcome::Unknown));
+    Ok(ApplyChangesResult { operation_results, new_snapshot_token: new_snapshot, reload_required: true, save_blocked })
 }
 
-fn annotate_xlsx_applied(results: &mut [OperationResult], message: &str) {
+fn mark_xlsx_applied_unknown(results: &mut [OperationResult], message: &str) {
     for result in results.iter_mut().filter(|result| result.outcome == OperationOutcome::Applied) {
+        result.outcome = OperationOutcome::Unknown;
         result.message = Some(match result.message.take() {
             Some(existing) => format!("{existing}; {message}"),
             None => message.to_string(),
@@ -725,6 +938,11 @@ fn annotate_xlsx_applied(results: &mut [OperationResult], message: &str) {
 fn validate_xlsx_value(value: &Value) -> Result<(), ExternalTableError> {
     if matches!(value, Value::Array(_) | Value::Object(_)) {
         return Err(ExternalTableError::invalid("XLSX cells accept only string, number, boolean, or null values"));
+    }
+    if value.as_number().is_some_and(|number| json_number_as_safe_f64(number).is_none()) {
+        return Err(ExternalTableError::invalid(
+            "XLSX integer values outside the JavaScript-safe range must be stored as text",
+        ));
     }
     Ok(())
 }
@@ -741,9 +959,11 @@ fn set_umya_cell_value(cell: &mut umya_spreadsheet::Cell, value: &Value) -> Resu
             cell.set_value_bool(*value);
         }
         Value::Number(value) => {
-            let number = value
-                .as_f64()
-                .ok_or_else(|| ExternalTableError::invalid("XLSX number is outside the supported range"))?;
+            let number = json_number_as_safe_f64(value).ok_or_else(|| {
+                ExternalTableError::invalid(
+                    "XLSX integer values outside the JavaScript-safe range must be stored as text",
+                )
+            })?;
             cell.set_value_number(number);
         }
         Value::Array(_) | Value::Object(_) => return Err(ExternalTableError::invalid("Unsupported XLSX cell value")),
@@ -822,7 +1042,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.operation_results.iter().all(|result| result.outcome == OperationOutcome::Applied));
+        assert!(
+            result.operation_results.iter().all(|result| result.outcome == OperationOutcome::Applied),
+            "unexpected XLSX outcomes: {:?}",
+            result.operation_results
+        );
         let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
         let sheet = workbook.sheet_by_name("Sheet1").unwrap();
         assert_eq!(sheet.cell("B2").unwrap().value(), "Ada Lovelace");
@@ -877,6 +1101,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert!(result.new_snapshot_token.is_none());
+        assert!(result.save_blocked);
         let readback = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
         assert_eq!(readback.sheet_by_name("Sheet1").unwrap().cell("B2").unwrap().value(), "External");
     }
@@ -905,5 +1131,212 @@ mod tests {
         assert_eq!(result.operation_results[0].outcome, OperationOutcome::Rejected);
         let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
         assert!(!workbook.sheet_by_name("Sheet1").unwrap().cell("D2").unwrap().formula().is_empty());
+    }
+
+    #[tokio::test]
+    async fn xlsx_snapshot_is_bound_to_worksheet_and_selected_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scoped-snapshot.xlsx");
+        let copied_path = directory.path().join("copied-snapshot.xlsx");
+        create_round_trip_fixture(&path);
+        std::fs::copy(&path, &copied_path).unwrap();
+        let default_adapter = XlsxAdapter::new(path.clone(), XlsxExternalConfig::default());
+        let ranged_adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:C4".to_string()) },
+        );
+        let copied_adapter = XlsxAdapter::new(copied_path.clone(), XlsxExternalConfig::default());
+        let no_header_adapter = XlsxAdapter::new(path, XlsxExternalConfig { has_header: false, data_range: None });
+
+        let first = default_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let other_sheet = default_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Untouched"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let other_range = ranged_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let copied = copied_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let no_header = no_header_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+
+        assert_ne!(first.snapshot_token, other_sheet.snapshot_token);
+        assert_ne!(first.snapshot_token, other_range.snapshot_token);
+        assert_ne!(first.snapshot_token, copied.snapshot_token);
+        assert_ne!(first.snapshot_token, no_header.snapshot_token);
+
+        let result = copied_adapter
+            .apply_changes(ApplyChangesRequest {
+                table: XlsxAdapter::table_ref("Sheet1"),
+                snapshot_token: first.snapshot_token,
+                operations: vec![ExternalOperation::Update {
+                    operation_id: "stale-source".to_string(),
+                    row_key: "row:2".to_string(),
+                    column_key: "col:2".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Wrong source".to_string()),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert_eq!(
+            umya_spreadsheet::reader::xlsx::read(&copied_path)
+                .unwrap()
+                .sheet_by_name("Sheet1")
+                .unwrap()
+                .cell("B2")
+                .unwrap()
+                .value(),
+            "Ada"
+        );
+    }
+
+    #[tokio::test]
+    async fn xlsx_explicit_range_appends_at_detected_end_and_rejects_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded-append.xlsx");
+        let mut workbook = umya_spreadsheet::new_file();
+        let sheet = workbook.sheet_by_name_mut("Sheet1").unwrap();
+        sheet.cell_mut("A1").set_value_string("id");
+        sheet.cell_mut("B1").set_value_string("name");
+        sheet.cell_mut("A2").set_value_number(1);
+        sheet.cell_mut("B2").set_value_string("Ada");
+        sheet.cell_mut("A3").set_value_number(2);
+        sheet.cell_mut("B3").set_value_string("Grace");
+        umya_spreadsheet::writer::xlsx::write(&workbook, &path).unwrap();
+
+        let adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:B4".to_string()) },
+        );
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let page = adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: page.snapshot_token,
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "append".to_string(),
+                    values: vec![ExternalCellInput {
+                        column_key: "col:2".to_string(),
+                        value: Value::String("Lin".to_string()),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Applied);
+        let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        assert_eq!(workbook.sheet_by_name("Sheet1").unwrap().cell("B4").unwrap().value(), "Lin");
+
+        let full_adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:B4".to_string()) },
+        );
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let full_page =
+            full_adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+        let overflow = full_adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: full_page.snapshot_token,
+                operations: vec![ExternalOperation::Insert { operation_id: "overflow".to_string(), values: vec![] }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(overflow.operation_results[0].outcome, OperationOutcome::Rejected);
+        let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        assert!(workbook.sheet_by_name("Sheet1").unwrap().cell("A5").is_none());
+    }
+
+    #[test]
+    fn xlsx_numbers_keep_large_integer_identity_and_reject_unsafe_integer_writes() {
+        let first = Value::Number(9_007_199_254_740_992_u64.into());
+        let second = Value::Number(9_007_199_254_740_993_u64.into());
+
+        assert!(!external_values_equal(&first, &second));
+        assert!(validate_xlsx_value(&first).is_err());
+    }
+
+    #[tokio::test]
+    async fn xlsx_subrange_rejects_append_and_physical_row_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("subrange.xlsx");
+        create_round_trip_fixture(&path);
+        let adapter =
+            XlsxAdapter::new(path, XlsxExternalConfig { has_header: true, data_range: Some("A1:C4".to_string()) });
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let schema = adapter.describe_table(&table).await.unwrap();
+        let page = adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: page.snapshot_token,
+                operations: vec![
+                    ExternalOperation::Delete { operation_id: "delete".to_string(), row_key: "row:3".to_string() },
+                    ExternalOperation::Insert { operation_id: "insert".to_string(), values: vec![] },
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(schema.capabilities.insert_mode, InsertMode::Unsupported);
+        assert_eq!(schema.capabilities.delete_mode, DeleteMode::Unsupported);
+        assert!(result.operation_results.iter().all(|result| result.outcome == OperationOutcome::Rejected));
+    }
+
+    #[tokio::test]
+    async fn xlsx_header_only_sheet_has_no_phantom_data_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("header-only.xlsx");
+        let mut workbook = umya_spreadsheet::new_file();
+        workbook.sheet_by_name_mut("Sheet1").unwrap().cell_mut("A1").set_value_string("name");
+        umya_spreadsheet::writer::xlsx::write(&workbook, &path).unwrap();
+        let adapter = XlsxAdapter::new(path, XlsxExternalConfig::default());
+
+        let page = adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+
+        assert!(page.rows.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xlsx_read_snapshot_falls_back_when_the_source_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("readonly-source.xlsx");
+        create_round_trip_fixture(&path);
+        let original_mode = std::fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let direct_temp = tempfile::Builder::new().suffix(".xlsx").tempfile_in(directory.path());
+        if direct_temp.is_ok() {
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(original_mode)).unwrap();
+            return;
+        }
+        let snapshot = stable_xlsx_copy(&path);
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(original_mode)).unwrap();
+
+        let (snapshot_path, hash) = snapshot.unwrap();
+        assert_eq!(hash, file_sha256(&path).unwrap());
+        assert_eq!(hash, file_sha256(&snapshot_path).unwrap());
     }
 }

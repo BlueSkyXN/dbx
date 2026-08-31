@@ -426,6 +426,8 @@ export default withEnglishFallback({
     host: "호스트",
     addHost: "호스트 추가",
     filePath: "파일 경로",
+    externalXlsxDataRangeHint: "이 범위에 workbook의 다른 사용된 셀이 포함되지 않으면 추가 및 물리적 행 삭제가 비활성화됩니다.",
+    externalFeishuDataRangeHint: "비워 두면 읽기 전용으로 탐색합니다. 편집하려면 명시적 범위가 필요하며, 구조 변경 시에는 감지된 모든 사용 셀을 범위에 포함해야 합니다.",
     h2FileMode: "파일",
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2 파일 경로는 비워둘 수 없습니다",
@@ -1397,6 +1399,10 @@ export default withEnglishFallback({
       skipped: "실행 안 됨",
       cancelled: "취소됨",
     },
+  },
+  externalTable: {
+    saveContextChanged: "저장 중 외부 테이블이 변경되었습니다. 다시 저장하기 전에 다시 로드하세요.",
+    schemaChangedDuringLoad: "로드 중 외부 테이블이 변경되었습니다. 편집하기 전에 다시 로드하세요.",
   },
   queryMessages: {
     empty: "메시지 없음",

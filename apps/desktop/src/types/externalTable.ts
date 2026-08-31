@@ -77,6 +77,7 @@ export interface OperationResult {
 
 export interface ApplyChangesResult {
   operationResults: OperationResult[];
+  /** Confirmed unchanged/post-write baseline; never a newer conflict-only remote snapshot. */
   newSnapshotToken?: string | null;
   reloadRequired: boolean;
   saveBlocked: boolean;

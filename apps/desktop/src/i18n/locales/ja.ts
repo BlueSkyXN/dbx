@@ -433,6 +433,8 @@ export default withEnglishFallback({
     host: "ホスト",
     addHost: "ホストを追加",
     filePath: "ファイルパス",
+    externalXlsxDataRangeHint: "この範囲に workbook 内の他の使用済みセルが含まれない場合、追加と物理行の削除は無効になります。",
+    externalFeishuDataRangeHint: "空欄の場合は読み取り専用で参照します。編集には明示的な範囲が必要で、構造変更では検出されたすべての使用済みセルを範囲に含める必要があります。",
     h2FileMode: "ファイル",
     h2TcpMode: "TCP",
     h2FilePathRequired: "H2ファイルパスを指定してください",
@@ -1477,6 +1479,10 @@ export default withEnglishFallback({
       skipped: "未実行",
       cancelled: "キャンセル済み",
     },
+  },
+  externalTable: {
+    saveContextChanged: "保存中に外部テーブルが変更されました。再度保存する前に再読み込みしてください。",
+    schemaChangedDuringLoad: "読み込み中に外部テーブルが変更されました。編集する前に再読み込みしてください。",
   },
   queryMessages: {
     empty: "メッセージなし",

@@ -111,11 +111,9 @@ impl FeishuClient {
     }
 
     async fn tenant_access_token(&self) -> Result<String, FeishuRequestError> {
-        {
-            let token = self.token.lock().await;
-            if let Some(token) = token.as_ref().filter(|token| token.refresh_at > Instant::now()) {
-                return Ok(token.value.clone());
-            }
+        let mut token = self.token.lock().await;
+        if let Some(token) = token.as_ref().filter(|token| token.refresh_at > Instant::now()) {
+            return Ok(token.value.clone());
         }
 
         let url = format!("{}/open-apis/auth/v3/tenant_access_token/internal", self.base_url);
@@ -133,8 +131,7 @@ impl FeishuClient {
         }
         #[derive(Deserialize)]
         struct TokenResponse {
-            #[serde(default)]
-            code: i64,
+            code: Option<i64>,
             #[serde(default)]
             msg: String,
             #[serde(default)]
@@ -144,16 +141,16 @@ impl FeishuClient {
         }
         let parsed: TokenResponse = serde_json::from_slice(&body)
             .map_err(|_| FeishuRequestError::rejected("Feishu token endpoint returned invalid JSON"))?;
-        if parsed.code != 0 || parsed.tenant_access_token.is_empty() {
+        if parsed.code != Some(0) || parsed.tenant_access_token.is_empty() {
             return Err(FeishuRequestError::rejected(format!(
                 "Feishu token request rejected (code {}): {}",
-                parsed.code,
+                parsed.code.map(|code| code.to_string()).unwrap_or_else(|| "missing".to_string()),
                 self.redact_message(&parsed.msg)
             )));
         }
         let refresh_in = parsed.expire.saturating_sub(60).max(1);
         let value = parsed.tenant_access_token;
-        *self.token.lock().await =
+        *token =
             Some(CachedToken { value: value.clone(), refresh_at: Instant::now() + Duration::from_secs(refresh_in) });
         Ok(value)
     }
@@ -194,7 +191,10 @@ impl FeishuClient {
         }
         let envelope: Value = serde_json::from_slice(&bytes)
             .map_err(|_| response_decode_error("Feishu API returned invalid JSON", mutation))?;
-        let code = envelope.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let code = envelope
+            .get("code")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| response_decode_error("Feishu API response is missing a numeric code", mutation))?;
         if code != 0 {
             let message = envelope.get("msg").and_then(Value::as_str).unwrap_or("request rejected");
             return Err(FeishuRequestError::rejected(format!(
@@ -260,16 +260,20 @@ impl FeishuClient {
     }
 }
 
-async fn bounded_body(response: reqwest::Response, mutation: bool) -> Result<bytes::Bytes, FeishuRequestError> {
+async fn bounded_body(mut response: reqwest::Response, mutation: bool) -> Result<bytes::Bytes, FeishuRequestError> {
     if response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES as u64) {
         return Err(response_decode_error("Feishu response exceeds the configured size limit", mutation));
     }
-    let bytes =
-        response.bytes().await.map_err(|_| response_decode_error("Failed to read Feishu response", mutation))?;
-    if bytes.len() > MAX_RESPONSE_BYTES {
-        return Err(response_decode_error("Feishu response exceeds the configured size limit", mutation));
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) =
+        response.chunk().await.map_err(|_| response_decode_error("Failed to read Feishu response", mutation))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(response_decode_error("Feishu response exceeds the configured size limit", mutation));
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok(bytes)
+    Ok(body.freeze())
 }
 
 fn response_decode_error(message: impl Into<String>, mutation: bool) -> FeishuRequestError {
@@ -419,6 +423,29 @@ mod tests {
         assert_eq!(error.kind, FeishuRequestErrorKind::Rejected);
         assert!(!error.message.contains("app-secret"));
         assert!(error.message.contains("customer-sensitive-row"));
+    }
+
+    #[tokio::test]
+    async fn missing_business_code_is_never_treated_as_success() {
+        let (read_url, read_server) = serve(vec![token(), MockReply::Json(json!({ "data": {} }).to_string())]).await;
+        let read_client =
+            FeishuClient::with_base_url(read_url, "app-id", "app-secret", Duration::from_secs(5)).unwrap();
+
+        let read_error = read_client.get_json("/probe", &[]).await.unwrap_err();
+
+        read_server.await.unwrap();
+        assert_eq!(read_error.kind, FeishuRequestErrorKind::Rejected);
+        assert!(read_error.message.contains("numeric code"));
+
+        let (write_url, write_server) = serve(vec![token(), MockReply::Json(json!({ "data": {} }).to_string())]).await;
+        let write_client =
+            FeishuClient::with_base_url(write_url, "app-id", "app-secret", Duration::from_secs(5)).unwrap();
+
+        let write_error = write_client.post_json("/write", json!({ "value": 1 }), true).await.unwrap_err();
+
+        write_server.await.unwrap();
+        assert_eq!(write_error.kind, FeishuRequestErrorKind::Unknown);
+        assert!(write_error.message.contains("automatic retry is blocked"));
     }
 
     #[tokio::test]

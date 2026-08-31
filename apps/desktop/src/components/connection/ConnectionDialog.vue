@@ -6269,7 +6269,10 @@ function openExternalUrl(url: string) {
                   </div>
                   <div v-if="form.db_type === 'xlsx'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.externalDataRange") }}{{ t("connection.optionalSuffix") }}</Label>
-                    <Input v-model="externalTableDataRange" class="col-span-3" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                    <div class="col-span-3 space-y-1">
+                      <Input v-model="externalTableDataRange" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                      <p class="text-xs text-muted-foreground">{{ t("connection.externalXlsxDataRangeHint") }}</p>
+                    </div>
                   </div>
                   <div v-if="form.db_type === 'csv' || form.db_type === 'xlsx'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.externalHasHeader") }}</Label>
@@ -6364,7 +6367,10 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.externalDataRange") }}{{ t("connection.optionalSuffix") }}</Label>
-                      <Input v-model="externalTableDataRange" class="col-span-3" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                      <div class="col-span-3 space-y-1">
+                        <Input v-model="externalTableDataRange" :placeholder="t('connection.externalDataRangePlaceholder')" />
+                        <p class="text-xs text-muted-foreground">{{ t("connection.externalFeishuDataRangeHint") }}</p>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.externalHasHeader") }}</Label>

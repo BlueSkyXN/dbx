@@ -212,6 +212,8 @@ impl ApplyChangesRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ApplyChangesResult {
     pub operation_results: Vec<OperationResult>,
+    /// Confirmed unchanged baseline or post-write snapshot. A conflict-only response must leave this unset rather
+    /// than exposing the newer remote snapshot as a retry baseline for pending positional operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_snapshot_token: Option<String>,
     pub reload_required: bool,

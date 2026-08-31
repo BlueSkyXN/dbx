@@ -33,11 +33,15 @@ Desktop file paths belong to the local computer. Docker/Web paths belong to the 
 DBX Desktop can open four external tabular sources through a direct table browser rather than SQL or a DuckDB cache:
 
 - CSV files, with an explicit delimiter, text encoding, and optional header row
-- Ordinary `.xlsx` workbooks, with worksheet selection, an optional A1 data range, and formula cells kept read-only
-- Feishu Sheets, authenticated with an app ID and app secret
+- Ordinary `.xlsx` workbooks, with worksheet selection, an optional A1 data range, and formula cells kept read-only; append and physical row deletion are disabled when a configured subrange excludes other used cells
+- Feishu Sheets, authenticated with an app ID and app secret; automatic range detection is browse-only, while editing requires an explicit A1 data range
 - Feishu Base, authenticated with an app ID and app secret
 
 All four support paged browsing, controlled value updates, row creation or append according to the source capability, row deletion, manual refresh, and save readback. DBX checks file snapshots or remote revisions before writing. Conflicts remain pending; partial results clear only confirmed operations; an uncertain network outcome blocks another save until the source is reloaded.
+
+For XLSX and Feishu Sheets, row deletion means deleting the whole physical worksheet row. DBX exposes append/delete only when the selected range contains all detected used cells, so a narrow range cannot shift or overwrite adjacent worksheet regions. Feishu Sheets ranges inferred from `current_region` remain read-only because automatic detection cannot reliably distinguish data rows from totals, signatures, or notes.
+
+CSV, XLSX, and Feishu Sheets row keys are positional addresses that are stable only within their bound snapshot. A conflict never rebases pending edits onto a newer snapshot; reload the source before editing again. Feishu Base uses persistent record IDs instead.
 
 This channel is Desktop-only. It does not add SQL queries, automatic synchronization, polling, webhooks, CLI/MCP tools, or `dbx-web` routes. XLSX editing is limited to normal `.xlsx` data regions; macros, encrypted workbooks, legacy Excel formats, formula editing, and workbook-structure editing are outside this path.
 
