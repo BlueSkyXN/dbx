@@ -1461,6 +1461,7 @@ export default withEnglishFallback({
     },
   },
   externalTable: {
+    saveContextChanged: "La tabla externa cambió mientras se guardaba. Vuelve a cargarla antes de guardar de nuevo.",
     schemaChangedDuringLoad: "La tabla externa cambió mientras se cargaba. Vuelve a cargarla antes de editar.",
   },
   queryMessages: {

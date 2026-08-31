@@ -1401,6 +1401,7 @@ export default withEnglishFallback({
     },
   },
   externalTable: {
+    saveContextChanged: "저장 중 외부 테이블이 변경되었습니다. 다시 저장하기 전에 다시 로드하세요.",
     schemaChangedDuringLoad: "로드 중 외부 테이블이 변경되었습니다. 편집하기 전에 다시 로드하세요.",
   },
   queryMessages: {

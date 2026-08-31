@@ -1459,6 +1459,7 @@ export default withEnglishFallback({
     },
   },
   externalTable: {
+    saveContextChanged: "La tabella esterna è cambiata durante il salvataggio. Ricaricala prima di salvare di nuovo.",
     schemaChangedDuringLoad: "La tabella esterna è cambiata durante il caricamento. Ricaricala prima di modificarla.",
   },
   queryMessages: {

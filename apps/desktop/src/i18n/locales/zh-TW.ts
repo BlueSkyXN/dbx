@@ -1460,6 +1460,7 @@ export default withEnglishFallback({
     },
   },
   externalTable: {
+    saveContextChanged: "儲存期間外部表格的來源或頁面發生變更，請重新載入後再儲存。",
     schemaChangedDuringLoad: "外部表格在載入期間發生變更，請重新載入後再編輯。",
   },
   queryMessages: {

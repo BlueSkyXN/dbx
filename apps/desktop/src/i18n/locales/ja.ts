@@ -1481,6 +1481,7 @@ export default withEnglishFallback({
     },
   },
   externalTable: {
+    saveContextChanged: "保存中に外部テーブルが変更されました。再度保存する前に再読み込みしてください。",
     schemaChangedDuringLoad: "読み込み中に外部テーブルが変更されました。編集する前に再読み込みしてください。",
   },
   queryMessages: {
