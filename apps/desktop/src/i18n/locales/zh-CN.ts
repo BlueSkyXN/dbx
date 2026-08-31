@@ -1465,6 +1465,7 @@ export default withEnglishFallback({
     saveConflict: "有 {count} 项修改与当前来源冲突。",
     saveRejected: "有 {count} 项修改被拒绝。",
     saveApplied: "修改已保存并完成回读。",
+    saveContextChanged: "保存期间外部表格上下文发生变化，请重新加载后再保存。",
     notLoaded: "外部表格尚未加载。",
     schemaChangedDuringLoad: "外部表格在加载期间发生变化，请重新加载后再编辑。",
     noValidChanges: "没有可保存的有效外部表格修改。",

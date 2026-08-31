@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use encoding_rs::{Encoding, UTF_8};
 use serde_json::Value;
 
-use super::file_support::{bytes_sha256, file_sha256, parse_index_key, replace_staged_file, unique_display_names};
+use super::file_support::{
+    bytes_sha256, canonical_path_fingerprint, file_sha256, parse_index_key, replace_staged_file, scoped_snapshot_token,
+    unique_display_names,
+};
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, CsvExternalConfig, DeleteMode,
     ExternalColumn, ExternalConnectionTestResult, ExternalOperation, ExternalRow, ExternalTableAdapter,
@@ -185,8 +188,21 @@ fn read_document_with_snapshot(
     }
     let bytes = std::fs::read(path)
         .map_err(|error| ExternalTableError::io(format!("Failed to read CSV file {}: {error}", path.display())))?;
-    let snapshot = bytes_sha256(&bytes);
+    let snapshot = csv_snapshot_token(path, &bytes_sha256(&bytes), config)?;
     Ok((read_document_bytes(&bytes, config)?, snapshot))
+}
+
+fn csv_snapshot_token(
+    path: &Path,
+    content_hash: &str,
+    config: &CsvExternalConfig,
+) -> Result<String, ExternalTableError> {
+    let path_fingerprint = canonical_path_fingerprint(path)?;
+    let has_header = if config.has_header { "header" } else { "no-header" };
+    Ok(scoped_snapshot_token(
+        "csv",
+        &[&path_fingerprint, content_hash, &config.delimiter, has_header, config.encoding.trim()],
+    ))
 }
 
 fn read_document_bytes(bytes: &[u8], config: &CsvExternalConfig) -> Result<CsvDocument, ExternalTableError> {
@@ -448,7 +464,7 @@ fn apply_csv_changes(
         .and_then(|_| staged.as_file().sync_all())
         .map_err(|error| ExternalTableError::io(format!("Failed to write CSV staging file: {error}")))?;
 
-    let before_replace = file_sha256(path)?;
+    let before_replace = csv_snapshot_token(path, &file_sha256(path)?, config)?;
     if before_replace != request.snapshot_token {
         for result in &mut operation_results {
             if result.outcome == OperationOutcome::Applied {
@@ -466,7 +482,7 @@ fn apply_csv_changes(
 
     let staged_path = staged.into_temp_path();
     let replace_warning = replace_staged_file(&staged_path, path)?;
-    let new_snapshot = match file_sha256(path) {
+    let new_snapshot = match file_sha256(path).and_then(|hash| csv_snapshot_token(path, &hash, config)) {
         Ok(snapshot) => Some(snapshot),
         Err(error) => {
             mark_csv_applied_unknown(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
@@ -644,8 +660,58 @@ mod tests {
 
         let (document, snapshot) = read_document_with_snapshot(&path, &CsvExternalConfig::default()).unwrap();
 
-        assert_eq!(snapshot, bytes_sha256(bytes));
+        assert_eq!(snapshot, csv_snapshot_token(&path, &bytes_sha256(bytes), &CsvExternalConfig::default()).unwrap());
+        assert_ne!(
+            snapshot,
+            csv_snapshot_token(&path, &bytes_sha256(b"id,name\n1,Grace\n"), &CsvExternalConfig::default()).unwrap()
+        );
         assert_eq!(document.rows[0][1], "Ada");
+    }
+
+    #[tokio::test]
+    async fn csv_snapshot_is_bound_to_path_and_parse_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.csv");
+        let second_path = directory.path().join("second.csv");
+        let bytes = b"id,name\n1,Ada\n";
+        std::fs::write(&first_path, bytes).unwrap();
+        std::fs::write(&second_path, bytes).unwrap();
+
+        let default_adapter = CsvAdapter::new(first_path.clone(), CsvExternalConfig::default());
+        let other_path_adapter = CsvAdapter::new(second_path, CsvExternalConfig::default());
+        let no_header_adapter =
+            CsvAdapter::new(first_path, CsvExternalConfig { has_header: false, ..CsvExternalConfig::default() });
+        let default_page = default_adapter
+            .read_page(ReadPageRequest { table: default_adapter.table_ref(), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let other_path_page = other_path_adapter
+            .read_page(ReadPageRequest { table: other_path_adapter.table_ref(), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let no_header_page = no_header_adapter
+            .read_page(ReadPageRequest { table: no_header_adapter.table_ref(), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+
+        assert_ne!(default_page.snapshot_token, other_path_page.snapshot_token);
+        assert_ne!(default_page.snapshot_token, no_header_page.snapshot_token);
+
+        let result = other_path_adapter
+            .apply_changes(request(
+                &default_page.snapshot_token,
+                vec![ExternalOperation::Update {
+                    operation_id: "stale-source".to_string(),
+                    row_key: "row:0".to_string(),
+                    column_key: "col:1".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Wrong source".to_string()),
+                }],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert_eq!(std::fs::read_to_string(directory.path().join("second.csv")).unwrap(), "id,name\n1,Ada\n");
     }
 
     #[cfg(unix)]

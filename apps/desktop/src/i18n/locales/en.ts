@@ -1541,6 +1541,7 @@ export default {
     saveConflict: "{count} change(s) conflicted with the current source.",
     saveRejected: "{count} change(s) were rejected.",
     saveApplied: "Changes saved and read back.",
+    saveContextChanged: "The external table changed while the save was in progress. Reload before saving again.",
     notLoaded: "The external table is not loaded.",
     schemaChangedDuringLoad: "The external table changed while it was loading. Reload before editing.",
     noValidChanges: "There are no valid external-table changes to save.",

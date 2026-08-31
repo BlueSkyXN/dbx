@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use super::feishu::{FeishuClient, FeishuRequestError, FeishuRequestErrorKind};
+use super::file_support::scoped_snapshot_token;
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, DeleteMode, ExternalCellInput,
     ExternalColumn, ExternalConnectionTestResult, ExternalOperation, ExternalRow, ExternalTableAdapter,
@@ -350,7 +351,7 @@ impl FeishuBaseAdapter {
         let revision = page.revision.filter(|revision| !revision.is_empty()).ok_or_else(|| {
             ExternalTableError::unsupported("Feishu Base did not return a revision; writes are blocked")
         })?;
-        Ok(snapshot_token(table_id, &revision, &metadata.schema_digest))
+        Ok(snapshot_token(&self.config, table_id, &revision, &metadata.schema_digest))
     }
 
     async fn page(&self, request: ReadPageRequest) -> Result<PageSnapshot, ExternalTableError> {
@@ -383,7 +384,7 @@ impl FeishuBaseAdapter {
             columns: columns(&before.fields),
             rows,
             next_cursor,
-            snapshot_token: snapshot_token(&table_id, &revision, &before.schema_digest),
+            snapshot_token: snapshot_token(&self.config, &table_id, &revision, &before.schema_digest),
             read_state: if schema_changed || page.incomplete || page.revision.is_none() {
                 ReadState::Incomplete
             } else {
@@ -447,10 +448,25 @@ async fn apply_base_changes(
     let metadata = adapter.metadata(&table_id).await?;
     let field_by_id = metadata.fields.iter().map(|field| (field.field_id.as_str(), field)).collect::<HashMap<_, _>>();
     let current_snapshot = adapter.current_snapshot(&table_id, &metadata).await?;
-    let (snapshot_table_id, _, requested_schema) = snapshot_parts(&request.snapshot_token)
+    let (requested_source, snapshot_table_id, _, requested_schema) = snapshot_parts(&request.snapshot_token)
         .ok_or_else(|| ExternalTableError::invalid("Invalid Feishu Base snapshot token"))?;
     if snapshot_table_id != table_id {
         return Err(ExternalTableError::invalid("Feishu Base snapshot token belongs to a different table"));
+    }
+    if requested_source != base_source_fingerprint(&adapter.config, &table_id) {
+        return Ok(ApplyChangesResult {
+            operation_results: request
+                .operations
+                .iter()
+                .map(|operation| {
+                    OperationResult::new(operation.operation_id(), OperationOutcome::Conflict)
+                        .message("Feishu Base source or view changed; reload before saving")
+                })
+                .collect(),
+            new_snapshot_token: None,
+            reload_required: true,
+            save_blocked: true,
+        });
     }
     let schema_changed = requested_schema != metadata.schema_digest;
     let revision_changed = request.snapshot_token != current_snapshot;
@@ -616,7 +632,8 @@ async fn apply_base_changes(
             Ok(revision) => match adapter.metadata(&table_id).await {
                 Ok(after_metadata) => {
                     force_save_blocked = after_metadata.schema_digest != metadata.schema_digest;
-                    new_snapshot_token = Some(snapshot_token(&table_id, &revision, &after_metadata.schema_digest));
+                    new_snapshot_token =
+                        Some(snapshot_token(&adapter.config, &table_id, &revision, &after_metadata.schema_digest));
                 }
                 Err(error) => {
                     annotate_applied_readback_failure(&mut operation_results, &error.to_string());
@@ -1084,15 +1101,28 @@ async fn read_back_applied(
         if results[insert.operation_index].outcome != OperationOutcome::Applied {
             continue;
         }
-        let exists = results[insert.operation_index]
+        let record = results[insert.operation_index]
             .created_row_key
             .as_deref()
             .and_then(|key| decode_key(key, ROW_KEY_PREFIX, "Feishu Base record").ok())
-            .is_some_and(|record_id| readback_records.contains_key(&record_id));
-        if !exists {
+            .and_then(|record_id| readback_records.get(&record_id));
+        let fields_match = record.is_some_and(|record| {
+            insert.fields.iter().all(|(field_id, expected)| {
+                fields
+                    .iter()
+                    .find(|field| field.field_id == *field_id)
+                    .is_some_and(|field| record_value(record, field) == *expected)
+            })
+        });
+        if record.is_none() {
             mark_result_unknown(
                 &mut results[insert.operation_index],
                 "Feishu Base returned a record ID, but created-record readback was incomplete",
+            );
+        } else if !fields_match {
+            mark_result_unknown(
+                &mut results[insert.operation_index],
+                "Feishu Base acknowledged the create, but created-record fields differ; reload required",
             );
         }
     }
@@ -1113,7 +1143,7 @@ async fn read_back_applied(
     let metadata = adapter.metadata(table_id).await?;
     let snapshot = adapter.current_snapshot(table_id, &metadata).await?;
     snapshot_parts(&snapshot)
-        .map(|(_, revision, _)| revision)
+        .map(|(_, _, revision, _)| revision)
         .ok_or_else(|| ExternalTableError::invalid("Feishu Base readback did not return a revision"))
 }
 
@@ -1359,20 +1389,33 @@ fn schema_digest(table: &BaseTable, fields: &[BaseField]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn snapshot_token(table_id: &str, revision: &str, schema_digest: &str) -> String {
-    format!("base:{}:rev:{}:schema:{schema_digest}", encode_path_segment(table_id), encode_path_segment(revision))
+fn base_source_fingerprint(config: &FeishuBaseExternalConfig, table_id: &str) -> String {
+    let view_id = config.view_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("<all>");
+    scoped_snapshot_token("feishu-base-source", &[&config.base_token, table_id, view_id])
 }
 
-fn snapshot_parts(snapshot: &str) -> Option<(String, String, String)> {
-    let tail = snapshot.strip_prefix("base:")?;
+fn snapshot_token(config: &FeishuBaseExternalConfig, table_id: &str, revision: &str, schema_digest: &str) -> String {
+    format!(
+        "base:v2:source:{}:table:{}:rev:{}:schema:{schema_digest}",
+        encode_path_segment(&base_source_fingerprint(config, table_id)),
+        encode_path_segment(table_id),
+        encode_path_segment(revision)
+    )
+}
+
+fn snapshot_parts(snapshot: &str) -> Option<(String, String, String, String)> {
+    let tail = snapshot.strip_prefix("base:v2:source:")?;
+    let (encoded_source, tail) = tail.split_once(":table:")?;
     let (encoded_table, tail) = tail.split_once(":rev:")?;
     let (encoded_revision, schema_digest) = tail.rsplit_once(":schema:")?;
-    if encoded_table.is_empty() || encoded_revision.is_empty() || schema_digest.is_empty() {
+    if encoded_source.is_empty() || encoded_table.is_empty() || encoded_revision.is_empty() || schema_digest.is_empty()
+    {
         return None;
     }
+    let source = percent_encoding::percent_decode_str(encoded_source).decode_utf8().ok()?.into_owned();
     let table_id = percent_encoding::percent_decode_str(encoded_table).decode_utf8().ok()?.into_owned();
     let revision = percent_encoding::percent_decode_str(encoded_revision).decode_utf8().ok()?.into_owned();
-    Some((table_id, revision, schema_digest.to_string()))
+    Some((source, table_id, revision, schema_digest.to_string()))
 }
 
 fn row_key(record_id: &str) -> String {
@@ -1542,16 +1585,16 @@ mod tests {
         }))
     }
 
+    fn adapter_config() -> FeishuBaseExternalConfig {
+        FeishuBaseExternalConfig {
+            base_token: "base-token".to_string(),
+            table_id: Some("tbl1".to_string()),
+            view_id: Some("view1".to_string()),
+        }
+    }
+
     fn adapter(client: FeishuClient) -> FeishuBaseAdapter {
-        FeishuBaseAdapter::from_client(
-            client,
-            FeishuBaseExternalConfig {
-                base_token: "base-token".to_string(),
-                table_id: Some("tbl1".to_string()),
-                view_id: Some("view1".to_string()),
-            },
-        )
-        .unwrap()
+        FeishuBaseAdapter::from_client(client, adapter_config()).unwrap()
     }
 
     fn table_ref() -> ExternalTableRef {
@@ -1567,7 +1610,7 @@ mod tests {
             .iter()
             .filter_map(parse_field)
             .collect::<Vec<_>>();
-        snapshot_token("tbl1", revision, &schema_digest(&table, &fields))
+        snapshot_token(&adapter_config(), "tbl1", revision, &schema_digest(&table, &fields))
     }
 
     async fn finish_server(server: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
@@ -1718,6 +1761,82 @@ mod tests {
         assert!(requests[7].contains("/records/batch_create"));
         assert!(requests[7].contains("create_records"));
         assert!(requests[7].contains("fld_amount"));
+    }
+
+    #[tokio::test]
+    async fn base_created_record_readback_must_match_requested_fields() {
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            table_reply(),
+            fields_reply(false),
+            matrix_reply(7, &["fld_name", "fld_amount"], &["Name", "Amount"], &[], json!([]), false),
+            api_reply(json!({ "record_id_list": ["rec3"] })),
+            matrix_reply(8, &["fld_name", "fld_amount"], &["Name", "Amount"], &["rec3"], json!([["Wrong", 5]]), false),
+            table_reply(),
+            fields_reply(false),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+
+        let result = adapter(client)
+            .apply_changes(ApplyChangesRequest {
+                table: table_ref(),
+                snapshot_token: snapshot("7", false),
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "insert".to_string(),
+                    values: vec![
+                        ExternalCellInput {
+                            column_key: "field:fld_name".to_string(),
+                            value: Value::String("Grace".to_string()),
+                        },
+                        ExternalCellInput {
+                            column_key: "field:fld_amount".to_string(),
+                            value: Value::Number(5.into()),
+                        },
+                    ],
+                }],
+            })
+            .await
+            .unwrap();
+
+        finish_server(server).await;
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Unknown);
+        assert!(result.save_blocked);
+    }
+
+    #[tokio::test]
+    async fn base_snapshot_is_bound_to_base_and_view_config() {
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            table_reply(),
+            fields_reply(false),
+            matrix_reply(7, &["fld_name", "fld_amount"], &["Name", "Amount"], &[], json!([]), false),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+        let changed_adapter = FeishuBaseAdapter::from_client(
+            client,
+            FeishuBaseExternalConfig {
+                base_token: "other-base-token".to_string(),
+                table_id: Some("tbl1".to_string()),
+                view_id: Some("other-view".to_string()),
+            },
+        )
+        .unwrap();
+
+        let result = changed_adapter
+            .apply_changes(ApplyChangesRequest {
+                table: table_ref(),
+                snapshot_token: snapshot("7", false),
+                operations: vec![ExternalOperation::Insert { operation_id: "insert".to_string(), values: vec![] }],
+            })
+            .await
+            .unwrap();
+
+        let requests = finish_server(server).await;
+        assert_eq!(requests.len(), 4, "a source-bound snapshot must reject before mutation dispatch");
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert!(result.save_blocked);
     }
 
     #[tokio::test]

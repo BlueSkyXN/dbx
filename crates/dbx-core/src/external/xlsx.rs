@@ -8,7 +8,8 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use serde_json::Value;
 
 use super::file_support::{
-    file_sha256, parse_index_key, replace_staged_file, scoped_snapshot_token, unique_display_names,
+    canonical_path_fingerprint, file_sha256, json_number_as_safe_f64, json_numbers_equal, parse_index_key,
+    replace_staged_file, scoped_snapshot_token, unique_display_names,
 };
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, DeleteMode, ExternalColumn,
@@ -189,7 +190,7 @@ impl ExternalTableAdapter for XlsxAdapter {
                 columns: document.columns,
                 rows,
                 next_cursor: (end < row_count).then(|| end.to_string()),
-                snapshot_token: xlsx_snapshot_token(&file_hash, &sheet_name, &config),
+                snapshot_token: xlsx_snapshot_token(&path, &file_hash, &sheet_name, &config)?,
                 read_state: ReadState::Complete,
             })
         })
@@ -257,9 +258,16 @@ fn stable_xlsx_copy(path: &Path) -> Result<(tempfile::TempPath, String), Externa
     ))
 }
 
-fn xlsx_snapshot_token(file_hash: &str, sheet_name: &str, config: &XlsxExternalConfig) -> String {
+fn xlsx_snapshot_token(
+    path: &Path,
+    file_hash: &str,
+    sheet_name: &str,
+    config: &XlsxExternalConfig,
+) -> Result<String, ExternalTableError> {
+    let path_fingerprint = canonical_path_fingerprint(path)?;
     let data_range = config.data_range.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("<used>");
-    scoped_snapshot_token("xlsx", &[file_hash, sheet_name, data_range])
+    let has_header = if config.has_header { "header" } else { "no-header" };
+    Ok(scoped_snapshot_token("xlsx", &[&path_fingerprint, file_hash, sheet_name, data_range, has_header]))
 }
 
 fn workbook_write_restriction(path: &Path) -> Result<Option<String>, ExternalTableError> {
@@ -314,14 +322,16 @@ fn read_sheet_document(
     });
     let bounds = resolve_sheet_bounds(&range, config.data_range.as_deref())?;
     let data_start_row = bounds.start_row + u32::from(config.has_header);
-    let data_row_count = if data_start_row > bounds.end_row
-        || (used_bounds.is_none()
-            && config.data_range.as_deref().map(str::trim).filter(|value| !value.is_empty()).is_none())
-    {
-        0
-    } else {
-        bounds.end_row.saturating_sub(data_start_row).saturating_add(1) as usize
-    };
+    let selected_used_end_row = (bounds.start_row..=bounds.end_row).rev().find(|row| {
+        (bounds.start_col..=bounds.end_col).any(|column| {
+            range.get_value((*row, column)).is_some_and(|value| !matches!(value, Data::Empty))
+                || formulas.get_value((*row, column)).is_some_and(|formula| !formula.trim().is_empty())
+        })
+    });
+    let data_row_count = selected_used_end_row
+        .filter(|end_row| data_start_row <= *end_row)
+        .map(|end_row| end_row.saturating_sub(data_start_row).saturating_add(1) as usize)
+        .unwrap_or(0);
     let structural_mutations_safe = used_bounds.is_none_or(|used| bounds.contains(used));
     let width = bounds.end_col.saturating_sub(bounds.start_col).saturating_add(1) as usize;
     let raw_headers = if config.has_header {
@@ -336,8 +346,9 @@ fn read_sheet_document(
     let mut readonly_cells = HashSet::new();
     let mut protected_rows = HashSet::new();
     let mut inferred_types = vec![ExternalValueType::Unknown; width];
-    if data_start_row <= bounds.end_row {
-        for row in data_start_row..=bounds.end_row {
+    if data_row_count > 0 {
+        let data_end_row = data_start_row + data_row_count as u32 - 1;
+        for row in data_start_row..=data_end_row {
             for (column_index, column) in (bounds.start_col..=bounds.end_col).enumerate() {
                 let value = range.get_value((row, column)).map(data_to_json).unwrap_or(Value::Null);
                 inferred_types[column_index] = merge_value_type(inferred_types[column_index], value_type(&value));
@@ -423,7 +434,7 @@ fn xlsx_readback_matches(
 
 fn external_values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Number(left), Value::Number(right)) => json_numbers_equal(left, right),
         _ => left == right,
     }
 }
@@ -569,7 +580,7 @@ fn apply_xlsx_changes(
     request: ApplyChangesRequest,
 ) -> Result<ApplyChangesResult, ExternalTableError> {
     let (stable_path, file_hash) = stable_xlsx_copy(path)?;
-    let current_snapshot = xlsx_snapshot_token(&file_hash, sheet_name, config);
+    let current_snapshot = xlsx_snapshot_token(path, &file_hash, sheet_name, config)?;
     if current_snapshot != request.snapshot_token {
         return Ok(ApplyChangesResult {
             operation_results: request
@@ -609,6 +620,8 @@ fn apply_xlsx_changes(
     let mut deletes = Vec::new();
     let mut inserts = Vec::new();
     let mut seen_delete_rows = HashSet::new();
+    let data_end_row =
+        (document.data_row_count > 0).then(|| document.data_start_row + document.data_row_count as u32 - 1);
 
     for (operation_index, operation) in request.operations.iter().enumerate() {
         match operation {
@@ -634,7 +647,7 @@ fn apply_xlsx_changes(
                 if row == 0
                     || column == 0
                     || row - 1 < document.data_start_row
-                    || row - 1 > document.bounds.end_row
+                    || data_end_row.is_none_or(|data_end_row| row - 1 > data_end_row)
                     || column - 1 < document.bounds.start_col
                     || column - 1 > document.bounds.end_col
                 {
@@ -651,7 +664,10 @@ fn apply_xlsx_changes(
                     );
                     continue;
                 }
-                if document.values.get(&(row - 1, column - 1)).cloned().unwrap_or(Value::Null) != *old_value {
+                if !external_values_equal(
+                    &document.values.get(&(row - 1, column - 1)).cloned().unwrap_or(Value::Null),
+                    old_value,
+                ) {
                     results[operation_index] = Some(
                         OperationResult::new(operation_id, OperationOutcome::Conflict)
                             .message("XLSX cell value changed after it was read"),
@@ -682,7 +698,10 @@ fn apply_xlsx_changes(
                         continue;
                     }
                 };
-                if row == 0 || row - 1 < document.data_start_row || row - 1 > document.bounds.end_row {
+                if row == 0
+                    || row - 1 < document.data_start_row
+                    || data_end_row.is_none_or(|data_end_row| row - 1 > data_end_row)
+                {
                     results[operation_index] = Some(
                         OperationResult::new(operation_id, OperationOutcome::Rejected)
                             .message("XLSX row key is outside the selected data range or points to the header"),
@@ -755,6 +774,27 @@ fn apply_xlsx_changes(
         }
     }
 
+    if config.data_range.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        let capacity = if document.data_start_row > document.bounds.end_row {
+            0
+        } else {
+            document.bounds.end_row.saturating_sub(document.data_start_row).saturating_add(1) as usize
+        };
+        let remaining_rows = document.data_row_count.saturating_sub(deletes.len());
+        let available_rows = capacity.saturating_sub(remaining_rows);
+        if inserts.len() > available_rows {
+            for (operation_index, _) in inserts.split_off(available_rows) {
+                results[operation_index] = Some(
+                    OperationResult::new(
+                        request.operations[operation_index].operation_id(),
+                        OperationOutcome::Rejected,
+                    )
+                    .message("XLSX append would exceed the configured data range"),
+                );
+            }
+        }
+    }
+
     deletes.sort_by_key(|(_, row)| std::cmp::Reverse(*row));
     for (_, row) in &deletes {
         let expected_index = (*row - 1 - document.data_start_row) as usize;
@@ -785,8 +825,8 @@ fn apply_xlsx_changes(
             Some(OperationResult::new(request.operations[*operation_index].operation_id(), OperationOutcome::Applied));
     }
 
-    let deleted_count = deletes.len() as u32;
-    let mut append_row = document.bounds.end_row.saturating_add(2).saturating_sub(deleted_count);
+    let remaining_rows = document.data_row_count.saturating_sub(deletes.len()) as u32;
+    let mut append_row = document.data_start_row.saturating_add(remaining_rows).saturating_add(1);
     {
         let sheet = workbook
             .sheet_by_name_mut(sheet_name)
@@ -836,7 +876,7 @@ fn apply_xlsx_changes(
         .and_then(|file| file.sync_all())
         .map_err(|error| ExternalTableError::io(format!("Failed to sync XLSX staging file: {error}")))?;
     let before_replace_hash = file_sha256(path)?;
-    let before_replace = xlsx_snapshot_token(&before_replace_hash, sheet_name, config);
+    let before_replace = xlsx_snapshot_token(path, &before_replace_hash, sheet_name, config)?;
     if before_replace != request.snapshot_token {
         let operation_results = operation_results
             .into_iter()
@@ -869,7 +909,7 @@ fn apply_xlsx_changes(
                     &format!("saved, but worksheet readback failed: {error}"),
                 ),
             }
-            Some(xlsx_snapshot_token(&snapshot_hash, sheet_name, config))
+            Some(xlsx_snapshot_token(path, &snapshot_hash, sheet_name, config)?)
         }
         Err(error) => {
             mark_xlsx_applied_unknown(&mut operation_results, &format!("saved, but snapshot readback failed: {error}"));
@@ -899,6 +939,11 @@ fn validate_xlsx_value(value: &Value) -> Result<(), ExternalTableError> {
     if matches!(value, Value::Array(_) | Value::Object(_)) {
         return Err(ExternalTableError::invalid("XLSX cells accept only string, number, boolean, or null values"));
     }
+    if value.as_number().is_some_and(|number| json_number_as_safe_f64(number).is_none()) {
+        return Err(ExternalTableError::invalid(
+            "XLSX integer values outside the JavaScript-safe range must be stored as text",
+        ));
+    }
     Ok(())
 }
 
@@ -914,9 +959,11 @@ fn set_umya_cell_value(cell: &mut umya_spreadsheet::Cell, value: &Value) -> Resu
             cell.set_value_bool(*value);
         }
         Value::Number(value) => {
-            let number = value
-                .as_f64()
-                .ok_or_else(|| ExternalTableError::invalid("XLSX number is outside the supported range"))?;
+            let number = json_number_as_safe_f64(value).ok_or_else(|| {
+                ExternalTableError::invalid(
+                    "XLSX integer values outside the JavaScript-safe range must be stored as text",
+                )
+            })?;
             cell.set_value_number(number);
         }
         Value::Array(_) | Value::Object(_) => return Err(ExternalTableError::invalid("Unsupported XLSX cell value")),
@@ -1090,10 +1137,16 @@ mod tests {
     async fn xlsx_snapshot_is_bound_to_worksheet_and_selected_range() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("scoped-snapshot.xlsx");
+        let copied_path = directory.path().join("copied-snapshot.xlsx");
         create_round_trip_fixture(&path);
+        std::fs::copy(&path, &copied_path).unwrap();
         let default_adapter = XlsxAdapter::new(path.clone(), XlsxExternalConfig::default());
-        let ranged_adapter =
-            XlsxAdapter::new(path, XlsxExternalConfig { has_header: true, data_range: Some("A1:C4".to_string()) });
+        let ranged_adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:C4".to_string()) },
+        );
+        let copied_adapter = XlsxAdapter::new(copied_path.clone(), XlsxExternalConfig::default());
+        let no_header_adapter = XlsxAdapter::new(path, XlsxExternalConfig { has_header: false, data_range: None });
 
         let first = default_adapter
             .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
@@ -1107,9 +1160,114 @@ mod tests {
             .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
             .await
             .unwrap();
+        let copied = copied_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
+        let no_header = no_header_adapter
+            .read_page(ReadPageRequest { table: XlsxAdapter::table_ref("Sheet1"), cursor: None, limit: 20 })
+            .await
+            .unwrap();
 
         assert_ne!(first.snapshot_token, other_sheet.snapshot_token);
         assert_ne!(first.snapshot_token, other_range.snapshot_token);
+        assert_ne!(first.snapshot_token, copied.snapshot_token);
+        assert_ne!(first.snapshot_token, no_header.snapshot_token);
+
+        let result = copied_adapter
+            .apply_changes(ApplyChangesRequest {
+                table: XlsxAdapter::table_ref("Sheet1"),
+                snapshot_token: first.snapshot_token,
+                operations: vec![ExternalOperation::Update {
+                    operation_id: "stale-source".to_string(),
+                    row_key: "row:2".to_string(),
+                    column_key: "col:2".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Wrong source".to_string()),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert_eq!(
+            umya_spreadsheet::reader::xlsx::read(&copied_path)
+                .unwrap()
+                .sheet_by_name("Sheet1")
+                .unwrap()
+                .cell("B2")
+                .unwrap()
+                .value(),
+            "Ada"
+        );
+    }
+
+    #[tokio::test]
+    async fn xlsx_explicit_range_appends_at_detected_end_and_rejects_overflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded-append.xlsx");
+        let mut workbook = umya_spreadsheet::new_file();
+        let sheet = workbook.sheet_by_name_mut("Sheet1").unwrap();
+        sheet.cell_mut("A1").set_value_string("id");
+        sheet.cell_mut("B1").set_value_string("name");
+        sheet.cell_mut("A2").set_value_number(1);
+        sheet.cell_mut("B2").set_value_string("Ada");
+        sheet.cell_mut("A3").set_value_number(2);
+        sheet.cell_mut("B3").set_value_string("Grace");
+        umya_spreadsheet::writer::xlsx::write(&workbook, &path).unwrap();
+
+        let adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:B4".to_string()) },
+        );
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let page = adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: page.snapshot_token,
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "append".to_string(),
+                    values: vec![ExternalCellInput {
+                        column_key: "col:2".to_string(),
+                        value: Value::String("Lin".to_string()),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Applied);
+        let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        assert_eq!(workbook.sheet_by_name("Sheet1").unwrap().cell("B4").unwrap().value(), "Lin");
+
+        let full_adapter = XlsxAdapter::new(
+            path.clone(),
+            XlsxExternalConfig { has_header: true, data_range: Some("A1:B4".to_string()) },
+        );
+        let table = XlsxAdapter::table_ref("Sheet1");
+        let full_page =
+            full_adapter.read_page(ReadPageRequest { table: table.clone(), cursor: None, limit: 20 }).await.unwrap();
+        let overflow = full_adapter
+            .apply_changes(ApplyChangesRequest {
+                table,
+                snapshot_token: full_page.snapshot_token,
+                operations: vec![ExternalOperation::Insert { operation_id: "overflow".to_string(), values: vec![] }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(overflow.operation_results[0].outcome, OperationOutcome::Rejected);
+        let workbook = umya_spreadsheet::reader::xlsx::read(&path).unwrap();
+        assert!(workbook.sheet_by_name("Sheet1").unwrap().cell("A5").is_none());
+    }
+
+    #[test]
+    fn xlsx_numbers_keep_large_integer_identity_and_reject_unsafe_integer_writes() {
+        let first = Value::Number(9_007_199_254_740_992_u64.into());
+        let second = Value::Number(9_007_199_254_740_993_u64.into());
+
+        assert!(!external_values_equal(&first, &second));
+        assert!(validate_xlsx_value(&first).is_err());
     }
 
     #[tokio::test]

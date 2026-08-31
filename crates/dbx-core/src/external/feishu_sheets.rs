@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::feishu::{FeishuClient, FeishuRequestErrorKind};
-use super::file_support::{parse_index_key, scoped_snapshot_token, unique_display_names};
+use super::file_support::{
+    json_number_as_safe_f64, json_numbers_equal, parse_index_key, scoped_snapshot_token, unique_display_names,
+};
 use super::{
     AdapterCapabilities, ApplyChangesRequest, ApplyChangesResult, ConflictMode, DeleteMode, ExternalCellInput,
     ExternalColumn, ExternalConnectionTestResult, ExternalOperation, ExternalRow, ExternalTableAdapter,
@@ -430,14 +432,35 @@ async fn apply_sheet_changes(
         .find(|sheet| sheet.sheet_id == sheet_id)
         .ok_or_else(|| ExternalTableError::invalid(format!("Feishu worksheet no longer exists: {sheet_id}")))?;
     let bounds = adapter.bounds(sheet).await?;
+    let current_snapshot = sheets_snapshot_token(&structure.revision, &sheet_id, &adapter.config);
+    let expected_source = sheets_source_fingerprint(&sheet_id, &adapter.config);
+    if sheets_snapshot_source(&request.snapshot_token) != Some(expected_source.as_str()) {
+        return Ok(ApplyChangesResult {
+            operation_results: request
+                .operations
+                .iter()
+                .map(|operation| {
+                    OperationResult::new(operation.operation_id(), OperationOutcome::Conflict)
+                        .message("Feishu Sheets source or range changed; reload before saving")
+                })
+                .collect(),
+            new_snapshot_token: None,
+            reload_required: true,
+            save_blocked: true,
+        });
+    }
     let has_structural_operations = request
         .operations
         .iter()
         .any(|operation| matches!(operation, ExternalOperation::Insert { .. } | ExternalOperation::Delete { .. }));
-    let structural_mutations_safe = !has_structural_operations
-        || adapter.detected_bounds(sheet).await.ok().is_some_and(|detected| bounds.contains(detected));
+    let detected_bounds = if has_structural_operations { adapter.detected_bounds(sheet).await.ok() } else { None };
+    let structural_mutations_safe =
+        !has_structural_operations || detected_bounds.is_some_and(|detected| bounds.contains(detected));
     let data_start_row = bounds.start_row + u32::from(adapter.config.has_header);
-    let current_snapshot = sheets_snapshot_token(&structure.revision, &sheet_id, &adapter.config);
+    let detected_data_row_count = detected_bounds
+        .filter(|detected| !detected.empty && detected.end_row >= data_start_row)
+        .map(|detected| detected.end_row.saturating_sub(data_start_row).saturating_add(1) as usize)
+        .unwrap_or(0);
     let mut results = vec![None; request.operations.len()];
     let mut updates = Vec::new();
     let mut deletes = Vec::new();
@@ -476,11 +499,9 @@ async fn apply_sheet_changes(
                     );
                     continue;
                 }
-                if matches!(new_value, Value::Array(_) | Value::Object(_)) {
-                    results[index] = Some(
-                        OperationResult::new(operation_id, OperationOutcome::Rejected)
-                            .message("Feishu Sheets cells accept only scalar or null values"),
-                    );
+                if let Err(error) = validate_sheet_value(new_value) {
+                    results[index] =
+                        Some(OperationResult::new(operation_id, OperationOutcome::Rejected).message(error.to_string()));
                     continue;
                 }
                 update_ranges.push(format!("{}{}", column_label(column), row));
@@ -507,6 +528,11 @@ async fn apply_sheet_changes(
                         OperationResult::new(operation_id, OperationOutcome::Rejected).message(
                             "Feishu Sheets row deletion is disabled because the configured data range does not contain all detected used cells",
                         ),
+                    );
+                } else if detected_bounds.is_none_or(|detected| detected.empty || row > detected.end_row) {
+                    results[index] = Some(
+                        OperationResult::new(operation_id, OperationOutcome::Rejected)
+                            .message("Feishu Sheets row key is outside the detected used data rows"),
                     );
                 } else if !seen_delete_rows.insert(row) {
                     results[index] = Some(
@@ -546,6 +572,27 @@ async fn apply_sheet_changes(
                         );
                     }
                 }
+            }
+        }
+    }
+
+    if structural_mutations_safe {
+        let capacity = if data_start_row > bounds.end_row {
+            0
+        } else {
+            bounds.end_row.saturating_sub(data_start_row).saturating_add(1) as usize
+        };
+        let remaining_rows = detected_data_row_count.saturating_sub(deletes.len());
+        let available_rows = capacity.saturating_sub(remaining_rows);
+        if inserts.len() > available_rows {
+            for (operation_index, _) in inserts.split_off(available_rows) {
+                results[operation_index] = Some(
+                    OperationResult::new(
+                        request.operations[operation_index].operation_id(),
+                        OperationOutcome::Rejected,
+                    )
+                    .message("Feishu Sheets append would exceed the configured data range"),
+                );
             }
         }
     }
@@ -772,7 +819,8 @@ async fn apply_sheet_changes(
                 results[*index].as_ref().is_some_and(|result| result.outcome == OperationOutcome::Applied)
             })
             .count() as u32;
-        let mut append_row = bounds.end_row.saturating_sub(deleted_count).saturating_add(1).max(data_start_row);
+        let remaining_rows = detected_data_row_count.saturating_sub(deleted_count as usize) as u32;
+        let mut append_row = data_start_row.saturating_add(remaining_rows);
         for (position, (operation_index, values)) in inserts.iter().enumerate() {
             let input = json!({
                 "excel_id": adapter.config.spreadsheet_token,
@@ -923,7 +971,7 @@ fn sheet_rows_equal(left: &[Value], right: &[Value]) -> bool {
 
 fn sheet_values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.as_f64() == right.as_f64(),
+        (Value::Number(left), Value::Number(right)) => json_numbers_equal(left, right),
         _ => left == right,
     }
 }
@@ -1102,12 +1150,22 @@ fn prepare_insert_row(values: &[ExternalCellInput], bounds: SheetBounds) -> Resu
                 cell.column_key
             )));
         }
-        if matches!(cell.value, Value::Array(_) | Value::Object(_)) {
-            return Err(ExternalTableError::invalid("Feishu Sheets cells accept only scalar or null values"));
-        }
+        validate_sheet_value(&cell.value)?;
         row[index] = cell.value.clone();
     }
     Ok(row)
+}
+
+fn validate_sheet_value(value: &Value) -> Result<(), ExternalTableError> {
+    if matches!(value, Value::Array(_) | Value::Object(_)) {
+        return Err(ExternalTableError::invalid("Feishu Sheets cells accept only scalar or null values"));
+    }
+    if value.as_number().is_some_and(|number| json_number_as_safe_f64(number).is_none()) {
+        return Err(ExternalTableError::invalid(
+            "Feishu Sheets integer values outside the JavaScript-safe range must be stored as text",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_remote_key(key: &str, prefix: &str) -> Result<u32, ExternalTableError> {
@@ -1137,9 +1195,30 @@ fn column_label(mut column: u32) -> String {
     label
 }
 
-fn sheets_snapshot_token(revision: &str, sheet_id: &str, config: &FeishuSheetsExternalConfig) -> String {
+fn snapshot_digest(namespace: &str, parts: &[&str]) -> String {
+    scoped_snapshot_token(namespace, parts)
+        .rsplit(':')
+        .next()
+        .expect("scoped snapshot tokens contain a digest")
+        .to_string()
+}
+
+fn sheets_source_fingerprint(sheet_id: &str, config: &FeishuSheetsExternalConfig) -> String {
     let data_range = config.data_range.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("<used>");
-    scoped_snapshot_token("feishu-sheets", &[revision, sheet_id, data_range])
+    let has_header = if config.has_header { "header" } else { "no-header" };
+    snapshot_digest("feishu-sheets-source", &[&config.spreadsheet_token, sheet_id, data_range, has_header])
+}
+
+fn sheets_snapshot_token(revision: &str, sheet_id: &str, config: &FeishuSheetsExternalConfig) -> String {
+    let source = sheets_source_fingerprint(sheet_id, config);
+    let state = snapshot_digest("feishu-sheets-state", &[revision]);
+    format!("feishu-sheets:v2:source:{source}:state:{state}")
+}
+
+fn sheets_snapshot_source(snapshot: &str) -> Option<&str> {
+    let tail = snapshot.strip_prefix("feishu-sheets:v2:source:")?;
+    let (source, state) = tail.split_once(":state:")?;
+    (!source.is_empty() && !state.is_empty()).then_some(source)
 }
 
 fn display_value(value: &Value) -> String {
@@ -1273,6 +1352,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sheets_snapshot_is_bound_to_spreadsheet_and_header_config() {
+        let first = FeishuSheetsExternalConfig {
+            spreadsheet_token: "spreadsheet-a".to_string(),
+            sheet_id: Some("sh1".to_string()),
+            data_range: Some("A1:B3".to_string()),
+            has_header: true,
+        };
+        let other_spreadsheet =
+            FeishuSheetsExternalConfig { spreadsheet_token: "spreadsheet-b".to_string(), ..first.clone() };
+        let no_header = FeishuSheetsExternalConfig { has_header: false, ..first.clone() };
+
+        assert_ne!(sheets_snapshot_token("7", "sh1", &first), sheets_snapshot_token("7", "sh1", &other_spreadsheet));
+        assert_ne!(sheets_snapshot_token("7", "sh1", &first), sheets_snapshot_token("7", "sh1", &no_header));
+    }
+
+    #[tokio::test]
+    async fn sheets_source_change_conflicts_before_update_preflight() {
+        let structure = json!({
+            "revision": 7,
+            "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 3, "column_count": 2 }]
+        });
+        let original_config = FeishuSheetsExternalConfig {
+            spreadsheet_token: "spreadsheet-a".to_string(),
+            sheet_id: Some("sh1".to_string()),
+            data_range: Some("A1:B3".to_string()),
+            has_header: true,
+        };
+        let changed_config =
+            FeishuSheetsExternalConfig { spreadsheet_token: "spreadsheet-b".to_string(), ..original_config.clone() };
+        let (base_url, server) = serve(vec![token_reply(), tool_reply(structure)]).await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+        let adapter = FeishuSheetsAdapter::from_client(client, changed_config).unwrap();
+
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table: ExternalTableRef { table_key: "sheet:sh1".to_string(), display_name: "Sheet1".to_string() },
+                snapshot_token: sheets_snapshot_token("7", "sh1", &original_config),
+                operations: vec![ExternalOperation::Update {
+                    operation_id: "update".to_string(),
+                    row_key: "row:2".to_string(),
+                    column_key: "col:1".to_string(),
+                    old_value: Value::String("Ada".to_string()),
+                    new_value: Value::String("Wrong source".to_string()),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2, "source mismatch must stop before old-value preflight");
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Conflict);
+        assert!(result.save_blocked);
+    }
+
+    #[test]
+    fn sheets_numeric_comparison_preserves_large_integer_identity() {
+        let first = Value::Number(9_007_199_254_740_992_u64.into());
+        let second = Value::Number(9_007_199_254_740_993_u64.into());
+        let safe_integer = Value::Number(42.into());
+        let safe_float = Value::Number(serde_json::Number::from_f64(42.0).unwrap());
+
+        assert!(!sheet_values_equal(&first, &second));
+        assert!(sheet_values_equal(&safe_integer, &safe_float));
+        assert!(validate_sheet_value(&first).is_err());
+    }
+
+    #[tokio::test]
+    async fn sheets_explicit_range_append_uses_detected_end_and_rejects_overflow() {
+        let structure = json!({
+            "revision": 7,
+            "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 20, "column_count": 2 }]
+        });
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            tool_reply(structure.clone()),
+            tool_reply(json!({ "current_region": "A1:B3", "annotated_csv": "" })),
+            tool_reply(json!({})),
+            tool_reply(json!({
+                "revision": 8,
+                "sheets": [{ "sheet_id": "sh1", "title": "Sheet1", "row_count": 20, "column_count": 2 }]
+            })),
+            tool_reply(json!({ "ranges": [{ "cells": [[{ "value": "Lin" }, { "value": null }]] }] })),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+        let adapter = FeishuSheetsAdapter::from_client(
+            client,
+            FeishuSheetsExternalConfig {
+                spreadsheet_token: "spreadsheet".to_string(),
+                sheet_id: Some("sh1".to_string()),
+                data_range: Some("A1:B10".to_string()),
+                has_header: true,
+            },
+        )
+        .unwrap();
+
+        let result = adapter
+            .apply_changes(ApplyChangesRequest {
+                table: ExternalTableRef { table_key: "sheet:sh1".to_string(), display_name: "Sheet1".to_string() },
+                snapshot_token: sheets_snapshot_token("7", "sh1", &adapter.config),
+                operations: vec![ExternalOperation::Insert {
+                    operation_id: "append".to_string(),
+                    values: vec![ExternalCellInput {
+                        column_key: "col:1".to_string(),
+                        value: Value::String("Lin".to_string()),
+                    }],
+                }],
+            })
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(result.operation_results[0].outcome, OperationOutcome::Applied);
+        assert!(requests[3].contains("\\\"range\\\":\\\"A4\\\""), "unexpected append request: {}", requests[3]);
+
+        let full_config = FeishuSheetsExternalConfig {
+            spreadsheet_token: "spreadsheet".to_string(),
+            sheet_id: Some("sh1".to_string()),
+            data_range: Some("A1:B3".to_string()),
+            has_header: true,
+        };
+        let (base_url, server) = serve(vec![
+            token_reply(),
+            tool_reply(structure),
+            tool_reply(json!({ "current_region": "A1:B3", "annotated_csv": "" })),
+        ])
+        .await;
+        let client = FeishuClient::with_base_url(base_url, "app", "secret", Duration::from_secs(5)).unwrap();
+        let full_adapter = FeishuSheetsAdapter::from_client(client, full_config).unwrap();
+        let overflow = full_adapter
+            .apply_changes(ApplyChangesRequest {
+                table: ExternalTableRef { table_key: "sheet:sh1".to_string(), display_name: "Sheet1".to_string() },
+                snapshot_token: sheets_snapshot_token("7", "sh1", &full_adapter.config),
+                operations: vec![ExternalOperation::Insert { operation_id: "overflow".to_string(), values: vec![] }],
+            })
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3, "overflow must be rejected before write dispatch");
+        assert_eq!(overflow.operation_results[0].outcome, OperationOutcome::Rejected);
+    }
+
     #[tokio::test]
     async fn sheets_without_explicit_range_is_browse_only() {
         let (base_url, server) = serve(vec![]).await;
@@ -1371,7 +1594,7 @@ mod tests {
         let (base_url, server) = serve(vec![
             token_reply(),
             tool_reply(structure.clone()),
-            tool_reply(json!({ "current_region": "A1:B3", "annotated_csv": "" })),
+            tool_reply(json!({ "current_region": "A1:B2", "annotated_csv": "" })),
             tool_reply(preflight),
             MockReply::Json(failure.to_string()),
             tool_reply(json!({
@@ -1424,7 +1647,7 @@ mod tests {
         let (base_url, server) = serve(vec![
             token_reply(),
             tool_reply(structure),
-            tool_reply(json!({ "current_region": "A1:B3", "annotated_csv": "" })),
+            tool_reply(json!({ "current_region": "A1:B2", "annotated_csv": "" })),
             MockReply::DropConnection,
         ])
         .await;
