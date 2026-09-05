@@ -3884,8 +3884,12 @@ fn postgres_foreign_keys_for_relations_sql() -> &'static str {
 // the schema/table arrays through their shared subscript so the fallback stays
 // one bounded query and preserves each relation tuple's position.
 // WITH ORDINALITY is equally unavailable before 9.4, so pair conkey/confkey
-// positions with generate_series over the array length plus plain subscripts —
-// the same pre-9.4 technique the index compat SQL relies on.
+// positions with generate_series plus plain subscripts — the same pre-9.4
+// technique the index compat SQL relies on. The series bounds must stay
+// constant: before PostgreSQL 9.3 a FROM item's function arguments cannot
+// reference an earlier FROM item (implicit LATERAL), so bound the series by
+// INDEX_MAX_KEYS (32, stable across PostgreSQL 9–18) and cap the ordinal with
+// a join-condition guard instead.
 fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
      con.conname AS constraint_name, \
@@ -3904,7 +3908,7 @@ fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
      JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
-     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1) \
      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
      JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
      WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
@@ -7455,8 +7459,11 @@ fn postgres_foreign_keys_sql() -> &'static str {
 }
 
 // Pre-9.4 sibling of `postgres_foreign_keys_sql`: WITH ORDINALITY requires
-// PostgreSQL 9.4, so pair conkey/confkey positions with generate_series over
-// the array length plus plain subscripts.
+// PostgreSQL 9.4, so pair conkey/confkey positions with generate_series plus
+// plain subscripts. The series bounds must stay constant: before PostgreSQL
+// 9.3 a FROM item's function arguments cannot reference an earlier FROM item
+// (implicit LATERAL), so bound the series by INDEX_MAX_KEYS (32, stable across
+// PostgreSQL 9–18) and cap the ordinal with a join-condition guard instead.
 fn postgres_foreign_keys_compat_sql() -> &'static str {
     "SELECT con.conname AS constraint_name, \
      a.attname AS column_name, \
@@ -7470,7 +7477,7 @@ fn postgres_foreign_keys_compat_sql() -> &'static str {
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
      JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
-     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1) \
      JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
      JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
      WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
@@ -10058,6 +10065,28 @@ mod tests {
         assert!(!opengauss_sql.contains("unnest"));
         assert!(opengauss_sql.contains("con.conkey::text"));
         assert!(opengauss_sql.contains("con.confkey::text"));
+    }
+
+    #[test]
+    fn postgres_foreign_key_compat_sql_keeps_series_bounds_lateral_free() {
+        // Before PostgreSQL 9.3 a FROM item's function arguments cannot
+        // reference an earlier FROM item (implicit LATERAL), so the compat
+        // tiers must keep the generate_series bounds constant at
+        // INDEX_MAX_KEYS and cap the ordinal with a join-condition guard.
+        // The pg_attribute subscripts must still pair conkey/confkey by the
+        // guarded ordinal so composite keys stay aligned.
+        for compat_sql in [postgres_foreign_keys_compat_sql(), postgres_foreign_keys_for_relations_compat_sql()] {
+            assert!(!compat_sql.contains("generate_series(1, array_length"));
+            assert!(compat_sql.contains("JOIN generate_series(1, 32) AS fk(ord) ON fk.ord <= array_length(con.conkey, 1)"));
+            assert!(compat_sql.contains("(con.conkey)[fk.ord]"));
+            assert!(compat_sql.contains("(con.confkey)[fk.ord]"));
+            assert!(!compat_sql.contains("LATERAL"));
+            assert!(!compat_sql.contains("WITH ORDINALITY"));
+        }
+        // The modern tiers keep explicit JOIN LATERAL and stay gated behind
+        // the compat fallback.
+        assert!(postgres_foreign_keys_sql().contains("JOIN LATERAL"));
+        assert!(postgres_foreign_keys_for_relations_sql().contains("JOIN LATERAL"));
     }
 
     #[test]
