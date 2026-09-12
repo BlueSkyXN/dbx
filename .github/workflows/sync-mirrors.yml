@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   sync-cnb:
+    if: github.repository == 't8y2/dbx'
     name: Sync to CNB
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +39,7 @@ jobs:
           git push cnb --tags --force
 
   sync-atomgit:
+    if: github.repository == 't8y2/dbx'
     name: Sync to AtomGit
     runs-on: ubuntu-latest
     steps:
@@ -59,6 +61,7 @@ jobs:
           git push atomgit --tags --force
 
   sync-gitee:
+    if: github.repository == 't8y2/dbx'
     name: Sync to Gitee
     runs-on: ubuntu-latest
     steps:
