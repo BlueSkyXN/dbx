@@ -2916,19 +2916,47 @@ fn is_timezone_suffix(value: &str) -> bool {
     )
 }
 
-fn transfer_length_params(source_type: &str, target_db: &DatabaseType) -> String {
+fn transfer_length_params(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     let params = &source_type[source_type.find('(').expect("caller checked length parameters")..];
     if matches!(target_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
-        params.to_string()
-    } else {
-        // Oracle length-unit qualifiers are invalid for non-Oracle-family
-        // targets, which only accept the numeric length.
-        normalize_len_params(params)
+        if matches!(source_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
+            // Oracle-family sources carry their own qualifier (or default to
+            // the source's BYTE/CHAR semantics); copy verbatim so the unit
+            // intent survives the transfer.
+            return params.to_string();
+        }
+        // Character-counting sources (MySQL/Postgres/SQLite/SQL Server …)
+        // must pin the unit: a bare length is read in bytes when the target
+        // runs byte semantics (Oracle NLS_LENGTH_SEMANTICS=BYTE, Dameng
+        // LENGTH_IN_CHAR=0), so multi-byte text that fit the source column
+        // would overflow the target byte length (#8101).
+        return oracle_char_length_params(params);
     }
+    // Oracle length-unit qualifiers are invalid for non-Oracle-family
+    // targets, which only accept the numeric length.
+    normalize_len_params(params)
 }
 
-pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: &DatabaseType) -> String {
-    if _source_db == target_db {
+/// Pins a numeric length as characters for Oracle-family targets:
+/// `(20)` becomes `(20 CHAR)`. Params that already carry a qualifier, a
+/// precision/scale pair, or anything non-numeric pass through unchanged.
+fn oracle_char_length_params(params: &str) -> String {
+    let trimmed = params.trim();
+    let Some(inner) = trimmed.strip_prefix('(') else {
+        return params.to_string();
+    };
+    let Some(digits) = inner.strip_suffix(')') else {
+        return params.to_string();
+    };
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return params.to_string();
+    }
+    format!("({digits} CHAR)")
+}
+
+pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
+    if source_db == target_db {
         return source_type.to_string();
     }
     let t = source_type.to_lowercase();
@@ -3010,7 +3038,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
             if t.contains('(') {
-                let len_part = transfer_length_params(&t, target_db);
+                let len_part = transfer_length_params(&t, source_db, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
                     DatabaseType::Mysql => format!("VARCHAR{len_part}"),
@@ -3023,7 +3051,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "char" | "nchar" | "character" => {
             if t.contains('(') {
-                let len_part = transfer_length_params(&t, target_db);
+                let len_part = transfer_length_params(&t, source_db, target_db);
                 format!("CHAR{len_part}")
             } else {
                 "CHAR(1)".into()
@@ -4781,6 +4809,33 @@ async fn execute_on_pool_with_options(
             PoolErrorAction::Keep => return result,
             PoolErrorAction::Discard => {
                 state.remove_pool_by_key(&current_pool_key).await;
+                // `WriteNoReplay` deliberately downgrades a recoverable connection
+                // error to `Discard` here so this specific write is never replayed
+                // (its outcome on the server is unknown). But leaving the pool
+                // torn down does not just affect this one statement: a bulk
+                // multi-table transfer keeps reusing this same `pool_key` for
+                // every remaining table, so once one table hits a transient
+                // connection drop (a momentary "too many connections"/"connection
+                // closed" from the target server under load), every later table
+                // immediately fails too with "Connection not found" / "Pool not
+                // found" -- turning one blip into a cascade for the rest of the
+                // run. Re-establish a fresh pool under the same key so the next
+                // caller isn't handed a known-dead connection; this never retries
+                // the failed statement above, only prepares the pool for
+                // whichever statement runs next.
+                if pool_error_action(db_type, error) == PoolErrorAction::ReconnectAndRetry {
+                    if let Some(connection_id) = connection_id.as_deref() {
+                        let catalog = catalog_from_pool_key(&current_pool_key).map(str::to_string);
+                        let _ = state
+                            .reconnect_pool_for_session_with_catalog(
+                                connection_id,
+                                database.as_deref(),
+                                catalog.as_deref(),
+                                client_session_id.as_deref(),
+                            )
+                            .await;
+                    }
+                }
                 return result;
             }
             PoolErrorAction::ReconnectAndRetry if attempt == 0 => {
@@ -5067,7 +5122,7 @@ const POSTGRES_OWNED_SEQUENCES_SQL: &str = "SELECT c.relname, \
              JOIN pg_depend d ON d.classid = 'pg_class'::regclass \
                AND d.objid = c.oid \
                AND d.refclassid = 'pg_class'::regclass \
-               AND d.deptype IN ('a', 'i') \
+               AND d.deptype = 'a' \
              JOIN pg_class t ON t.oid = d.refobjid \
              JOIN pg_namespace tn ON tn.oid = t.relnamespace AND tn.nspname = n.nspname \
              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid \
@@ -5366,7 +5421,19 @@ pub fn should_transfer_schema_objects(
         return false;
     }
     if !objects.is_empty() {
-        return true;
+        // A table-only selection is already handled by the table transfer pass.
+        // Do not enter the PostgreSQL-family schema-object path just because the
+        // request also carries the selected table kind. This matters for
+        // Kingbase, whose catalog is not a drop-in PostgreSQL catalog.
+        return objects
+            .iter()
+            .any(|selection| selection.object_type != TransferObjectKind::Table && !selection.names.is_empty());
+    }
+    if matches!(source_db_type, DatabaseType::Kingbase) || matches!(target_db_type, DatabaseType::Kingbase) {
+        // Kingbase V8 does not expose every PostgreSQL pg_catalog relation used
+        // by the optional object scanner. Empty selection means the legacy
+        // table-transfer request here, so avoid probing unsupported catalogs.
+        return false;
     }
     transfer_object_family(source_db_type) == Some(TransferObjectFamily::Postgres)
         && transfer_object_family(target_db_type) == Some(TransferObjectFamily::Postgres)
@@ -8393,11 +8460,23 @@ mod tests {
                 &TransferContent::StructureOnly,
                 &[]
             ));
-            assert!(should_transfer_schema_objects(
+            assert!(!should_transfer_schema_objects(
                 &DatabaseType::Kingbase,
                 &DatabaseType::Postgres,
                 &TransferContent::StructureAndData,
                 &[]
+            ));
+            assert!(!should_transfer_schema_objects(
+                &DatabaseType::Kingbase,
+                &DatabaseType::Kingbase,
+                &TransferContent::StructureAndData,
+                &[TransferObjectSelection { object_type: TransferObjectKind::Table, names: vec!["orders".into()] }]
+            ));
+            assert!(should_transfer_schema_objects(
+                &DatabaseType::Kingbase,
+                &DatabaseType::Kingbase,
+                &TransferContent::StructureOnly,
+                &[TransferObjectSelection { object_type: TransferObjectKind::View, names: vec!["v_orders".into()] }]
             ));
             assert!(should_transfer_schema_objects(
                 &DatabaseType::Postgres,
@@ -9196,11 +9275,11 @@ mod tests {
         fn postgres_owned_sequence_queries_support_pre_ten_catalogs() {
             assert!(!POSTGRES_OWNED_SEQUENCES_SQL.contains("pg_sequence"));
             assert!(!POSTGRES_SEQUENCE_SNAPSHOTS_SQL.contains("pg_sequence"));
-            for sql in [POSTGRES_OWNED_SEQUENCES_SQL, POSTGRES_SEQUENCE_SNAPSHOTS_SQL] {
-                assert!(sql.contains("c.relkind = 'S'"));
-                assert!(sql.contains("pg_depend"));
-                assert!(sql.contains("d.deptype IN ('a', 'i')"));
-            }
+            assert!(POSTGRES_OWNED_SEQUENCES_SQL.contains("c.relkind = 'S'"));
+            assert!(POSTGRES_OWNED_SEQUENCES_SQL.contains("pg_depend"));
+            assert!(POSTGRES_OWNED_SEQUENCES_SQL.contains("d.deptype = 'a'"));
+            assert!(!POSTGRES_OWNED_SEQUENCES_SQL.contains("d.deptype IN ('a', 'i')"));
+            assert!(POSTGRES_SEQUENCE_SNAPSHOTS_SQL.contains("d.deptype IN ('a', 'i')"));
         }
 
         #[test]
@@ -12123,7 +12202,41 @@ SELECT 1 FROM dual"#
                 if target == DatabaseType::Oracle { DatabaseType::OceanbaseOracle } else { DatabaseType::Oracle };
             assert_eq!(map_column_type("VARCHAR2(50 CHAR)", &source, &target), "VARCHAR(50 char)");
             assert_eq!(map_column_type("CHAR(20 BYTE)", &source, &target), "CHAR(20 byte)");
+            // Oracle-family bare lengths keep their own default semantics; they
+            // pass through verbatim between Oracle-family databases.
+            assert_eq!(map_column_type("VARCHAR2(20)", &source, &target), "VARCHAR(20)");
         }
+    }
+
+    #[test]
+    fn map_column_type_pins_char_unit_for_character_counting_sources() {
+        // MySQL/Postgres/… count VARCHAR(n) in characters; an Oracle-family
+        // target running byte semantics (Oracle NLS_LENGTH_SEMANTICS=BYTE,
+        // Dameng LENGTH_IN_CHAR=0) would read the bare length in bytes and
+        // reject multi-byte text that fit the source column (#8101).
+        for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            assert_eq!(map_column_type("varchar(20)", &DatabaseType::Mysql, &target), "VARCHAR(20 CHAR)");
+            assert_eq!(map_column_type("varchar(30)", &DatabaseType::Postgres, &target), "VARCHAR(30 CHAR)");
+            assert_eq!(map_column_type("nvarchar(40)", &DatabaseType::SqlServer, &target), "VARCHAR(40 CHAR)");
+            assert_eq!(map_column_type("char(10)", &DatabaseType::Mysql, &target), "CHAR(10 CHAR)");
+        }
+
+        // Non-Oracle-family targets keep the plain numeric length.
+        assert_eq!(map_column_type("varchar(20)", &DatabaseType::Mysql, &DatabaseType::Postgres), "VARCHAR(20)");
+        assert_eq!(map_column_type("varchar(20)", &DatabaseType::Postgres, &DatabaseType::Mysql), "VARCHAR(20)");
+        assert_eq!(map_column_type("char(10)", &DatabaseType::Mysql, &DatabaseType::Postgres), "CHAR(10)");
+
+        // Params that already carry a qualifier or are not a plain numeric
+        // length pass through unchanged instead of being double-qualified.
+        assert_eq!(
+            map_column_type("varchar(20 char)", &DatabaseType::Mysql, &DatabaseType::Oracle),
+            "VARCHAR(20 char)"
+        );
+        assert_eq!(
+            map_column_type("varchar(20 byte)", &DatabaseType::Mysql, &DatabaseType::Oracle),
+            "VARCHAR(20 byte)"
+        );
+        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "VARCHAR(max)");
     }
 
     #[test]
